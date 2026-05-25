@@ -78,7 +78,7 @@
     </div>
 
     <!-- Loading -->
-    <div v-if="loading" class="space-y-3">
+    <div v-if="loading && !displayedData.length" class="space-y-3">
       <div v-for="i in 4" :key="i" class="rounded-lg border border-border-default bg-bg-surface/60 px-4 py-3 space-y-2">
         <BaseSkeleton variant="text" class="w-48" />
         <BaseSkeleton variant="text" class="w-32" />
@@ -105,7 +105,7 @@
     <BaseEmptyState
       v-else
       title="No recordings"
-      :description="data?.length ? 'No recordings match the selected filters.' : 'Recordings will appear here after streams are saved.'"
+      :description="displayedData.length ? 'No recordings match the selected filters.' : 'Recordings will appear here after streams are saved.'"
     />
 
     <!-- Player Modal -->
@@ -114,11 +114,30 @@
       :recording="activeRecording"
       @close="activeRecording = null"
     />
+
+    <!-- Refresh toast -->
+    <Transition name="toast">
+      <div
+        v-if="showRefreshToast"
+        class="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-full bg-bg-overlay border border-border-default px-4 py-2.5 shadow-lg"
+      >
+        <span class="text-sm text-text-primary">有新的錄影可查看</span>
+        <button
+          class="inline-flex items-center gap-1 rounded-full bg-accent-primary px-3 py-1 text-xs font-medium text-white hover:bg-accent-primary/90 transition"
+          @click="applyUpdate"
+        >
+          <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+          重新整理
+        </button>
+      </div>
+    </Transition>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import RecordingsList from '@/components/RecordingsList.vue'
 import RecordingPlayer from '@/components/RecordingPlayer.vue'
 import BaseSkeleton from '@/components/ui/BaseSkeleton.vue'
@@ -126,6 +145,7 @@ import BaseErrorState from '@/components/ui/BaseErrorState.vue'
 import BaseEmptyState from '@/components/ui/BaseEmptyState.vue'
 import { listRecordings } from '@/api/streams'
 import { usePolling } from '@/composables/usePolling'
+import { deepEqual } from '@/utils/deepEqual'
 import type { Recording } from '@/types'
 
 const { data, error, loading, refetch } = usePolling(() => listRecordings(), {
@@ -133,19 +153,44 @@ const { data, error, loading, refetch } = usePolling(() => listRecordings(), {
   immediate: true,
 })
 
+const displayedData = ref<Recording[]>([])
+const showRefreshToast = ref(false)
 const activeRecording = ref<Recording | null>(null)
 const selectedStreamKey = ref('')
 const selectedTimeRange = ref('all')
 const viewMode = ref<'grid' | 'list'>('grid')
 
+// On first load, immediately display data. On subsequent changes, show toast.
+let isFirstLoad = true
+watch(
+  data,
+  (newData) => {
+    if (!newData) return
+    if (isFirstLoad) {
+      displayedData.value = newData
+      isFirstLoad = false
+    } else if (!deepEqual(displayedData.value, newData)) {
+      showRefreshToast.value = true
+    }
+  },
+  { immediate: true },
+)
+
+function applyUpdate() {
+  if (data.value) {
+    displayedData.value = data.value
+  }
+  showRefreshToast.value = false
+}
+
 const streamKeys = computed(() => {
   const keys = new Set<string>()
-  data.value?.forEach((r) => keys.add(r.stream_key))
+  displayedData.value.forEach((r) => keys.add(r.stream_key))
   return Array.from(keys).sort()
 })
 
 const filteredRecordings = computed(() => {
-  let list = data.value ?? []
+  let list = displayedData.value
 
   if (selectedStreamKey.value) {
     list = list.filter((r) => r.stream_key === selectedStreamKey.value)
@@ -166,3 +211,15 @@ const filteredRecordings = computed(() => {
   return list
 })
 </script>
+
+<style>
+.toast-enter-active,
+.toast-leave-active {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translate(-50%, 16px);
+}
+</style>

@@ -1,8 +1,10 @@
 /**
  * Generic polling composable with visibility-aware pause/resume.
+ * Only updates reactive state when fetched data actually changes (deep equality).
  */
 
 import { ref, onMounted, onUnmounted, type Ref } from 'vue'
+import { deepEqual } from '@/utils/deepEqual'
 
 export interface UsePollingOptions {
   /** Interval in milliseconds (default: 3000) */
@@ -40,7 +42,10 @@ export function usePolling<T>(
     try {
       const result = await fetchFn()
       if (!aborted) {
-        data.value = result
+        // Only update if data actually changed to avoid unnecessary re-renders
+        if (!deepEqual(data.value, result)) {
+          data.value = result
+        }
         error.value = null
       }
     } catch (e) {

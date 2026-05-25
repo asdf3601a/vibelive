@@ -17,7 +17,7 @@
     </div>
 
     <!-- Loading skeletons -->
-    <div v-if="loading && !data?.length" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+    <div v-if="loading && !displayedData?.length" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
       <div v-for="i in 3" :key="i">
         <BaseCard hoverable>
           <BaseSkeleton variant="video" />
@@ -41,9 +41,14 @@
     />
 
     <!-- Stream grid -->
-    <div v-else-if="data?.length" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-      <StreamCard v-for="stream in data" :key="stream.stream_key" :stream="stream" />
-    </div>
+    <TransitionGroup
+      v-else-if="displayedData?.length"
+      name="stream-list"
+      tag="div"
+      class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
+    >
+      <StreamCard v-for="stream in displayedData" :key="stream.stream_key" :stream="stream" />
+    </TransitionGroup>
 
     <!-- Empty state -->
     <BaseEmptyState v-else title="No active streams" description="Start streaming to see it here.">
@@ -63,7 +68,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import StreamCard from '@/components/StreamCard.vue'
 import BaseCard from '@/components/ui/BaseCard.vue'
 import BaseSkeleton from '@/components/ui/BaseSkeleton.vue'
@@ -71,10 +76,24 @@ import BaseEmptyState from '@/components/ui/BaseEmptyState.vue'
 import BaseErrorState from '@/components/ui/BaseErrorState.vue'
 import BaseCodeBlock from '@/components/ui/BaseCodeBlock.vue'
 import { useStreamList } from '@/composables/useStreamList'
+import type { Stream } from '@/types'
 
 const { data, error, loading, refetch } = useStreamList()
 
-const liveCount = computed(() => data.value?.length ?? 0)
+// Two-stage data: only update displayed list when polled data actually changes
+const displayedData = ref<Stream[]>([])
+
+watch(
+  data,
+  (newData) => {
+    if (newData) {
+      displayedData.value = newData
+    }
+  },
+  { immediate: true },
+)
+
+const liveCount = computed(() => displayedData.value?.length ?? 0)
 
 watch(
   () => liveCount.value,
@@ -84,3 +103,19 @@ watch(
   { immediate: true },
 )
 </script>
+
+<style>
+.stream-list-move,
+.stream-list-enter-active,
+.stream-list-leave-active {
+  transition: all 0.3s ease;
+}
+.stream-list-enter-from,
+.stream-list-leave-to {
+  opacity: 0;
+  transform: translateY(12px);
+}
+.stream-list-leave-active {
+  position: absolute;
+}
+</style>
