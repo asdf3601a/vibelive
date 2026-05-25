@@ -168,7 +168,7 @@ run_graceful_stop_test() {
 
     ffmpeg -y -re -f lavfi -i "testsrc=duration=10:size=640x360:rate=30" \
         -f lavfi -i "sine=frequency=440:duration=10" \
-        -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
+        -c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
         -c:a aac -t 4 -f flv \
         "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
     FF_PID=$!
@@ -219,7 +219,7 @@ run_reconnect_test() {
     # First push (long duration, will be killed abruptly)
     ffmpeg -y -re -f lavfi -i "testsrc=duration=30:size=640x360:rate=30" \
         -f lavfi -i "sine=frequency=440:duration=30" \
-        -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
+        -c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
         -c:a aac -f flv \
         "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
     FF_PID=$!
@@ -242,7 +242,7 @@ run_reconnect_test() {
     echo "--- Reconnecting within grace period ---"
     ffmpeg -y -re -f lavfi -i "testsrc=duration=10:size=640x360:rate=30" \
         -f lavfi -i "sine=frequency=1000:duration=10" \
-        -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
+        -c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
         -c:a aac -t 4 -f flv \
         "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
     FF_PID=$!
