@@ -3,8 +3,8 @@
     <!-- Preview thumbnail -->
     <div class="shrink-0 w-24 h-14 rounded-md overflow-hidden bg-bg-base relative group cursor-pointer" @click="$emit('play', recording)">
       <img
-        v-if="thumbnailLoaded && !thumbnailError"
-        :src="recording.thumbnail_url"
+        v-if="thumbnailSrc && !thumbnailError"
+        :src="thumbnailSrc"
         class="w-full h-full object-cover"
         loading="lazy"
         @error="thumbnailError = true"
@@ -63,19 +63,27 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import type { Recording } from '@/types'
 import { formatDateTime, formatDuration, formatFileSize } from '@/utils/format'
 
 interface Props {
   recording: Recording
 }
-defineProps<Props>()
+const props = defineProps<Props>()
 
 defineEmits<{
   play: [recording: Recording]
 }>()
 
-const thumbnailLoaded = ref(true)
 const thumbnailError = ref(false)
+
+const thumbnailSrc = computed(() => {
+  if (thumbnailError.value) return ''
+  // Prefer 480px, fallback to first available
+  return props.recording.thumbnails['480']
+    || props.recording.thumbnails['320']
+    || props.recording.thumbnail_url
+    || ''
+})
 </script>

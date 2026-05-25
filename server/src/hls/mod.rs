@@ -33,6 +33,10 @@ pub struct HlsStreamState {
     init_written: bool,
     init_data: Option<Vec<u8>>,
     segment_data: Vec<Vec<u8>>,
+    audio_codec: Option<fmp4::AudioCodec>,
+    timestamp_offset: u64,
+    last_video_pts: u64,
+    last_audio_pts: u64,
 }
 
 impl HlsStreamState {
@@ -53,7 +57,15 @@ impl HlsStreamState {
             init_written: false,
             init_data: None,
             segment_data: Vec::new(),
+            audio_codec: None,
+            timestamp_offset: 0,
+            last_video_pts: 0,
+            last_audio_pts: 0,
         }
+    }
+
+    pub fn stream_dir(&self) -> &PathBuf {
+        &self.stream_dir
     }
 
     fn segment_path(&self, index: u32) -> PathBuf {
@@ -72,8 +84,9 @@ impl HlsStreamState {
         Ok(())
     }
 
-    pub async fn set_audio_config(&mut self, config: &[u8]) -> anyhow::Result<()> {
-        self.fmp4_muxer.set_audio_codec(fmp4::AudioCodec::AAC);
+    pub async fn set_audio_config(&mut self, codec: fmp4::AudioCodec, config: &[u8]) -> anyhow::Result<()> {
+        self.audio_codec = Some(codec);
+        self.fmp4_muxer.set_audio_codec(codec);
         self.fmp4_muxer.set_audio_config(config.to_vec());
         self.init_written = false;
         self.write_init_segment().await?;
@@ -85,7 +98,7 @@ impl HlsStreamState {
             self.first_video_ts = Some(timestamp);
         }
         let base_ts = self.first_video_ts.unwrap_or(0);
-        let pts = (timestamp - base_ts) as u64;
+        let pts = (timestamp - base_ts) as u64 + self.timestamp_offset;
 
         if !self.has_video {
             self.has_video = true;
@@ -102,6 +115,7 @@ impl HlsStreamState {
         }
 
         self.fmp4_muxer.add_video_sample(data.to_vec(), pts, pts, is_keyframe);
+        self.last_video_pts = pts;
         Ok(())
     }
 
@@ -111,14 +125,19 @@ impl HlsStreamState {
         }
         if !self.has_audio {
             self.has_audio = true;
-            self.fmp4_muxer.set_audio_codec(fmp4::AudioCodec::AAC);
+            if let Some(codec) = self.audio_codec {
+                self.fmp4_muxer.set_audio_codec(codec);
+            } else {
+                self.fmp4_muxer.set_audio_codec(fmp4::AudioCodec::AAC);
+            }
         }
         if self.current_file.is_none() {
             return Ok(());
         }
         let base_ts = self.first_audio_ts.unwrap_or(0);
-        let pts = (timestamp - base_ts) as u64;
+        let pts = (timestamp - base_ts) as u64 + self.timestamp_offset;
         self.fmp4_muxer.add_audio_sample(data.to_vec(), pts);
+        self.last_audio_pts = pts;
         Ok(())
     }
 
@@ -152,6 +171,18 @@ impl HlsStreamState {
             file.sync_all().await?;
         }
         self.update_playlist().await?;
+        Ok(())
+    }
+
+    /// Finalize the current segment and prepare a fresh one for potential reconnect.
+    pub async fn prepare_for_grace_period(&mut self) -> anyhow::Result<()> {
+        self.finalize_segment().await?;
+        self.timestamp_offset = self.last_video_pts.max(self.last_audio_pts).saturating_add(33);
+        self.first_video_ts = None;
+        self.first_audio_ts = None;
+        self.segment_index += 1;
+        self.rotate_segment().await?;
+        self.current_segment_start = self.timestamp_offset;
         Ok(())
     }
 

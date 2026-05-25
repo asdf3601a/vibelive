@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
@@ -97,8 +98,10 @@ pub async fn handle_rtmp_session(
         Ok(())
     }.await;
 
-    // Always run cleanup, even if the session loop errored or the connection dropped
-    cleanup_session(&app_state, &mut session_ctx).await;
+    // If not a graceful stop, enter grace period for reconnection
+    if !session_ctx.graceful_stop {
+        enter_grace_period(&app_state, &mut session_ctx).await;
+    }
 
     tracing::debug!("RTMP session ended: {}", peer_addr);
     session_result
@@ -109,6 +112,7 @@ struct SessionContext {
     current_app: Option<String>,
     hls_state: Option<HlsStreamState>,
     recorder: Option<Fmp4Recorder>,
+    graceful_stop: bool,
 }
 
 impl SessionContext {
@@ -118,37 +122,102 @@ impl SessionContext {
             current_app: None,
             hls_state: None,
             recorder: None,
+            graceful_stop: false,
         }
     }
 }
 
-async fn cleanup_session(app_state: &Arc<AppState>, ctx: &mut SessionContext) {
-    if let Some(ref key) = ctx.current_stream_key {
-        let mut sm = app_state.stream_manager.write().await;
-        sm.remove_publisher(key);
+async fn finalize_stream(
+    app_state: &Arc<AppState>,
+    stream_key: &str,
+    mut hls: HlsStreamState,
+    recorder: Option<Fmp4Recorder>,
+    remove_publisher: bool,
+) {
+    let _ = hls.close().await;
+    if let Some(mut r) = recorder {
+        let (init_data, segments) = hls.take_recording_data();
+        if let Some(init) = init_data {
+            r.set_init(init).await;
+        }
+        for seg in segments {
+            r.write_segment(seg).await;
+        }
+        if let Ok(mp4_path) = r.close().await {
+            let sizes = app_state.config.thumbnail_sizes.clone();
+            let media_dir = app_state.config.media_dir.clone();
+            let base_url = app_state.config.recordings_base_url.clone();
+            let key = stream_key.to_string();
+            tokio::spawn(async move {
+                let thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("recordings");
+                let _ = crate::thumbnail::generate_thumbnails_for_file(&mp4_path, &thumb_dir, &sizes).await;
+                let _ = crate::recording::write_index_json(&media_dir, &base_url, &sizes).await;
+                // Clean up HLS files after recording is saved
+                let hls_dir = PathBuf::from(&media_dir).join("hls").join(&key);
+                let _ = tokio::fs::remove_dir_all(&hls_dir).await;
+            });
+        }
     }
-    if let Some(mut hls) = ctx.hls_state.take() {
-        let _ = hls.close().await;
-        if let Some(mut r) = ctx.recorder.take() {
-            let (init_data, segments) = hls.take_recording_data();
-            if let Some(init) = init_data {
-                r.set_init(init).await;
-            }
-            for seg in segments {
-                r.write_segment(seg).await;
-            }
-            if let Ok(mp4_path) = r.close().await {
-                let thumb_path = mp4_path.with_extension("jpg");
-                let width = app_state.config.thumbnail_default_width;
-                tokio::spawn(async move {
-                    let _ = crate::thumbnail::generate_from_file(&mp4_path, &thumb_path, Some(width)).await;
-                });
-            }
+    if remove_publisher {
+        let mut sm = app_state.stream_manager.write().await;
+        sm.remove_publisher(stream_key);
+    }
+}
+
+async fn finalize_session(app_state: &Arc<AppState>, ctx: &mut SessionContext) {
+    if let Some(ref key) = ctx.current_stream_key.take() {
+        if let Some(hls) = ctx.hls_state.take() {
+            let recorder = ctx.recorder.take();
+            finalize_stream(app_state, key, hls, recorder, true).await;
+        } else if let Some(mut r) = ctx.recorder.take() {
+            let _ = r.close().await;
+            let mut sm = app_state.stream_manager.write().await;
+            sm.remove_publisher(key);
+        } else {
+            let mut sm = app_state.stream_manager.write().await;
+            sm.remove_publisher(key);
         }
     } else if let Some(mut r) = ctx.recorder.take() {
         let _ = r.close().await;
     }
-    ctx.current_stream_key = None;
+}
+
+async fn enter_grace_period(app_state: &Arc<AppState>, ctx: &mut SessionContext) {
+    if let Some(ref key) = ctx.current_stream_key.clone() {
+        if let Some(mut hls) = ctx.hls_state.take() {
+            let _ = hls.prepare_for_grace_period().await;
+            let recorder = ctx.recorder.take();
+            {
+                let mut sm = app_state.stream_manager.write().await;
+                sm.mark_disconnected(key, hls, recorder);
+            }
+
+            let app_state_clone = app_state.clone();
+            let key_clone = key.clone();
+            let grace_period = app_state.config.stream_grace_period_seconds;
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(grace_period)).await;
+
+                let pending = {
+                    let mut sm = app_state_clone.stream_manager.write().await;
+                    sm.pending_streams.remove(&key_clone)
+                };
+
+                if let Some(pending) = pending {
+                    finalize_stream(&app_state_clone, &key_clone, pending.hls_state, pending.recorder, true).await;
+                }
+            });
+        } else if let Some(mut r) = ctx.recorder.take() {
+            let _ = r.close().await;
+            let mut sm = app_state.stream_manager.write().await;
+            sm.remove_publisher(key);
+        } else {
+            let mut sm = app_state.stream_manager.write().await;
+            sm.remove_publisher(key);
+        }
+    } else if let Some(mut r) = ctx.recorder.take() {
+        let _ = r.close().await;
+    }
 }
 
 async fn handle_outbound(
@@ -216,29 +285,39 @@ async fn handle_event(
             tracing::debug!("Sending {} outbound responses for publish accept", responses.len());
             handle_outbound(stream, responses).await?;
 
-            {
-                let mut sm = app_state.stream_manager.write().await;
+            let mut sm = app_state.stream_manager.write().await;
+            if let Some(pending) = sm.reconnect(&stream_key) {
+                // Reconnect within grace period
+                drop(sm);
+                ctx.hls_state = Some(pending.hls_state);
+                ctx.recorder = pending.recorder;
+                ctx.current_stream_key = Some(stream_key.clone());
+                tracing::info!("Stream {} reconnected within grace period", stream_key);
+            } else {
                 sm.add_publisher(&stream_key, crate::rtmp::PublisherInfo {
                     stream_key: stream_key.clone(),
                     app_name: ctx.current_app.clone().unwrap_or_default(),
                     started_at: chrono::Utc::now(),
                     metadata: None,
+                    disconnected_at: None,
                 });
-            }
+                drop(sm);
 
-            let media_dir = app_state.config.media_dir.clone();
-            ctx.hls_state = Some(HlsStreamState::new(&media_dir, &stream_key, app_state.config.hls_segment_duration));
-            if app_state.config.recording_enabled {
-                ctx.recorder = Some(Fmp4Recorder::new(&media_dir, &stream_key));
-            }
-            ctx.current_stream_key = Some(stream_key.clone());
+                let media_dir = app_state.config.media_dir.clone();
+                ctx.hls_state = Some(HlsStreamState::new(&media_dir, &stream_key, app_state.config.hls_segment_duration));
+                if app_state.config.recording_enabled {
+                    ctx.recorder = Some(Fmp4Recorder::new(&media_dir, &stream_key));
+                }
+                ctx.current_stream_key = Some(stream_key.clone());
 
-            tracing::info!("Stream {} is now live", stream_key);
+                tracing::info!("Stream {} is now live", stream_key);
+            }
         }
 
         ServerSessionEvent::PublishStreamFinished { stream_key, .. } => {
             tracing::info!("Publish finished: {}", stream_key);
-            cleanup_session(app_state, ctx).await;
+            ctx.graceful_stop = true;
+            finalize_session(app_state, ctx).await;
         }
 
         ServerSessionEvent::VideoDataReceived { stream_key, data, timestamp, .. } => {
@@ -356,7 +435,11 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
             match header.packet_type {
                 crate::rtmp::enhanced::AudioPacketType::SequenceStart => {
                     if let Some(ref mut hls) = ctx.hls_state {
-                        let _ = hls.set_audio_config(remainder).await;
+                        let codec = match header.codec {
+                            crate::rtmp::enhanced::EnhancedAudioCodec::Opus => crate::hls::fmp4::AudioCodec::Opus,
+                            _ => crate::hls::fmp4::AudioCodec::AAC,
+                        };
+                        let _ = hls.set_audio_config(codec, remainder).await;
                     }
                 }
                 crate::rtmp::enhanced::AudioPacketType::CodedFrames => {
@@ -374,9 +457,29 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
             let remainder = &data[2..];
             if aac_packet_type == 0 {
                 if let Some(ref mut hls) = ctx.hls_state {
-                    let _ = hls.set_audio_config(remainder).await;
+                    let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::AAC, remainder).await;
                 }
             } else if aac_packet_type == 1 {
+                if let Some(ref mut hls) = ctx.hls_state {
+                    let _ = hls.write_audio(remainder, ts).await;
+                }
+            }
+        } else if sound_format == 9 && data.len() > 5 {
+            // FFmpeg uses FLV audio format 9 for Opus, prefixing data with "Opus"
+            let remainder = &data[1..];
+            if remainder.starts_with(b"Opus") {
+                let opus_data = &remainder[4..];
+                if opus_data.starts_with(b"OpusHead") {
+                    if let Some(ref mut hls) = ctx.hls_state {
+                        let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Opus, opus_data).await;
+                    }
+                } else {
+                    if let Some(ref mut hls) = ctx.hls_state {
+                        let _ = hls.write_audio(opus_data, ts).await;
+                    }
+                }
+            } else {
+                let remainder = &data[1..];
                 if let Some(ref mut hls) = ctx.hls_state {
                     let _ = hls.write_audio(remainder, ts).await;
                 }

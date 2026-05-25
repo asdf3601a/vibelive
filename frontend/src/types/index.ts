@@ -20,6 +20,7 @@ export interface Stream {
   started_at: string | null
   metadata: StreamMetadata | null
   hls_url: string | null
+  player_url: string | null
 }
 
 /** Represents a saved recording (fMP4 → MP4). */
@@ -31,6 +32,7 @@ export interface Recording {
   duration_seconds?: number
   url: string
   thumbnail_url: string
+  thumbnails: Record<string, string>
 }
 
 /** Server health-check response. */

@@ -2,26 +2,14 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::process::Command;
 
-pub async fn get_or_generate_thumbnail(
-    stream_key: &str,
+pub async fn generate_thumbnails_for_stream(
     media_dir: &str,
-    width: Option<u32>,
-    ttl_seconds: u64,
-) -> anyhow::Result<PathBuf> {
+    stream_key: &str,
+    sizes: &[u32],
+    interval_seconds: u32,
+) -> anyhow::Result<Vec<PathBuf>> {
     let dir = PathBuf::from(media_dir).join("thumbnails");
     tokio::fs::create_dir_all(&dir).await?;
-
-    let suffix = width.map(|w| format!("_w{}", w)).unwrap_or_default();
-    let thumb_path = dir.join(format!("{}{}.jpg", stream_key, suffix));
-
-    // Check if existing thumbnail is fresh enough
-    if let Ok(meta) = tokio::fs::metadata(&thumb_path).await {
-        if let Ok(modified) = meta.modified() {
-            if modified.elapsed().unwrap_or(Duration::MAX) < Duration::from_secs(ttl_seconds) {
-                return Ok(thumb_path);
-            }
-        }
-    }
 
     // Build a temporary MP4 from init + first segment so ffmpeg can decode it
     let hls_dir = PathBuf::from(media_dir).join("hls").join(stream_key);
@@ -43,20 +31,58 @@ pub async fn get_or_generate_thumbnail(
     tmp_data.extend_from_slice(&seg0);
     tokio::fs::write(&tmp_path, &tmp_data).await?;
 
-    let result = run_ffmpeg_thumbnail(&tmp_path, &thumb_path, width).await;
+    let mut results = Vec::new();
+    for &width in sizes {
+        let thumb_path = dir.join(format!("{}_w{}.jpg", stream_key, width));
+
+        // Check if existing thumbnail is fresh enough
+        let should_generate = if let Ok(meta) = tokio::fs::metadata(&thumb_path).await {
+            if let Ok(modified) = meta.modified() {
+                modified.elapsed().unwrap_or(Duration::MAX) >= Duration::from_secs(interval_seconds as u64)
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+
+        if should_generate {
+            if let Err(e) = run_ffmpeg_thumbnail(&tmp_path, &thumb_path, Some(width)).await {
+                tracing::warn!("Thumbnail generation failed for {} w={}: {}", stream_key, width, e);
+            } else {
+                results.push(thumb_path);
+            }
+        } else {
+            results.push(thumb_path);
+        }
+    }
 
     // Clean up temp file
     let _ = tokio::fs::remove_file(&tmp_path).await;
 
-    result
+    Ok(results)
 }
 
-pub async fn generate_from_file(
+pub async fn generate_thumbnails_for_file(
     video_path: &std::path::Path,
-    output_path: &std::path::Path,
-    width: Option<u32>,
-) -> anyhow::Result<PathBuf> {
-    run_ffmpeg_thumbnail(video_path, output_path, width).await
+    output_dir: &std::path::Path,
+    sizes: &[u32],
+) -> anyhow::Result<Vec<PathBuf>> {
+    tokio::fs::create_dir_all(output_dir).await?;
+
+    let filename = video_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid video path"))?;
+
+    let mut results = Vec::new();
+    for &width in sizes {
+        let thumb_path = output_dir.join(format!("{}_w{}.jpg", filename, width));
+        run_ffmpeg_thumbnail(video_path, &thumb_path, Some(width)).await?;
+        results.push(thumb_path);
+    }
+
+    Ok(results)
 }
 
 async fn run_ffmpeg_thumbnail(

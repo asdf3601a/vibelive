@@ -8,12 +8,20 @@ pub struct Config {
     pub hls_segment_duration: u32,
     pub hls_segments_keep: u32,
     pub recording_enabled: bool,
-    pub thumbnail_ttl_seconds: u32,
-    pub thumbnail_default_width: u32,
+    pub thumbnail_sizes: Vec<u32>,
+    pub thumbnail_interval_seconds: u32,
+    pub recordings_base_url: String,
+    pub stream_grace_period_seconds: u64,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        let thumbnail_sizes_str = env::var("THUMBNAIL_SIZES").unwrap_or_else(|_| "320,480".into());
+        let thumbnail_sizes: Vec<u32> = thumbnail_sizes_str
+            .split(',')
+            .map(|s| s.trim().parse())
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Self {
             rtmp_port: env::var("RTMP_PORT")
                 .unwrap_or_else(|_| "1935".into())
@@ -32,11 +40,14 @@ impl Config {
             recording_enabled: env::var("RECORDING_ENABLED")
                 .unwrap_or_else(|_| "true".into())
                 .parse()?,
-            thumbnail_ttl_seconds: env::var("THUMBNAIL_TTL_SECONDS")
-                .unwrap_or_else(|_| "5".into())
+            thumbnail_sizes,
+            thumbnail_interval_seconds: env::var("THUMBNAIL_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "10".into())
                 .parse()?,
-            thumbnail_default_width: env::var("THUMBNAIL_DEFAULT_WIDTH")
-                .unwrap_or_else(|_| "480".into())
+            recordings_base_url: env::var("RECORDINGS_BASE_URL")
+                .unwrap_or_else(|_| "/recordings".into()),
+            stream_grace_period_seconds: env::var("STREAM_GRACE_PERIOD_SECONDS")
+                .unwrap_or_else(|_| "30".into())
                 .parse()?,
         })
     }

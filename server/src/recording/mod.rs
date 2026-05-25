@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
@@ -75,6 +76,107 @@ impl Fmp4Recorder {
     }
 }
 
+/// Parses the stream key from a recording filename like `{key}_{YYYYMMDD}_{HHMMSS}.mp4`.
+/// Handles stream keys that contain underscores.
+pub fn parse_stream_key_from_filename(name: &str) -> String {
+    let stem = name.strip_suffix(".mp4").unwrap_or(name);
+    let parts: Vec<&str> = stem.split('_').collect();
+    if parts.len() >= 3 {
+        parts[..parts.len() - 2].join("_")
+    } else {
+        stem.to_string()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct RecordingEntry {
+    pub filename: String,
+    pub stream_key: String,
+    pub created_at: String,
+    pub size_bytes: u64,
+    pub duration_seconds: Option<u64>,
+    pub url: String,
+    pub thumbnails: HashMap<String, String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct RecordingsIndex {
+    pub recordings: Vec<RecordingEntry>,
+}
+
+pub async fn write_index_json(
+    media_dir: &str,
+    recordings_base_url: &str,
+    thumbnail_sizes: &[u32],
+) -> anyhow::Result<()> {
+    let recordings_dir = PathBuf::from(media_dir).join("recordings");
+    let mut recordings = Vec::new();
+
+    if let Ok(mut rd) = tokio::fs::read_dir(&recordings_dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if !name.ends_with(".mp4") {
+                continue;
+            }
+
+            let meta = match tokio::fs::metadata(&path).await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let size = meta.len();
+            let modified = match meta.modified() {
+                Ok(t) => {
+                    let dt: chrono::DateTime<chrono::Utc> = t.into();
+                    dt.to_rfc3339()
+                }
+                Err(_) => chrono::Utc::now().to_rfc3339(),
+            };
+
+            let stream_key = parse_stream_key_from_filename(&name);
+
+            let mut thumbnails = HashMap::new();
+            for width in thumbnail_sizes {
+                let thumb_filename = format!("{}_w{}.jpg", name, width);
+                let thumb_path = PathBuf::from(media_dir)
+                    .join("thumbnails")
+                    .join("recordings")
+                    .join(&thumb_filename);
+                if thumb_path.exists() {
+                    thumbnails.insert(
+                        width.to_string(),
+                        format!("{}/thumbnails/{}", recordings_base_url, thumb_filename),
+                    );
+                }
+            }
+
+            recordings.push(RecordingEntry {
+                filename: name.clone(),
+                stream_key,
+                created_at: modified,
+                size_bytes: size,
+                duration_seconds: None, // Could be populated with ffprobe if needed
+                url: format!("{}/{}", recordings_base_url, name),
+                thumbnails,
+            });
+        }
+    }
+
+    recordings.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let index = RecordingsIndex { recordings };
+    let index_path = recordings_dir.join("index.json");
+    let tmp_path = recordings_dir.join("index.json.tmp");
+    let json = serde_json::to_string_pretty(&index)?;
+    tokio::fs::write(&tmp_path, json).await?;
+    tokio::fs::rename(&tmp_path, &index_path).await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +236,25 @@ mod tests {
         assert_eq!(contents, vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
 
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn test_parse_stream_key_from_filename() {
+        assert_eq!(
+            parse_stream_key_from_filename("mystream_20260525_143000.mp4"),
+            "mystream"
+        );
+        assert_eq!(
+            parse_stream_key_from_filename("my_stream_key_20260525_143000.mp4"),
+            "my_stream_key"
+        );
+        assert_eq!(
+            parse_stream_key_from_filename("key_20260525_143000.mp4"),
+            "key"
+        );
+        assert_eq!(
+            parse_stream_key_from_filename("invalid.mp4"),
+            "invalid"
+        );
     }
 }

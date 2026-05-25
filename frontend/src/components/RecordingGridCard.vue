@@ -3,8 +3,8 @@
     <!-- Preview -->
     <div class="relative w-full bg-bg-base cursor-pointer overflow-hidden" style="padding-bottom: 56.25%;" @click="$emit('play', recording)">
       <img
-        v-if="!thumbnailError"
-        :src="recording.thumbnail_url"
+        v-if="thumbnailSrc && !thumbnailError"
+        :src="thumbnailSrc"
         class="absolute inset-0 h-full w-full object-cover transition group-hover:scale-105"
         loading="lazy"
         @error="thumbnailError = true"
@@ -64,7 +64,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import type { Recording } from '@/types'
 import BaseCard from '@/components/ui/BaseCard.vue'
 import { formatDateTime, formatDuration, formatFileSize } from '@/utils/format'
@@ -72,11 +72,20 @@ import { formatDateTime, formatDuration, formatFileSize } from '@/utils/format'
 interface Props {
   recording: Recording
 }
-defineProps<Props>()
+const props = defineProps<Props>()
 
 defineEmits<{
   play: [recording: Recording]
 }>()
 
 const thumbnailError = ref(false)
+
+const thumbnailSrc = computed(() => {
+  if (thumbnailError.value) return ''
+  // Prefer 480px, fallback to first available
+  return props.recording.thumbnails['480']
+    || props.recording.thumbnails['320']
+    || props.recording.thumbnail_url
+    || ''
+})
 </script>

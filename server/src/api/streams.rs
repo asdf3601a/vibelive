@@ -11,6 +11,7 @@ pub struct StreamResponse {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub metadata: Option<crate::rtmp::StreamMeta>,
     pub hls_url: Option<String>,
+    pub player_url: Option<String>,
 }
 
 pub async fn list(
@@ -19,12 +20,14 @@ pub async fn list(
     let sm = state.stream_manager.read().await;
     let streams: Vec<StreamResponse> = sm.publishers.values().map(|info| {
         let hls_url = Some(format!("/hls/{}/index.m3u8", info.stream_key));
+        let player_url = Some(format!("/live/{}", info.stream_key));
         StreamResponse {
             stream_key: info.stream_key.clone(),
             status: "live".to_string(),
             started_at: Some(info.started_at),
             metadata: info.metadata.clone(),
             hls_url,
+            player_url,
         }
     }).collect();
 
@@ -39,12 +42,14 @@ pub async fn get(
     match sm.publishers.get(&key) {
         Some(info) => {
             let hls_url = Some(format!("/hls/{}/index.m3u8", info.stream_key));
+            let player_url = Some(format!("/live/{}", info.stream_key));
             (StatusCode::OK, Json(serde_json::json!(StreamResponse {
                 stream_key: info.stream_key.clone(),
                 status: "live".to_string(),
                 started_at: Some(info.started_at),
                 metadata: info.metadata.clone(),
                 hls_url,
+                player_url,
             })))
         }
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Stream not found"}))),
@@ -56,38 +61,69 @@ pub struct ThumbnailQuery {
     pub width: Option<u32>,
 }
 
+fn closest_thumbnail_width(requested: Option<u32>, sizes: &[u32]) -> u32 {
+    match requested {
+        None => sizes.first().copied().unwrap_or(480),
+        Some(w) => {
+            let mut best = sizes.first().copied().unwrap_or(480);
+            for &s in sizes {
+                if s <= w && s > best {
+                    best = s;
+                }
+            }
+            best
+        }
+    }
+}
+
 pub async fn thumbnail(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
     Query(query): Query<ThumbnailQuery>,
 ) -> impl IntoResponse {
-    let width = match query.width {
-        None => Some(state.config.thumbnail_default_width),
-        Some(0) => None,
-        Some(w) => Some(w),
-    };
-    let ttl = state.config.thumbnail_ttl_seconds as u64;
+    let width = closest_thumbnail_width(query.width, &state.config.thumbnail_sizes);
+    let ttl = state.config.thumbnail_interval_seconds as u64;
     let cache_header = format!("max-age={}, stale-while-revalidate={}", ttl, ttl * 2);
 
-    match crate::thumbnail::get_or_generate_thumbnail(&key, &state.config.media_dir, width, ttl).await {
-        Ok(path) => {
-            match tokio::fs::read(&path).await {
-                Ok(data) => {
-                    (
-                        StatusCode::OK,
-                        [
-                            (axum::http::header::CONTENT_TYPE, "image/jpeg"),
-                            (axum::http::header::CACHE_CONTROL, cache_header.as_str()),
-                        ],
-                        data,
-                    ).into_response()
-                }
-                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read thumbnail").into_response(),
-            }
+    let thumb_dir = std::path::PathBuf::from(&state.config.media_dir).join("thumbnails");
+    let thumb_path = thumb_dir.join(format!("{}_w{}.jpg", key, width));
+
+    match tokio::fs::read(&thumb_path).await {
+        Ok(data) => {
+            (
+                StatusCode::OK,
+                [
+                    (axum::http::header::CONTENT_TYPE, "image/jpeg"),
+                    (axum::http::header::CACHE_CONTROL, cache_header.as_str()),
+                ],
+                data,
+            ).into_response()
         }
-        Err(e) => {
-            tracing::warn!("Thumbnail generation failed for {}: {}", key, e);
-            (StatusCode::NOT_FOUND, "Thumbnail not available").into_response()
+        Err(_) => {
+            // Try generating on the fly if the pre-generated thumbnail doesn't exist
+            match crate::thumbnail::generate_thumbnails_for_stream(
+                &state.config.media_dir,
+                &key,
+                &[width],
+                0,
+            ).await {
+                Ok(paths) if !paths.is_empty() => {
+                    match tokio::fs::read(&paths[0]).await {
+                        Ok(data) => {
+                            (
+                                StatusCode::OK,
+                                [
+                                    (axum::http::header::CONTENT_TYPE, "image/jpeg"),
+                                    (axum::http::header::CACHE_CONTROL, cache_header.as_str()),
+                                ],
+                                data,
+                            ).into_response()
+                        }
+                        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read thumbnail").into_response(),
+                    }
+                }
+                _ => (StatusCode::NOT_FOUND, "Thumbnail not available").into_response(),
+            }
         }
     }
 }

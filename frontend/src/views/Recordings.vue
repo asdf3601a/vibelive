@@ -31,19 +31,31 @@
         </select>
       </div>
 
-      <div class="flex items-center gap-2 rounded-lg border border-border-default bg-bg-surface/60 px-3 py-2 min-w-[180px]">
+      <!-- Date range -->
+      <div class="flex items-center gap-2 rounded-lg border border-border-default bg-bg-surface/60 px-3 py-2">
         <svg class="h-4 w-4 text-text-muted shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
           <path stroke-linecap="round" stroke-linejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
         </svg>
-        <select
-          v-model="selectedTimeRange"
-          class="bg-transparent text-sm text-text-primary outline-none w-full cursor-pointer"
+        <input
+          v-model="startDate"
+          type="date"
+          class="bg-transparent text-sm text-text-primary outline-none cursor-pointer"
+          placeholder="Start date"
+        />
+        <span class="text-xs text-text-muted">to</span>
+        <input
+          v-model="endDate"
+          type="date"
+          class="bg-transparent text-sm text-text-primary outline-none cursor-pointer"
+          placeholder="End date"
+        />
+        <button
+          v-if="startDate || endDate"
+          class="text-xs text-text-muted hover:text-text-primary transition"
+          @click="clearDateRange"
         >
-          <option value="all">All time</option>
-          <option value="today">Today</option>
-          <option value="week">Last 7 days</option>
-          <option value="month">Last 30 days</option>
-        </select>
+          Clear
+        </button>
       </div>
 
       <div class="flex items-center gap-2 ml-auto">
@@ -75,6 +87,18 @@
           {{ filteredRecordings.length }} result{{ filteredRecordings.length === 1 ? '' : 's' }}
         </span>
       </div>
+    </div>
+
+    <!-- Active date range badge -->
+    <div v-if="startDate || endDate" class="flex items-center gap-2 mb-4">
+      <span class="inline-flex items-center gap-1 rounded-full bg-accent-primary/10 text-accent-primary px-2.5 py-1 text-xs font-medium">
+        {{ dateRangeLabel }}
+        <button class="hover:text-accent-primary/80" @click="clearDateRange">
+          <svg class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
+      </span>
     </div>
 
     <!-- Loading -->
@@ -157,7 +181,8 @@ const displayedData = ref<Recording[]>([])
 const showRefreshToast = ref(false)
 const activeRecording = ref<Recording | null>(null)
 const selectedStreamKey = ref('')
-const selectedTimeRange = ref('all')
+const startDate = ref('')
+const endDate = ref('')
 const viewMode = ref<'grid' | 'list'>('grid')
 
 // On first load, immediately display data. On subsequent changes, show toast.
@@ -183,10 +208,28 @@ function applyUpdate() {
   showRefreshToast.value = false
 }
 
+function clearDateRange() {
+  startDate.value = ''
+  endDate.value = ''
+}
+
 const streamKeys = computed(() => {
   const keys = new Set<string>()
   displayedData.value.forEach((r) => keys.add(r.stream_key))
   return Array.from(keys).sort()
+})
+
+const dateRangeLabel = computed(() => {
+  if (startDate.value && endDate.value) {
+    return `${startDate.value} to ${endDate.value}`
+  }
+  if (startDate.value) {
+    return `From ${startDate.value}`
+  }
+  if (endDate.value) {
+    return `Until ${endDate.value}`
+  }
+  return ''
 })
 
 const filteredRecordings = computed(() => {
@@ -196,16 +239,22 @@ const filteredRecordings = computed(() => {
     list = list.filter((r) => r.stream_key === selectedStreamKey.value)
   }
 
-  const now = new Date()
-  if (selectedTimeRange.value === 'today') {
-    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-    list = list.filter((r) => new Date(r.created_at) >= startOfDay)
-  } else if (selectedTimeRange.value === 'week') {
-    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
-    list = list.filter((r) => new Date(r.created_at) >= weekAgo)
-  } else if (selectedTimeRange.value === 'month') {
-    const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
-    list = list.filter((r) => new Date(r.created_at) >= monthAgo)
+  if (startDate.value) {
+    const start = new Date(startDate.value)
+    start.setHours(0, 0, 0, 0)
+    list = list.filter((r) => {
+      const created = new Date(r.created_at)
+      return created >= start
+    })
+  }
+
+  if (endDate.value) {
+    const end = new Date(endDate.value)
+    end.setHours(23, 59, 59, 999)
+    list = list.filter((r) => {
+      const created = new Date(r.created_at)
+      return created <= end
+    })
   }
 
   return list

@@ -12,65 +12,84 @@ NC='\033[0m'
 PASS=0
 FAIL=0
 
-SERVER_PID=""
-MEDIA_DIR="./data_test"
-rm -rf "$MEDIA_DIR"
-mkdir -p "$MEDIA_DIR"
+MEDIA_DIR="./data"
+API_BASE="http://localhost:8080"
+RTMP_BASE="rtmp://localhost:1935/live"
 
-start_server() {
-    echo "=== Starting server ==="
-    MEDIA_DIR="$MEDIA_DIR" \
-    RTMP_PORT=1936 \
-    API_PORT=8081 \
-    STREAM_KEEP_ALIVE_SECS=30 \
-    HLS_SEGMENT_DURATION=2 \
-    HLS_SEGMENTS_KEEP=10 \
-    RECORDING_ENABLED=true \
-    RUST_LOG=warn \
-    ./target/release/livestream-server &
-    SERVER_PID=$!
-    sleep 2
+api_call() {
+    curl -s "${API_BASE}$1"
 }
 
-stop_server() {
-    if [ -n "$SERVER_PID" ]; then
-        echo "=== Stopping server ==="
-        kill $SERVER_PID 2>/dev/null || true
-        wait $SERVER_PID 2>/dev/null || true
-        SERVER_PID=""
-    fi
-}
-
-cleanup_stream() {
+count_recordings() {
     local key=$1
-    rm -rf "$MEDIA_DIR/hls/$key"
+    ls "$MEDIA_DIR/recordings/" 2>/dev/null | grep -c "^${key}_" || echo 0
 }
 
-check_hls() {
-    local key=$1
-    local timeout=${2:-15}
-    local i=0
-    while [ $i -lt $timeout ]; do
-        if [ -f "$MEDIA_DIR/hls/$key/index.m3u8" ]; then
-            return 0
+check_mp4_integrity() {
+    local mp4_path="$1"
+    local key="$2"
+    local max_expected_duration="${3:-30}"
+    local corrupt=0
+
+    # Check 1: ffprobe can read duration without errors
+    local duration
+    duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$mp4_path" 2>&1) || {
+        echo -e "${RED}✗ ffprobe failed to read $key${NC}"
+        corrupt=1
+    }
+
+    # Check 2: duration is reasonable (not overflow / underflow)
+    if [ "$corrupt" -eq 0 ]; then
+        if [ -z "$duration" ] || [ "$duration" = "N/A" ]; then
+            echo -e "${RED}✗ Duration is N/A for $key${NC}"
+            corrupt=1
+        else
+            # Use awk for float comparison
+            local too_long
+            too_long=$(awk "BEGIN { print ($duration > $max_expected_duration) ? 1 : 0 }")
+            local too_short
+            too_short=$(awk "BEGIN { print ($duration < 0.5) ? 1 : 0 }")
+            if [ "$too_long" -eq 1 ]; then
+                echo -e "${RED}✗ Duration overflow: ${duration}s (expected < ${max_expected_duration}s) for $key${NC}"
+                corrupt=1
+            fi
+            if [ "$too_short" -eq 1 ]; then
+                echo -e "${RED}✗ Duration too short: ${duration}s for $key${NC}"
+                corrupt=1
+            fi
         fi
-        sleep 1
-        i=$((i+1))
-    done
-    return 1
-}
+    fi
 
-count_segments() {
-    local key=$1
-    local m3u8="$MEDIA_DIR/hls/$key/index.m3u8"
-    if [ -f "$m3u8" ]; then
-        grep -c '^segment' "$m3u8" 2>/dev/null || echo 0
+    # Check 3: ffmpeg can remux without decode errors
+    if [ "$corrupt" -eq 0 ]; then
+        local ffmpeg_err
+        ffmpeg_err=$(ffmpeg -v error -i "$mp4_path" -c copy -f null - 2>&1) || true
+        if [ -n "$ffmpeg_err" ]; then
+            echo -e "${RED}✗ ffmpeg remux errors for $key:${NC}"
+            echo "$ffmpeg_err" | head -5
+            corrupt=1
+        fi
+    fi
+
+    # Check 4: at least some video frames exist
+    if [ "$corrupt" -eq 0 ]; then
+        local frame_count
+        frame_count=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=noprint_wrappers=1:nokey=1 "$mp4_path" 2>/dev/null || echo 0)
+        if [ "$frame_count" -lt 10 ]; then
+            echo -e "${RED}✗ Too few frames ($frame_count) for $key${NC}"
+            corrupt=1
+        fi
+    fi
+
+    if [ "$corrupt" -eq 0 ]; then
+        echo -e "${GREEN}✓ MP4 integrity OK (duration=${duration}s, frames=${frame_count})${NC}"
+        return 0
     else
-        echo 0
+        return 1
     fi
 }
 
-run_test() {
+run_codec_test() {
     local name="$1"
     local vcodec="$2"
     local acodec="$3"
@@ -88,167 +107,206 @@ run_test() {
         -c:v "$vcodec" -pix_fmt yuv420p \
         -g 60 -keyint_min 60 \
         -c:a "$acodec" \
-        -t 8 -f flv \
+        -t 6 -f flv \
         $extra_flags \
-        "rtmp://localhost:1936/live/$key" >/dev/null 2>&1 &
+        "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
     local ffmpeg_pid=$!
 
-    # Wait for ffmpeg to finish (so HLS is finalized)
     wait $ffmpeg_pid 2>/dev/null || true
-    sleep 1
+    sleep 3  # Wait for thumbnail generation and index.json
 
-    if [ -f "$MEDIA_DIR/hls/$key/index.m3u8" ]; then
-        echo -e "${GREEN}✓ HLS playlist generated${NC}"
+    local mp4_count
+    mp4_count=$(count_recordings "$key")
 
-        local m3u8="$MEDIA_DIR/hls/$key/index.m3u8"
-        echo "--- m3u8 content ---"
-        cat "$m3u8"
-        echo "--------------------"
+    if [ "$mp4_count" -gt 0 ]; then
+        echo -e "${GREEN}✓ Recording generated ($mp4_count file(s))${NC}"
 
-        local seg_count
-        seg_count=$(count_segments "$key")
-        echo "Segments in playlist: $seg_count"
+        local thumb_count
+        thumb_count=$(find "$MEDIA_DIR/thumbnails/recordings" -name "${key}_*.mp4_w*.jpg" 2>/dev/null | wc -l)
+        if [ "$thumb_count" -gt 0 ]; then
+            echo -e "${GREEN}✓ Thumbnails generated ($thumb_count)${NC}"
+        else
+            echo -e "${YELLOW}⚠ No thumbnails found${NC}"
+        fi
 
-        if [ "$seg_count" -gt 0 ]; then
+        if [ -f "$MEDIA_DIR/recordings/index.json" ]; then
+            echo -e "${GREEN}✓ index.json exists${NC}"
+        else
+            echo -e "${YELLOW}⚠ index.json not found${NC}"
+        fi
+
+        # Integrity check on the recording
+        local integrity_ok=1
+        for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do
+            if [ -f "$f" ]; then
+                if ! check_mp4_integrity "$f" "$key" 15; then
+                    integrity_ok=0
+                fi
+            fi
+        done
+
+        if [ "$integrity_ok" -eq 1 ]; then
             echo -e "${GREEN}✓ $name PASSED${NC}"
             PASS=$((PASS+1))
         else
-            echo -e "${RED}✗ $name FAILED (no segments)${NC}"
+            echo -e "${RED}✗ $name FAILED (file corrupt)${NC}"
             FAIL=$((FAIL+1))
         fi
     else
-        echo -e "${RED}✗ $name FAILED (no HLS output)${NC}"
+        echo -e "${RED}✗ $name FAILED (no recording)${NC}"
         FAIL=$((FAIL+1))
     fi
+}
 
-    cleanup_stream "$key"
+run_graceful_stop_test() {
+    local key="graceful_test_$(date +%s)"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Test: Graceful stop (HLS cleanup)"
+    echo "Key:  $key"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    ffmpeg -y -re -f lavfi -i "testsrc=duration=10:size=640x360:rate=30" \
+        -f lavfi -i "sine=frequency=440:duration=10" \
+        -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
+        -c:a aac -t 4 -f flv \
+        "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+    FF_PID=$!
+
+    wait $FF_PID 2>/dev/null || true
+    sleep 3  # Wait for finalization and HLS cleanup
+
+    local hls_dir="$MEDIA_DIR/hls/$key"
+    local mp4_count
+    mp4_count=$(count_recordings "$key")
+
+    if [ "$mp4_count" -gt 0 ] && [ ! -d "$hls_dir" ]; then
+        echo -e "${GREEN}✓ Recording exists and HLS directory cleaned up${NC}"
+
+        local integrity_ok=1
+        for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do
+            if [ -f "$f" ]; then
+                if ! check_mp4_integrity "$f" "$key" 10; then
+                    integrity_ok=0
+                fi
+            fi
+        done
+
+        if [ "$integrity_ok" -eq 1 ]; then
+            echo -e "${GREEN}✓ Graceful stop test PASSED${NC}"
+            PASS=$((PASS+1))
+        else
+            echo -e "${RED}✗ Graceful stop test FAILED (file corrupt)${NC}"
+            FAIL=$((FAIL+1))
+        fi
+    elif [ "$mp4_count" -eq 0 ]; then
+        echo -e "${RED}✗ Graceful stop test FAILED (no recording)${NC}"
+        FAIL=$((FAIL+1))
+    else
+        echo -e "${RED}✗ Graceful stop test FAILED (HLS directory still exists)${NC}"
+        FAIL=$((FAIL+1))
+    fi
+}
+
+run_reconnect_test() {
+    local key="reconnect_test_$(date +%s)"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Test: Abnormal disconnect + reconnect"
+    echo "Key:  $key"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # First push (long duration, will be killed abruptly)
+    ffmpeg -y -re -f lavfi -i "testsrc=duration=30:size=640x360:rate=30" \
+        -f lavfi -i "sine=frequency=440:duration=30" \
+        -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
+        -c:a aac -f flv \
+        "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+    FF_PID=$!
+
+    sleep 4  # Let it push for 4 seconds
+
+    # Abruptly kill ffmpeg (simulates network drop / abnormal disconnect)
+    kill -9 $FF_PID 2>/dev/null || true
+    sleep 1
+
+    # Check API - stream should still be "live" during grace period
+    local stream_json
+    stream_json=$(api_call "/api/streams")
+    if echo "$stream_json" | grep -q "$key"; then
+        echo -e "${GREEN}✓ Stream still visible in API during grace period${NC}"
+    else
+        echo -e "${YELLOW}⚠ Stream not visible in API during grace period${NC}"
+    fi
+
+    echo "--- Reconnecting within grace period ---"
+    ffmpeg -y -re -f lavfi -i "testsrc=duration=10:size=640x360:rate=30" \
+        -f lavfi -i "sine=frequency=1000:duration=10" \
+        -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
+        -c:a aac -t 4 -f flv \
+        "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+    FF_PID=$!
+
+    wait $FF_PID 2>/dev/null || true
+    sleep 3  # Wait for finalization
+
+    echo "--- After reconnect ---"
+    local mp4_count
+    mp4_count=$(count_recordings "$key")
+    echo "MP4 recordings for reconnect key: $mp4_count"
+
+    if [ "$mp4_count" -eq 1 ]; then
+        local integrity_ok=1
+        for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do
+            if [ -f "$f" ]; then
+                if ! check_mp4_integrity "$f" "$key" 15; then
+                    integrity_ok=0
+                fi
+            fi
+        done
+
+        if [ "$integrity_ok" -eq 1 ]; then
+            echo -e "${GREEN}✓ Reconnect test PASSED (1 merged recording)${NC}"
+            PASS=$((PASS+1))
+        else
+            echo -e "${RED}✗ Reconnect test FAILED (file corrupt)${NC}"
+            FAIL=$((FAIL+1))
+        fi
+    else
+        echo -e "${RED}✗ Reconnect test FAILED (expected 1 recording, got $mp4_count)${NC}"
+        FAIL=$((FAIL+1))
+    fi
 }
 
 # ============ MAIN ============
 
-trap stop_server EXIT
-start_server
+echo "=== Using existing instance ==="
+echo "API:  $API_BASE"
+echo "RTMP: $RTMP_BASE"
+echo ""
+
+api_call "/api/health" || { echo "Health check failed, is the server running?"; exit 1; }
 
 echo ""
 echo "========== VIDEO + AUDIO CODEC TESTS =========="
 
-# 1. H264 + AAC (legacy baseline)
-run_test "H264 + AAC (legacy baseline)" libx264 aac "-preset ultrafast -tune zerolatency"
+run_codec_test "H264 + AAC (legacy baseline)" libx264 aac "-preset ultrafast -tune zerolatency"
+run_codec_test "AV1 + AAC (enhanced video)" libsvtav1 aac "-svtav1-params preset=12:crf=35"
+run_codec_test "H264 + Opus (enhanced audio)" libx264 libopus "-preset ultrafast -tune zerolatency -ar 48000"
+run_codec_test "AV1 + Opus (both enhanced)" libsvtav1 libopus "-svtav1-params preset=12:crf=35 -ar 48000"
 
-# 2. AV1 + AAC (enhanced video + legacy audio)
-run_test "AV1 + AAC (enhanced video)" libsvtav1 aac "-svtav1-params preset=12:crf=35"
-
-# 3. H264 + Opus (legacy video + enhanced audio)
-run_test "H264 + Opus (enhanced audio)" libx264 libopus "-preset ultrafast -tune zerolatency -ar 48000"
-
-# 4. AV1 + Opus (enhanced video + enhanced audio)
-run_test "AV1 + Opus (both enhanced)" libsvtav1 libopus "-svtav1-params preset=12:crf=35 -ar 48000"
-
-# 5. H264 + FLAC (test if server handles gracefully)
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Test: H264 + FLAC (unsupported audio)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-key="test_h264_flac_$(date +%s)"
-ffmpeg -y -re -f lavfi -i "testsrc=duration=6:size=640x360:rate=30" \
-    -f lavfi -i "sine=frequency=440:duration=6" \
-    -c:v libx264 -preset ultrafast -tune zerolatency -t 4 -f flv \
-    "rtmp://localhost:1936/live/$key" >/dev/null 2>&1 &
-ff_pid=$!
-if check_hls "$key" 10; then
-    echo -e "${YELLOW}⚠ HLS generated but audio may be ignored (FLAC unsupported)${NC}"
-    PASS=$((PASS+1))
-else
-    echo -e "${YELLOW}⚠ No HLS (expected, FLAC unsupported by FLV/RTMP)${NC}"
-    PASS=$((PASS+1))
-fi
-wait $ff_pid 2>/dev/null || true
-cleanup_stream "$key"
+echo "========== GRACEFUL STOP + HLS CLEANUP =========="
+run_graceful_stop_test
 
-# ============ DISCONNECT / RECONNECT TEST ============
 echo ""
-echo "========== DISCONNECT / RECONNECT TEST =========="
+echo "========== ABNORMAL DISCONNECT / RECONNECT =========="
+run_reconnect_test
 
-RECONNECT_KEY="reconnect_test_$(date +%s)"
-echo "Stream key: $RECONNECT_KEY"
-
-# First push (8s)
-ffmpeg -y -re -f lavfi -i "testsrc=duration=10:size=640x360:rate=30" \
-    -f lavfi -i "sine=frequency=440:duration=10" \
-    -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
-    -c:a aac -t 8 -f flv \
-    "rtmp://localhost:1936/live/$RECONNECT_KEY" >/dev/null 2>&1 &
-FF_PID=$!
-
-wait $FF_PID 2>/dev/null || true
-sleep 1
-
-echo "--- After first push ---"
-if [ -f "$MEDIA_DIR/hls/$RECONNECT_KEY/index.m3u8" ]; then
-    cat "$MEDIA_DIR/hls/$RECONNECT_KEY/index.m3u8"
-    SEG1=$(count_segments "$RECONNECT_KEY")
-    echo "Segments before disconnect: $SEG1"
-else
-    echo -e "${RED}✗ No HLS before disconnect${NC}"
-    SEG1=0
-fi
-
-echo "--- Waiting 3s then reconnecting (within 30s keep-alive) ---"
-sleep 3
-
-# Second push (same key)
-ffmpeg -y -re -f lavfi -i "testsrc=duration=10:size=640x360:rate=30" \
-    -f lavfi -i "sine=frequency=1000:duration=10" \
-    -c:v libx264 -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
-    -c:a aac -t 8 -f flv \
-    "rtmp://localhost:1936/live/$RECONNECT_KEY" >/dev/null 2>&1 &
-FF_PID=$!
-
-wait $FF_PID 2>/dev/null || true
-sleep 1
-
-echo "--- After reconnect ---"
-if [ -f "$MEDIA_DIR/hls/$RECONNECT_KEY/index.m3u8" ]; then
-    cat "$MEDIA_DIR/hls/$RECONNECT_KEY/index.m3u8"
-    if grep -q "DISCONTINUITY" "$MEDIA_DIR/hls/$RECONNECT_KEY/index.m3u8"; then
-        echo -e "${GREEN}✓ #EXT-X-DISCONTINUITY found in playlist${NC}"
-        DISC_OK=1
-    else
-        echo -e "${YELLOW}⚠ No DISCONTINUITY tag found${NC}"
-        DISC_OK=0
-    fi
-    SEG2=$(count_segments "$RECONNECT_KEY")
-    echo "Segments after reconnect: $SEG2"
-else
-    echo -e "${RED}✗ No HLS after reconnect${NC}"
-    SEG2=0
-    DISC_OK=0
-fi
-
-# Wait for zombie cleanup to finish recording
-sleep 2
-
-# Check recordings
 echo ""
-echo "--- Recordings ---"
-ls -la "$MEDIA_DIR/recordings/" 2>/dev/null || echo "No recordings dir"
-REC_COUNT=$(ls "$MEDIA_DIR/recordings/" 2>/dev/null | grep -c "\.mp4$" || echo 0)
-echo "MP4 recordings for reconnect key: $REC_COUNT"
-
-if [ "$DISC_OK" -eq 1 ] && [ "$SEG2" -gt 0 ]; then
-    echo -e "${GREEN}✓ Reconnect test PASSED${NC}"
-    PASS=$((PASS+1))
-else
-    echo -e "${RED}✗ Reconnect test FAILED${NC}"
-    FAIL=$((FAIL+1))
-fi
-
-# Check API
-sleep 2
-echo ""
-echo "--- API Check ---"
-curl -s http://localhost:8081/api/health || echo "Health check failed"
-curl -s http://localhost:8081/api/streams | python3 -m json.tool 2>/dev/null || echo "Streams API failed"
+echo "========== API CHECK =========="
+echo "Health: $(api_call "/api/health")"
+echo "Streams: $(api_call "/api/streams")"
 
 # Final summary
 echo ""
@@ -258,9 +316,6 @@ echo "============================================"
 echo -e "${GREEN}Passed: $PASS${NC}"
 echo -e "${RED}Failed: $FAIL${NC}"
 echo "============================================"
-
-stop_server
-rm -rf "$MEDIA_DIR"
 
 if [ "$FAIL" -gt 0 ]; then
     exit 1

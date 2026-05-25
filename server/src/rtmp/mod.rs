@@ -6,9 +6,12 @@ pub mod stream;
 pub use server::start_rtmp_server;
 
 use std::collections::HashMap;
+use crate::hls::HlsStreamState;
+use crate::recording::Fmp4Recorder;
 
 pub struct StreamManager {
     pub publishers: HashMap<String, PublisherInfo>,
+    pub pending_streams: HashMap<String, PendingStream>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -17,6 +20,8 @@ pub struct PublisherInfo {
     pub app_name: String,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub metadata: Option<StreamMeta>,
+    #[serde(skip)]
+    pub disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -30,10 +35,18 @@ pub struct StreamMeta {
     pub framerate: f64,
 }
 
+pub struct PendingStream {
+    pub stream_key: String,
+    pub disconnected_at: chrono::DateTime<chrono::Utc>,
+    pub hls_state: HlsStreamState,
+    pub recorder: Option<Fmp4Recorder>,
+}
+
 impl StreamManager {
     pub fn new() -> Self {
         Self {
             publishers: HashMap::new(),
+            pending_streams: HashMap::new(),
         }
     }
 
@@ -47,5 +60,37 @@ impl StreamManager {
 
     pub fn is_publishing(&self, stream_key: &str) -> bool {
         self.publishers.contains_key(stream_key)
+    }
+
+    pub fn is_live_or_pending(&self, stream_key: &str) -> bool {
+        self.publishers.contains_key(stream_key) || self.pending_streams.contains_key(stream_key)
+    }
+
+    pub fn mark_disconnected(
+        &mut self,
+        stream_key: &str,
+        hls_state: HlsStreamState,
+        recorder: Option<Fmp4Recorder>,
+    ) {
+        let now = chrono::Utc::now();
+        if let Some(ref mut info) = self.publishers.get_mut(stream_key) {
+            info.disconnected_at = Some(now);
+        }
+        self.pending_streams.insert(stream_key.to_string(), PendingStream {
+            stream_key: stream_key.to_string(),
+            disconnected_at: now,
+            hls_state,
+            recorder,
+        });
+    }
+
+    pub fn reconnect(&mut self, stream_key: &str) -> Option<PendingStream> {
+        let pending = self.pending_streams.remove(stream_key);
+        if pending.is_some() {
+            if let Some(ref mut info) = self.publishers.get_mut(stream_key) {
+                info.disconnected_at = None;
+            }
+        }
+        pending
     }
 }

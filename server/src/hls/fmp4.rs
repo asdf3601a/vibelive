@@ -11,6 +11,7 @@ pub enum VideoCodec {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AudioCodec {
     AAC,
+    Opus,
 }
 
 #[derive(Clone, Debug)]
@@ -452,7 +453,14 @@ impl Fmp4Muxer {
     fn write_stsd_audio(&self, w: &mut Vec<u8>) {
         let mut data = Vec::new();
         data.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-        self.write_mp4a_sample_entry(&mut data);
+        match self.audio_codec {
+            Some(AudioCodec::Opus) => {
+                self.write_opus_sample_entry(&mut data);
+            }
+            _ => {
+                self.write_mp4a_sample_entry(&mut data);
+            }
+        }
         write_fullbox(w, b"stsd", 0, 0, &data);
     }
 
@@ -531,6 +539,29 @@ impl Fmp4Muxer {
         }
 
         write_box(w, b"mp4a", &data);
+    }
+
+    fn write_opus_sample_entry(&self, w: &mut Vec<u8>) {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 6]); // reserved
+        data.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+        data.extend_from_slice(&[0u8; 8]); // reserved
+        data.extend_from_slice(&2u16.to_be_bytes()); // channelcount
+        data.extend_from_slice(&16u16.to_be_bytes()); // samplesize
+        data.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
+        data.extend_from_slice(&0u16.to_be_bytes()); // reserved
+        data.extend_from_slice(&(48000u32 << 16).to_be_bytes()); // samplerate 48000 in 16.16
+
+        // dOps box: convert OpusHead (version=1, little-endian) to dOps (version=0, big-endian)
+        if let Some(ref config) = self.audio_config {
+            let dops = build_dops(config);
+            write_box(&mut data, b"dOps", &dops);
+        } else {
+            // Minimal dOps: version=0, channel_count=2, pre_skip=0, sample_rate=48000, gain=0, mapping_family=0
+            write_box(&mut data, b"dOps", &[0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xBB, 0x80, 0x00, 0x00, 0x00]);
+        }
+
+        write_box(w, b"Opus", &data);
     }
 
     fn write_mvex(&self, w: &mut Vec<u8>) {
@@ -718,6 +749,45 @@ fn build_esds(audio_specific_config: &[u8]) -> Vec<u8> {
     esds.push(0x02); // predefined = 2
 
     esds
+}
+
+/// Convert OpusHead (RFC 7845) to dOps box content (ISOBMFF).
+/// OpusHead: version(1), channel_count(1), pre_skip(2 LE), sample_rate(4 LE), gain(2 LE), family(1)
+/// dOps:     version(0), channel_count(1), pre_skip(2 BE), sample_rate(4 BE), gain(2 BE), family(1)
+fn build_dops(opus_head: &[u8]) -> Vec<u8> {
+    // Strip "OpusHead" signature if present
+    let head = if opus_head.len() > 8 && &opus_head[..8] == b"OpusHead" {
+        &opus_head[8..]
+    } else {
+        opus_head
+    };
+
+    if head.len() < 11 {
+        // Return minimal dOps
+        return vec![0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xBB, 0x80, 0x00, 0x00, 0x00];
+    }
+
+    let version = 0u8;
+    let channel_count = head[1];
+    let pre_skip = u16::from_le_bytes([head[2], head[3]]);
+    let sample_rate = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+    let gain = i16::from_le_bytes([head[8], head[9]]);
+    let family = head[10];
+
+    let mut dops = Vec::new();
+    dops.push(version);
+    dops.push(channel_count);
+    dops.extend_from_slice(&pre_skip.to_be_bytes());
+    dops.extend_from_slice(&sample_rate.to_be_bytes());
+    dops.extend_from_slice(&gain.to_be_bytes());
+    dops.push(family);
+
+    // Channel mapping bytes if family != 0
+    if family != 0 && head.len() > 10 {
+        dops.extend_from_slice(&head[10..]);
+    }
+
+    dops
 }
 
 fn write_descriptor_length(w: &mut Vec<u8>, mut len: usize) {

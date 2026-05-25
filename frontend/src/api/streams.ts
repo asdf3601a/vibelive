@@ -17,6 +17,10 @@ export function getThumbnailUrl(key: string, width = 480): string {
   return `/api/streams/${encodeURIComponent(key)}/thumbnail?width=${width}`
 }
 
+export function getPlayerUrl(key: string): string {
+  return `/live/${encodeURIComponent(key)}`
+}
+
 // Recordings endpoints (require server-side support)
 export function listRecordings(): Promise<Recording[]> {
   return apiFetch<Recording[]>('/api/recordings')

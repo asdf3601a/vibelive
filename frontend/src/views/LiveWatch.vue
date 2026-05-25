@@ -41,11 +41,6 @@
             <BaseTag v-if="stream.metadata.audio_codec">{{ stream.metadata.audio_codec }}</BaseTag>
             <BaseTag v-if="stream.metadata.framerate">{{ stream.metadata.framerate }} fps</BaseTag>
           </div>
-
-          <div class="mt-4 flex items-center gap-2 min-w-0">
-            <span class="text-xs text-text-muted shrink-0">HLS:</span>
-            <BaseCodeBlock :text="stream.hls_url ?? '—'" />
-          </div>
         </div>
       </div>
 
@@ -118,7 +113,6 @@ import BaseTag from '@/components/ui/BaseTag.vue'
 import BaseSkeleton from '@/components/ui/BaseSkeleton.vue'
 import BaseEmptyState from '@/components/ui/BaseEmptyState.vue'
 import BaseErrorState from '@/components/ui/BaseErrorState.vue'
-import BaseCodeBlock from '@/components/ui/BaseCodeBlock.vue'
 import { useStream } from '@/composables/useStream'
 import { formatDateTime } from '@/utils/format'
 import type { Recording } from '@/types'
