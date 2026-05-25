@@ -1,6 +1,5 @@
 /**
  * Centralized type definitions for the LiveStream Platform frontend.
- * All interfaces are shared across views, components, and the API layer.
  */
 
 /** Metadata extracted from an active RTMP stream. */
@@ -29,7 +28,9 @@ export interface Recording {
   stream_key: string
   created_at: string
   size_bytes: number
+  duration_seconds?: number
   url: string
+  thumbnail_url: string
 }
 
 /** Server health-check response. */

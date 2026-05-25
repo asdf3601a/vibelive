@@ -37,7 +37,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/streams", get(streams::list))
         .route("/api/streams/{key}", get(streams::get))
         .route("/api/streams/{key}/thumbnail", get(streams::thumbnail))
-        .route("/api/recordings", get(recordings::list));
+        .route("/api/recordings", get(recordings::list))
+        .route("/api/recordings/{filename}/thumbnail", get(recordings::thumbnail));
 
     let hls_service = ServeDir::new(hls_dir);
 

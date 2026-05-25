@@ -7,9 +7,7 @@
             to="/"
             class="flex items-center gap-2.5 text-white font-bold text-lg tracking-tight hover:opacity-80 transition shrink-0"
           >
-            <span class="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent-live text-[10px] font-bold">
-              ●
-            </span>
+            <img src="/on.svg" alt="LiveStream" class="h-7 w-7 rounded-md" />
             LiveStream
           </router-link>
 

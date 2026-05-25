@@ -30,7 +30,7 @@
               <h1 class="text-xl font-bold text-text-primary truncate">{{ stream.stream_key }}</h1>
               <div class="mt-1 flex flex-wrap items-center gap-3 text-sm text-text-secondary">
                 <BaseBadge :status="stream.status === 'live' ? 'live' : 'ended'" />
-                <span v-if="stream.started_at">Started {{ formatDate(stream.started_at) }}</span>
+                <span v-if="stream.started_at">Started {{ formatDateTime(stream.started_at) }}</span>
               </div>
             </div>
           </div>
@@ -55,7 +55,7 @@
 
         <div v-if="recordings.length" class="rounded-xl border border-border-default bg-bg-surface/60 p-4">
           <h3 class="text-sm font-semibold text-text-primary mb-3">Recordings</h3>
-          <RecordingsList :recordings="recordings" />
+          <RecordingsList :recordings="recordings" view="list" @play="activeRecording = $event" />
         </div>
       </div>
     </div>
@@ -96,6 +96,13 @@
         </router-link>
       </template>
     </BaseEmptyState>
+
+    <!-- Player Modal for recordings -->
+    <RecordingPlayer
+      v-if="activeRecording"
+      :recording="activeRecording"
+      @close="activeRecording = null"
+    />
   </div>
 </template>
 
@@ -105,6 +112,7 @@ import { useRoute } from 'vue-router'
 import Player from '@/components/Player.vue'
 import StreamInfo from '@/components/StreamInfo.vue'
 import RecordingsList from '@/components/RecordingsList.vue'
+import RecordingPlayer from '@/components/RecordingPlayer.vue'
 import BaseBadge from '@/components/ui/BaseBadge.vue'
 import BaseTag from '@/components/ui/BaseTag.vue'
 import BaseSkeleton from '@/components/ui/BaseSkeleton.vue'
@@ -112,6 +120,7 @@ import BaseEmptyState from '@/components/ui/BaseEmptyState.vue'
 import BaseErrorState from '@/components/ui/BaseErrorState.vue'
 import BaseCodeBlock from '@/components/ui/BaseCodeBlock.vue'
 import { useStream } from '@/composables/useStream'
+import { formatDateTime } from '@/utils/format'
 import type { Recording } from '@/types'
 
 const route = useRoute()
@@ -121,12 +130,8 @@ const { data, error, loading, refetch } = useStream(key.value)
 const stream = computed(() => data.value ?? null)
 const hlsUrl = computed(() => stream.value?.hls_url ?? null)
 
-// Placeholder recordings (will be populated when server API is ready)
 const recordings = ref<Recording[]>([])
-
-function formatDate(d: string): string {
-  return new Date(d).toLocaleString()
-}
+const activeRecording = ref<Recording | null>(null)
 
 watch(
   () => stream.value?.stream_key,

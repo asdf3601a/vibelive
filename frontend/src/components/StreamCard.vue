@@ -14,6 +14,10 @@
         <BaseBadge :status="stream.status === 'live' ? 'live' : 'ended'" />
       </div>
 
+      <p v-if="stream.started_at" class="text-xs text-text-muted mt-1">
+        {{ formatDateTime(stream.started_at) }}
+      </p>
+
       <div v-if="stream.metadata" class="mt-2 flex flex-wrap gap-2">
         <BaseTag>
           {{ stream.metadata.width }}×{{ stream.metadata.height }}
@@ -24,7 +28,11 @@
       </div>
 
       <div class="mt-3 flex items-center justify-between min-w-0">
-        <span class="text-xs text-text-muted truncate mr-2">
+        <span v-if="stream.status === 'live'" class="inline-flex items-center gap-1.5 text-xs font-medium text-accent-live">
+          <span class="h-1.5 w-1.5 rounded-full bg-accent-live animate-pulse"></span>
+          LIVE
+        </span>
+        <span v-else class="text-xs text-text-muted truncate mr-2">
           {{ relativeTime }}
         </span>
 
@@ -52,6 +60,7 @@ import BaseTag from '@/components/ui/BaseTag.vue'
 import ThumbnailImg from '@/components/ThumbnailImg.vue'
 import { getThumbnailUrl } from '@/api/streams'
 import { useRelativeTime } from '@/composables/useRelativeTime'
+import { formatDateTime } from '@/utils/format'
 
 interface Props {
   stream: Stream

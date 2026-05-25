@@ -3,7 +3,7 @@
     <h3 class="text-sm font-semibold text-text-primary mb-3">Stream Info</h3>
     <dl class="space-y-2 text-sm">
       <div class="flex justify-between gap-2">
-        <dt class="text-text-muted shrink-0">Key</dt>
+        <dt class="text-text-muted shrink-0">Stream Key</dt>
         <dd class="text-text-primary font-mono truncate">{{ stream.stream_key }}</dd>
       </div>
       <div class="flex justify-between gap-2">
@@ -12,7 +12,7 @@
       </div>
       <div v-if="stream.started_at" class="flex justify-between gap-2">
         <dt class="text-text-muted shrink-0">Started</dt>
-        <dd class="text-text-primary truncate">{{ formatDate(stream.started_at) }}</dd>
+        <dd class="text-text-primary truncate">{{ formatDateTime(stream.started_at) }}</dd>
       </div>
       <template v-if="stream.metadata">
         <div class="flex justify-between gap-2">
@@ -46,15 +46,12 @@
 
 <script setup lang="ts">
 import type { Stream } from '@/types'
+import { formatDateTime } from '@/utils/format'
 
 interface Props {
   stream: Stream
 }
 defineProps<Props>()
-
-function formatDate(d: string): string {
-  return new Date(d).toLocaleString()
-}
 
 function formatBitrate(bps: number): string {
   if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} Mbps`
