@@ -1,0 +1,395 @@
+use std::sync::Arc;
+use std::net::SocketAddr;
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
+use rml_rtmp::sessions::{ServerSession, ServerSessionConfig, ServerSessionResult, ServerSessionEvent};
+
+use crate::AppState;
+use crate::hls::HlsStreamState;
+use crate::recording::Fmp4Recorder;
+
+pub async fn handle_rtmp_session(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    app_state: Arc<AppState>,
+) -> anyhow::Result<()> {
+    let mut handshake = Handshake::new(PeerType::Server);
+    let mut handshake_done = false;
+
+    let config = ServerSessionConfig {
+        chunk_size: 4096,
+        ..ServerSessionConfig::new()
+    };
+    let (mut session, init_results) = ServerSession::new(config)
+        .map_err(|e| anyhow::anyhow!("session create: {}", e))?;
+    let mut init_results = Some(init_results);
+
+    let mut buf = vec![0u8; 1024 * 64];
+    let mut session_ctx = SessionContext::new();
+
+    let session_result: anyhow::Result<()> = async {
+        loop {
+            let n = match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("RTMP read error for {}: {}", peer_addr, e);
+                    break;
+                }
+            };
+            tracing::debug!("Read {} bytes from socket", n);
+            let data = &buf[..n];
+            tracing::trace!("HEXDUMP: {:?}", &data[..n.min(64)]);
+
+            if !handshake_done {
+                tracing::debug!("Handshake: processing {} bytes", data.len());
+                match handshake.process_bytes(data) {
+                    Ok(HandshakeProcessResult::InProgress { response_bytes }) => {
+                        if !response_bytes.is_empty() {
+                            stream.write_all(&response_bytes).await?;
+                            stream.flush().await?;
+                        }
+                        continue;
+                    }
+                    Ok(HandshakeProcessResult::Completed { response_bytes, remaining_bytes }) => {
+                        if !response_bytes.is_empty() {
+                            stream.write_all(&response_bytes).await?;
+                            stream.flush().await?;
+                        }
+                        handshake_done = true;
+                        if let Some(results) = init_results.take() {
+                            handle_outbound(&mut stream, results).await?;
+                        }
+                        if !remaining_bytes.is_empty() {
+                            match session.handle_input(&remaining_bytes) {
+                                Ok(results) => {
+                                    if let Err(e) = process_results(results, &mut session, &mut stream, &app_state, &mut session_ctx).await {
+                                        tracing::error!("process_results after handshake: {:?}", e);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("session input after handshake: {:?}", e);
+                                    break;
+                                }
+                            };
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(anyhow::anyhow!("handshake: {}", e)),
+                }
+            }
+
+            match session.handle_input(data) {
+                Ok(results) => {
+                    if let Err(e) = process_results(results, &mut session, &mut stream, &app_state, &mut session_ctx).await {
+                        tracing::error!("process_results error {}: {:?}", peer_addr, e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("session input error {}: {:?}", peer_addr, e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }.await;
+
+    // Always run cleanup, even if the session loop errored or the connection dropped
+    cleanup_session(&app_state, &mut session_ctx).await;
+
+    tracing::debug!("RTMP session ended: {}", peer_addr);
+    session_result
+}
+
+struct SessionContext {
+    current_stream_key: Option<String>,
+    current_app: Option<String>,
+    hls_state: Option<HlsStreamState>,
+    recorder: Option<Fmp4Recorder>,
+}
+
+impl SessionContext {
+    fn new() -> Self {
+        Self {
+            current_stream_key: None,
+            current_app: None,
+            hls_state: None,
+            recorder: None,
+        }
+    }
+}
+
+async fn cleanup_session(app_state: &Arc<AppState>, ctx: &mut SessionContext) {
+    if let Some(ref key) = ctx.current_stream_key {
+        let mut sm = app_state.stream_manager.write().await;
+        sm.remove_publisher(key);
+    }
+    if let Some(mut hls) = ctx.hls_state.take() {
+        let _ = hls.close().await;
+        if let Some(mut r) = ctx.recorder.take() {
+            let (init_data, segments) = hls.take_recording_data();
+            if let Some(init) = init_data {
+                r.set_init(init).await;
+            }
+            for seg in segments {
+                r.write_segment(seg).await;
+            }
+            if let Ok(mp4_path) = r.close().await {
+                let thumb_path = mp4_path.with_extension("jpg");
+                let width = app_state.config.thumbnail_default_width;
+                tokio::spawn(async move {
+                    let _ = crate::thumbnail::generate_from_file(&mp4_path, &thumb_path, Some(width)).await;
+                });
+            }
+        }
+    } else if let Some(mut r) = ctx.recorder.take() {
+        let _ = r.close().await;
+    }
+    ctx.current_stream_key = None;
+}
+
+async fn handle_outbound(
+    stream: &mut TcpStream,
+    results: Vec<ServerSessionResult>,
+) -> anyhow::Result<()> {
+    for r in results {
+        if let ServerSessionResult::OutboundResponse(pkt) = r {
+            stream.write_all(&pkt.bytes).await?;
+            stream.flush().await?;
+        }
+    }
+    Ok(())
+}
+
+async fn process_results(
+    results: Vec<ServerSessionResult>,
+    session: &mut ServerSession,
+    stream: &mut TcpStream,
+    app_state: &Arc<AppState>,
+    ctx: &mut SessionContext,
+) -> anyhow::Result<()> {
+    for result in results {
+        match result {
+            ServerSessionResult::OutboundResponse(pkt) => {
+                stream.write_all(&pkt.bytes).await?;
+                stream.flush().await?;
+            }
+            ServerSessionResult::RaisedEvent(event) => {
+                handle_event(session, stream, app_state, ctx, event).await?;
+            }
+            ServerSessionResult::UnhandleableMessageReceived(msg) => {
+                tracing::warn!("Unhandled msg: type={}", msg.type_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_event(
+    session: &mut ServerSession,
+    stream: &mut TcpStream,
+    app_state: &Arc<AppState>,
+    ctx: &mut SessionContext,
+    event: ServerSessionEvent,
+) -> anyhow::Result<()> {
+    match event {
+        ServerSessionEvent::ConnectionRequested { request_id, app_name } => {
+            tracing::info!("RTMP connect: app={}", app_name);
+            ctx.current_app = Some(app_name);
+            let responses = session.accept_request(request_id)
+                .map_err(|e| anyhow::anyhow!("accept: {}", e))?;
+            handle_outbound(stream, responses).await?;
+        }
+
+        ServerSessionEvent::ReleaseStreamRequested { request_id, .. } => {
+            handle_outbound(stream, session.accept_request(request_id)
+                .map_err(|e| anyhow::anyhow!("release: {}", e))?).await?;
+        }
+
+        ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
+            tracing::info!("Publish request: stream_key={}", stream_key);
+            let responses = session.accept_request(request_id)
+                .map_err(|e| anyhow::anyhow!("publish accept: {}", e))?;
+            tracing::debug!("Sending {} outbound responses for publish accept", responses.len());
+            handle_outbound(stream, responses).await?;
+
+            {
+                let mut sm = app_state.stream_manager.write().await;
+                sm.add_publisher(&stream_key, crate::rtmp::PublisherInfo {
+                    stream_key: stream_key.clone(),
+                    app_name: ctx.current_app.clone().unwrap_or_default(),
+                    started_at: chrono::Utc::now(),
+                    metadata: None,
+                });
+            }
+
+            let media_dir = app_state.config.media_dir.clone();
+            ctx.hls_state = Some(HlsStreamState::new(&media_dir, &stream_key, app_state.config.hls_segment_duration));
+            if app_state.config.recording_enabled {
+                ctx.recorder = Some(Fmp4Recorder::new(&media_dir, &stream_key));
+            }
+            ctx.current_stream_key = Some(stream_key.clone());
+
+            tracing::info!("Stream {} is now live", stream_key);
+        }
+
+        ServerSessionEvent::PublishStreamFinished { stream_key, .. } => {
+            tracing::info!("Publish finished: {}", stream_key);
+            cleanup_session(app_state, ctx).await;
+        }
+
+        ServerSessionEvent::VideoDataReceived { stream_key, data, timestamp, .. } => {
+            if let Some(ref key) = ctx.current_stream_key {
+                if *key == stream_key {
+                    let ts = timestamp.value;
+                    handle_video_data(&data, ts, ctx, app_state, &stream_key).await;
+                }
+            }
+        }
+
+        ServerSessionEvent::AudioDataReceived { stream_key, data, timestamp, .. } => {
+            if let Some(ref key) = ctx.current_stream_key {
+                if *key == stream_key {
+                    let ts = timestamp.value;
+                    handle_audio_data(&data, ts, ctx).await;
+                }
+            }
+        }
+
+        ServerSessionEvent::StreamMetadataChanged { metadata, .. } => {
+            let meta = crate::rtmp::StreamMeta {
+                width: metadata.video_width.unwrap_or(0),
+                height: metadata.video_height.unwrap_or(0),
+                video_codec: metadata.video_codec_id.map(|c| format!("{}", c)).unwrap_or_default(),
+                audio_codec: metadata.audio_codec_id.map(|c| format!("{}", c)).unwrap_or_default(),
+                video_bitrate: metadata.video_bitrate_kbps.unwrap_or(0),
+                audio_bitrate: metadata.audio_bitrate_kbps.unwrap_or(0),
+                framerate: metadata.video_frame_rate.unwrap_or(0.0) as f64,
+            };
+            if let Some(ref key) = ctx.current_stream_key {
+                let mut sm = app_state.stream_manager.write().await;
+                if let Some(ref mut pi) = sm.publishers.get_mut(key) {
+                    pi.metadata = Some(meta);
+                }
+            }
+        }
+
+        ServerSessionEvent::PlayStreamRequested { request_id, .. } => {
+            handle_outbound(stream, session.accept_request(request_id)
+                .map_err(|e| anyhow::anyhow!("play accept: {}", e))?).await?;
+        }
+
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_state: &Arc<AppState>, stream_key: &str) {
+    tracing::info!("handle_video_data: ts={}, len={}, first_bytes={:02x?}", ts, data.len(), &data[..data.len().min(8)]);
+    if crate::rtmp::enhanced::is_enhanced_video(data) {
+        if let Ok((header, remainder)) = crate::rtmp::enhanced::parse_enhanced_video_header(data) {
+            let codec = match header.codec {
+                crate::rtmp::enhanced::EnhancedVideoCodec::Av1 => crate::hls::fmp4::VideoCodec::AV1,
+                crate::rtmp::enhanced::EnhancedVideoCodec::Avc => crate::hls::fmp4::VideoCodec::H264,
+                crate::rtmp::enhanced::EnhancedVideoCodec::Hevc => crate::hls::fmp4::VideoCodec::H265,
+                _ => crate::hls::fmp4::VideoCodec::H264,
+            };
+            let is_keyframe = header.frame_type == crate::rtmp::enhanced::VideoFrameType::KeyFrame;
+            match header.packet_type {
+                crate::rtmp::enhanced::VideoPacketType::SequenceStart => {
+                    if let Some(ref mut hls) = ctx.hls_state {
+                        let _ = hls.set_video_config(remainder, codec).await;
+                    }
+                }
+                crate::rtmp::enhanced::VideoPacketType::CodedFrames |
+                crate::rtmp::enhanced::VideoPacketType::CodedFramesX => {
+                    if let Some(ref mut hls) = ctx.hls_state {
+                        let _ = hls.write_video(remainder, ts, is_keyframe).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else if !data.is_empty() {
+        // Legacy FLV video tag
+        let frame_type = (data[0] & 0xF0) >> 4;
+        let codec_id = data[0] & 0x0F;
+        let is_keyframe = frame_type == 1;
+        tracing::info!("legacy video: frame_type={}, codec_id={}, len={}", frame_type, codec_id, data.len());
+
+        if codec_id == 7 && data.len() >= 2 {
+            let avc_packet_type = data[1];
+            let remainder = if data.len() >= 5 { &data[5..] } else { &[] };
+            tracing::info!("avc_packet_type={}, remainder_len={}", avc_packet_type, remainder.len());
+
+            if avc_packet_type == 0 {
+                // AVC sequence header -> avcC config
+                if let Some(ref mut hls) = ctx.hls_state {
+                    let _ = hls.set_video_config(remainder, crate::hls::fmp4::VideoCodec::H264).await;
+                }
+            } else if avc_packet_type == 1 {
+                // AVC NALU -> raw AVCC sample data
+                if let Some(ref mut hls) = ctx.hls_state {
+                    let _ = hls.write_video(remainder, ts, is_keyframe).await;
+                }
+            }
+        } else {
+            // Non-AVC legacy video (Sorenson, VP6, etc.)
+            let remainder = &data[1..];
+            if let Some(ref mut hls) = ctx.hls_state {
+                let _ = hls.write_video(remainder, ts, is_keyframe).await;
+            }
+        }
+    }
+
+    if let Some(ref mut r) = ctx.recorder {
+        let _ = r.write_video(data, ts).await;
+    }
+}
+
+async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
+    if crate::rtmp::enhanced::is_enhanced_audio(data) {
+        if let Ok((header, remainder)) = crate::rtmp::enhanced::parse_enhanced_audio_header(data) {
+            match header.packet_type {
+                crate::rtmp::enhanced::AudioPacketType::SequenceStart => {
+                    if let Some(ref mut hls) = ctx.hls_state {
+                        let _ = hls.set_audio_config(remainder).await;
+                    }
+                }
+                crate::rtmp::enhanced::AudioPacketType::CodedFrames => {
+                    if let Some(ref mut hls) = ctx.hls_state {
+                        let _ = hls.write_audio(remainder, ts).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else if !data.is_empty() {
+        let sound_format = (data[0] & 0xF0) >> 4;
+        if sound_format == 10 && data.len() >= 2 {
+            let aac_packet_type = data[1];
+            let remainder = &data[2..];
+            if aac_packet_type == 0 {
+                if let Some(ref mut hls) = ctx.hls_state {
+                    let _ = hls.set_audio_config(remainder).await;
+                }
+            } else if aac_packet_type == 1 {
+                if let Some(ref mut hls) = ctx.hls_state {
+                    let _ = hls.write_audio(remainder, ts).await;
+                }
+            }
+        } else {
+            let remainder = &data[1..];
+            if let Some(ref mut hls) = ctx.hls_state {
+                let _ = hls.write_audio(remainder, ts).await;
+            }
+        }
+    }
+
+    if let Some(ref mut r) = ctx.recorder {
+        let _ = r.write_audio(data, ts).await;
+    }
+}

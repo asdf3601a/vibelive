@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "1935:1935"
+      - "8080:8080"
+    environment:
+      MEDIA_DIR: /data
+      RUST_LOG: info
+    volumes:
+      - media:/data
+
+volumes:
+  media:

@@ -1,0 +1,67 @@
+/** Tailwind CSS v4 entry */
+@import "tailwindcss";
+
+@theme {
+  /* Background layers (Twitch-inspired dark palette) */
+  --color-bg-base: #0e0e10;
+  --color-bg-surface: #18181b;
+  --color-bg-elevated: #1f1f23;
+  --color-bg-overlay: #26262c;
+
+  /* Accents */
+  --color-accent-primary: #9147ff;
+  --color-accent-live: #eb0400;
+  --color-accent-success: #00c853;
+
+  /* Text */
+  --color-text-primary: #efeff1;
+  --color-text-secondary: #adadb8;
+  --color-text-muted: #71717a;
+
+  /* Border */
+  --color-border-default: #2f2f35;
+  --color-border-hover: #464649;
+
+  /* Font */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+}
+
+/* Dark theme base */
+html {
+  color-scheme: dark;
+}
+
+body {
+  background-color: var(--color-bg-base);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar (dark) */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+
+/* Focus ring */
+:focus-visible {
+  outline: 2px solid var(--color-accent-primary);
+  outline-offset: 2px;
+}
+
+/* Smooth transitions */
+* {
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}

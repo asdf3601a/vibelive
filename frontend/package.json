@@ -1,0 +1,28 @@
+{
+  "name": "livestream-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "lint": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "hls.js": "^1.5",
+    "pinia": "^2.1",
+    "vue": "^3.4",
+    "vue-router": "^4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.0",
+    "@vitejs/plugin-vue": "^5.0",
+    "autoprefixer": "^10.5.0",
+    "postcss": "^8.5.15",
+    "tailwindcss": "^4.3.0",
+    "typescript": "^5.4",
+    "vite": "^5.2",
+    "vue-tsc": "^2.0"
+  }
+}
