@@ -113,6 +113,8 @@ struct SessionContext {
     hls_state: Option<HlsStreamState>,
     recorder: Option<Fmp4Recorder>,
     graceful_stop: bool,
+    video_width: u16,
+    video_height: u16,
 }
 
 impl SessionContext {
@@ -123,6 +125,8 @@ impl SessionContext {
             hls_state: None,
             recorder: None,
             graceful_stop: false,
+            video_width: 1920,
+            video_height: 1080,
         }
     }
 }
@@ -304,8 +308,12 @@ async fn handle_event(
                 drop(sm);
 
                 let media_dir = app_state.config.media_dir.clone();
+                let hls_dir = std::path::PathBuf::from(&media_dir).join("hls").join(&stream_key);
+                let _ = tokio::fs::create_dir_all(&hls_dir).await;
                 ctx.hls_state = Some(HlsStreamState::new(&media_dir, &stream_key, app_state.config.hls_segment_duration));
                 if app_state.config.recording_enabled {
+                    let recordings_dir = std::path::PathBuf::from(&media_dir).join("recordings");
+                    let _ = tokio::fs::create_dir_all(&recordings_dir).await;
                     ctx.recorder = Some(Fmp4Recorder::new(&media_dir, &stream_key));
                 }
                 ctx.current_stream_key = Some(stream_key.clone());
@@ -321,24 +329,31 @@ async fn handle_event(
         }
 
         ServerSessionEvent::VideoDataReceived { stream_key, data, timestamp, .. } => {
-            if let Some(ref key) = ctx.current_stream_key {
-                if *key == stream_key {
-                    let ts = timestamp.value;
-                    handle_video_data(&data, ts, ctx, app_state, &stream_key).await;
-                }
+            if let Some(ref key) = ctx.current_stream_key
+                && *key == stream_key
+            {
+                let ts = timestamp.value;
+                handle_video_data(&data, ts, ctx, app_state, &stream_key).await;
             }
         }
 
         ServerSessionEvent::AudioDataReceived { stream_key, data, timestamp, .. } => {
-            if let Some(ref key) = ctx.current_stream_key {
-                if *key == stream_key {
-                    let ts = timestamp.value;
-                    handle_audio_data(&data, ts, ctx).await;
-                }
+            if let Some(ref key) = ctx.current_stream_key
+                && *key == stream_key
+            {
+                let ts = timestamp.value;
+                handle_audio_data(&data, ts, ctx).await;
             }
         }
 
         ServerSessionEvent::StreamMetadataChanged { metadata, .. } => {
+            let width = metadata.video_width.unwrap_or(1920) as u16;
+            let height = metadata.video_height.unwrap_or(1080) as u16;
+            ctx.video_width = width;
+            ctx.video_height = height;
+            if let Some(ref mut hls) = ctx.hls_state {
+                let _ = hls.update_video_resolution(width, height).await;
+            }
             let meta = crate::rtmp::StreamMeta {
                 width: metadata.video_width.unwrap_or(0),
                 height: metadata.video_height.unwrap_or(0),
@@ -366,7 +381,7 @@ async fn handle_event(
     Ok(())
 }
 
-async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_state: &Arc<AppState>, stream_key: &str) {
+async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_state: &Arc<AppState>, _stream_key: &str) {
     tracing::info!("handle_video_data: ts={}, len={}, first_bytes={:02x?}", ts, data.len(), &data[..data.len().min(8)]);
     if crate::rtmp::enhanced::is_enhanced_video(data) {
         if let Ok((header, remainder)) = crate::rtmp::enhanced::parse_enhanced_video_header(data) {
@@ -380,7 +395,7 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_
             match header.packet_type {
                 crate::rtmp::enhanced::VideoPacketType::SequenceStart => {
                     if let Some(ref mut hls) = ctx.hls_state {
-                        let _ = hls.set_video_config(remainder, codec).await;
+                        let _ = hls.set_video_config(remainder, codec, ctx.video_width, ctx.video_height).await;
                     }
                 }
                 crate::rtmp::enhanced::VideoPacketType::CodedFrames |
@@ -407,7 +422,7 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_
             if avc_packet_type == 0 {
                 // AVC sequence header -> avcC config
                 if let Some(ref mut hls) = ctx.hls_state {
-                    let _ = hls.set_video_config(remainder, crate::hls::fmp4::VideoCodec::H264).await;
+                    let _ = hls.set_video_config(remainder, crate::hls::fmp4::VideoCodec::H264, ctx.video_width, ctx.video_height).await;
                 }
             } else if avc_packet_type == 1 {
                 // AVC NALU -> raw AVCC sample data
@@ -437,7 +452,7 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
                     if let Some(ref mut hls) = ctx.hls_state {
                         let codec = match header.codec {
                             crate::rtmp::enhanced::EnhancedAudioCodec::Opus => crate::hls::fmp4::AudioCodec::Opus,
-                            _ => crate::hls::fmp4::AudioCodec::AAC,
+                            _ => crate::hls::fmp4::AudioCodec::Aac,
                         };
                         let _ = hls.set_audio_config(codec, remainder).await;
                     }
@@ -457,12 +472,12 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
             let remainder = &data[2..];
             if aac_packet_type == 0 {
                 if let Some(ref mut hls) = ctx.hls_state {
-                    let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::AAC, remainder).await;
+                    let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Aac, remainder).await;
                 }
-            } else if aac_packet_type == 1 {
-                if let Some(ref mut hls) = ctx.hls_state {
-                    let _ = hls.write_audio(remainder, ts).await;
-                }
+            } else if aac_packet_type == 1
+                && let Some(ref mut hls) = ctx.hls_state
+            {
+                let _ = hls.write_audio(remainder, ts).await;
             }
         } else if sound_format == 9 && data.len() > 5 {
             // FFmpeg uses FLV audio format 9 for Opus, prefixing data with "Opus"

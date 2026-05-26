@@ -14,7 +14,6 @@ pub struct Fmp4Recorder {
 impl Fmp4Recorder {
     pub fn new(media_dir: &str, stream_key: &str) -> Self {
         let dir = PathBuf::from(media_dir).join("recordings");
-        std::fs::create_dir_all(&dir).ok();
         Self {
             dir,
             stream_key: stream_key.to_string(),
@@ -46,7 +45,7 @@ impl Fmp4Recorder {
     pub async fn close(&mut self) -> std::io::Result<PathBuf> {
         if self.closed {
             return self.saved_path.clone().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Other, "already closed with no path")
+                std::io::Error::other("already closed with no path")
             });
         }
         self.closed = true;
@@ -140,12 +139,12 @@ pub async fn write_index_json(
 
             let mut thumbnails = HashMap::new();
             for width in thumbnail_sizes {
-                let thumb_filename = format!("{}_w{}.jpg", name, width);
+                let thumb_filename = format!("{}_w{}.webp", name, width);
                 let thumb_path = PathBuf::from(media_dir)
                     .join("thumbnails")
                     .join("recordings")
                     .join(&thumb_filename);
-                if thumb_path.exists() {
+                if tokio::fs::try_exists(&thumb_path).await.unwrap_or(false) {
                     thumbnails.insert(
                         width.to_string(),
                         format!("{}/thumbnails/{}", recordings_base_url, thumb_filename),
@@ -183,59 +182,106 @@ mod tests {
 
     #[tokio::test]
     async fn test_fmp4_recorder_create_and_close() {
-        let test_dir = "/tmp/recording_fmp4_test";
-        let _ = std::fs::remove_dir_all(test_dir);
-        let mut recorder = Fmp4Recorder::new(test_dir, "teststream");
+        let test_dir = std::env::temp_dir().join("recording_fmp4_test");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("recordings")).await.unwrap();
+        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "teststream");
 
         recorder.set_init(vec![0x66, 0x74, 0x79, 0x70]).await;
         recorder.write_segment(vec![0x6d, 0x6f, 0x6f, 0x66]).await;
         let path = recorder.close().await.unwrap();
-        assert!(path.exists());
+        assert!(tokio::fs::try_exists(&path).await.unwrap_or(false));
 
-        let recordings_dir = std::path::PathBuf::from(test_dir).join("recordings");
-        let entries: Vec<_> = std::fs::read_dir(&recordings_dir).unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name().to_string_lossy().starts_with("teststream_")
-                    && e.file_name().to_string_lossy().ends_with(".mp4")
-            })
-            .collect();
+        let recordings_dir = test_dir.join("recordings");
+        let mut rd = tokio::fs::read_dir(&recordings_dir).await.unwrap();
+        let mut entries = Vec::new();
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("teststream_") && name.ends_with(".mp4") {
+                entries.push(entry);
+            }
+        }
         assert_eq!(entries.len(), 1);
 
-        let contents = std::fs::read(entries[0].path()).unwrap();
+        let contents = tokio::fs::read(entries[0].path()).await.unwrap();
         assert_eq!(&contents[0..4], &[0x66, 0x74, 0x79, 0x70]);
         assert_eq!(&contents[4..8], &[0x6d, 0x6f, 0x6f, 0x66]);
 
-        let _ = std::fs::remove_dir_all(test_dir);
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 
     #[tokio::test]
     async fn test_fmp4_recorder_multiple_segments() {
-        let test_dir = "/tmp/recording_fmp4_multi";
-        let _ = std::fs::remove_dir_all(test_dir);
-        let mut recorder = Fmp4Recorder::new(test_dir, "multistream");
+        let test_dir = std::env::temp_dir().join("recording_fmp4_multi");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("recordings")).await.unwrap();
+        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "multistream");
 
         recorder.set_init(vec![0x01, 0x02]).await;
         recorder.write_segment(vec![0x03, 0x04]).await;
         recorder.write_segment(vec![0x05, 0x06]).await;
         recorder.write_segment(vec![0x07, 0x08]).await;
         let path = recorder.close().await.unwrap();
-        assert!(path.exists());
+        assert!(tokio::fs::try_exists(&path).await.unwrap_or(false));
 
-        let recordings_dir = std::path::PathBuf::from(test_dir).join("recordings");
-        let entries: Vec<_> = std::fs::read_dir(&recordings_dir).unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name().to_string_lossy().starts_with("multistream_")
-                    && e.file_name().to_string_lossy().ends_with(".mp4")
-            })
-            .collect();
+        let recordings_dir = test_dir.join("recordings");
+        let mut rd = tokio::fs::read_dir(&recordings_dir).await.unwrap();
+        let mut entries = Vec::new();
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("multistream_") && name.ends_with(".mp4") {
+                entries.push(entry);
+            }
+        }
         assert_eq!(entries.len(), 1);
 
-        let contents = std::fs::read(entries[0].path()).unwrap();
+        let contents = tokio::fs::read(entries[0].path()).await.unwrap();
         assert_eq!(contents, vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
 
-        let _ = std::fs::remove_dir_all(test_dir);
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_write_index_json() {
+        let test_dir = std::env::temp_dir().join("recording_index_test");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("recordings")).await.unwrap();
+        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "indexstream");
+
+        recorder.set_init(vec![0x66, 0x74, 0x79, 0x70]).await;
+        recorder.write_segment(vec![0x6d, 0x6f, 0x6f, 0x66]).await;
+        let _path = recorder.close().await.unwrap();
+
+        crate::recording::write_index_json(
+            test_dir.to_str().unwrap(),
+            "/recordings",
+            &[320, 480],
+        ).await.unwrap();
+
+        let index_path = test_dir.join("recordings").join("index.json");
+        assert!(tokio::fs::try_exists(&index_path).await.unwrap_or(false));
+
+        let index_data = tokio::fs::read_to_string(&index_path).await.unwrap();
+        let index: crate::recording::RecordingsIndex = serde_json::from_str(&index_data).unwrap();
+        assert_eq!(index.recordings.len(), 1);
+        assert_eq!(index.recordings[0].stream_key, "indexstream");
+
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_double_close() {
+        let test_dir = std::env::temp_dir().join("recording_double_close_test");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("recordings")).await.unwrap();
+        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "doublestream");
+
+        recorder.set_init(vec![0x01, 0x02]).await;
+        let path1 = recorder.close().await.unwrap();
+        let path2 = recorder.close().await.unwrap();
+        assert_eq!(path1, path2);
+
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 
     #[test]

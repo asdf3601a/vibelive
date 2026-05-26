@@ -1,6 +1,21 @@
 pub mod recordings;
 pub mod streams;
 
+pub fn closest_thumbnail_width(requested: Option<u32>, sizes: &[u32]) -> u32 {
+    match requested {
+        None => sizes.first().copied().unwrap_or(480),
+        Some(w) => {
+            let mut best = sizes.first().copied().unwrap_or(480);
+            for &s in sizes {
+                if s <= w && s > best {
+                    best = s;
+                }
+            }
+            best
+        }
+    }
+}
+
 use axum::{Router, routing::get, response::Response};
 use std::sync::Arc;
 use crate::AppState;
@@ -45,4 +60,39 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn(hls_content_type_middleware))
         .merge(api_routes)
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_closest_thumbnail_width_exact_match() {
+        let sizes = vec![320, 480, 640];
+        assert_eq!(closest_thumbnail_width(Some(480), &sizes), 480);
+    }
+
+    #[test]
+    fn test_closest_thumbnail_width_lower() {
+        let sizes = vec![320, 480];
+        assert_eq!(closest_thumbnail_width(Some(640), &sizes), 480);
+    }
+
+    #[test]
+    fn test_closest_thumbnail_width_below_all() {
+        let sizes = vec![320, 480];
+        assert_eq!(closest_thumbnail_width(Some(200), &sizes), 320);
+    }
+
+    #[test]
+    fn test_closest_thumbnail_width_none() {
+        let sizes = vec![320, 480];
+        assert_eq!(closest_thumbnail_width(None, &sizes), 320);
+    }
+
+    #[test]
+    fn test_closest_thumbnail_width_empty_sizes() {
+        assert_eq!(closest_thumbnail_width(Some(200), &[]), 480);
+        assert_eq!(closest_thumbnail_width(None, &[]), 480);
+    }
 }

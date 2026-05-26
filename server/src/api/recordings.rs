@@ -31,22 +31,22 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut recordings = Vec::new();
 
     // Try reading from index.json first
-    if let Ok(index_data) = tokio::fs::read_to_string(&index_path).await {
-        if let Ok(index) = serde_json::from_str::<crate::recording::RecordingsIndex>(&index_data) {
-            for entry in index.recordings {
-                recordings.push(RecordingResponse {
-                    filename: entry.filename,
-                    stream_key: entry.stream_key,
-                    created_at: entry.created_at,
-                    size_bytes: entry.size_bytes,
-                    duration_seconds: entry.duration_seconds,
-                    url: entry.url,
-                    thumbnail_url: entry.thumbnails.values().next().cloned().unwrap_or_default(),
-                    thumbnails: entry.thumbnails,
-                });
-            }
-            return (StatusCode::OK, Json(serde_json::json!(recordings)));
+    if let Ok(index_data) = tokio::fs::read_to_string(&index_path).await
+        && let Ok(index) = serde_json::from_str::<crate::recording::RecordingsIndex>(&index_data)
+    {
+        for entry in index.recordings {
+            recordings.push(RecordingResponse {
+                filename: entry.filename,
+                stream_key: entry.stream_key,
+                created_at: entry.created_at,
+                size_bytes: entry.size_bytes,
+                duration_seconds: entry.duration_seconds,
+                url: entry.url,
+                thumbnail_url: entry.thumbnails.values().next().cloned().unwrap_or_default(),
+                thumbnails: entry.thumbnails,
+            });
         }
+        return (StatusCode::OK, Json(serde_json::json!(recordings)));
     }
 
     // Fallback: scan directory
@@ -80,12 +80,12 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
             let mut thumbnails = HashMap::new();
             for width in &state.config.thumbnail_sizes {
-                let thumb_filename = format!("{}_w{}.jpg", name, width);
+                let thumb_filename = format!("{}_w{}.webp", name, width);
                 let thumb_path = PathBuf::from(&state.config.media_dir)
                     .join("thumbnails")
                     .join("recordings")
                     .join(&thumb_filename);
-                if thumb_path.exists() {
+                if tokio::fs::try_exists(&thumb_path).await.unwrap_or(false) {
                     thumbnails.insert(
                         width.to_string(),
                         format!("{}/thumbnails/{}", state.config.recordings_base_url, thumb_filename),
@@ -117,43 +117,28 @@ pub struct ThumbnailQuery {
     width: Option<u32>,
 }
 
-fn closest_thumbnail_width(requested: Option<u32>, sizes: &[u32]) -> u32 {
-    match requested {
-        None => sizes.first().copied().unwrap_or(480),
-        Some(w) => {
-            let mut best = sizes.first().copied().unwrap_or(480);
-            for &s in sizes {
-                if s <= w && s > best {
-                    best = s;
-                }
-            }
-            best
-        }
-    }
-}
-
 pub async fn thumbnail(
     State(state): State<Arc<AppState>>,
     Path(filename): Path<String>,
     Query(query): Query<ThumbnailQuery>,
 ) -> impl IntoResponse {
-    let width = closest_thumbnail_width(query.width, &state.config.thumbnail_sizes);
+    let width = crate::api::closest_thumbnail_width(query.width, &state.config.thumbnail_sizes);
 
     let thumb_dir = PathBuf::from(&state.config.media_dir).join("thumbnails").join("recordings");
-    let thumb_path = thumb_dir.join(format!("{}_w{}.jpg", filename, width));
+    let thumb_path = thumb_dir.join(format!("{}_w{}.webp", filename, width));
 
     match tokio::fs::read(&thumb_path).await {
         Ok(data) => {
             (
                 StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
+                [(axum::http::header::CONTENT_TYPE, "image/webp")],
                 data,
             ).into_response()
         }
         Err(_) => {
             // Fallback: generate on-the-fly if pre-generated doesn't exist
             let video_path = PathBuf::from(&state.config.media_dir).join("recordings").join(&filename);
-            if !video_path.exists() {
+            if !tokio::fs::try_exists(&video_path).await.unwrap_or(false) {
                 return (StatusCode::NOT_FOUND, "Recording not found").into_response();
             }
 
@@ -164,7 +149,7 @@ pub async fn thumbnail(
                         Ok(data) => {
                             (
                                 StatusCode::OK,
-                                [(axum::http::header::CONTENT_TYPE, "image/jpeg")],
+                                [(axum::http::header::CONTENT_TYPE, "image/webp")],
                                 data,
                             ).into_response()
                         }

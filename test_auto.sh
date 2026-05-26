@@ -122,7 +122,7 @@ run_codec_test() {
         echo -e "${GREEN}✓ Recording generated ($mp4_count file(s))${NC}"
 
         local thumb_count
-        thumb_count=$(find "$MEDIA_DIR/thumbnails/recordings" -name "${key}_*.mp4_w*.jpg" 2>/dev/null | wc -l)
+        thumb_count=$(find "$MEDIA_DIR/thumbnails/recordings" -name "${key}_*.mp4_w*.webp" 2>/dev/null | wc -l)
         if [ "$thumb_count" -gt 0 ]; then
             echo -e "${GREEN}✓ Thumbnails generated ($thumb_count)${NC}"
         else

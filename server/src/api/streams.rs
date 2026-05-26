@@ -61,39 +61,24 @@ pub struct ThumbnailQuery {
     pub width: Option<u32>,
 }
 
-fn closest_thumbnail_width(requested: Option<u32>, sizes: &[u32]) -> u32 {
-    match requested {
-        None => sizes.first().copied().unwrap_or(480),
-        Some(w) => {
-            let mut best = sizes.first().copied().unwrap_or(480);
-            for &s in sizes {
-                if s <= w && s > best {
-                    best = s;
-                }
-            }
-            best
-        }
-    }
-}
-
 pub async fn thumbnail(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
     Query(query): Query<ThumbnailQuery>,
 ) -> impl IntoResponse {
-    let width = closest_thumbnail_width(query.width, &state.config.thumbnail_sizes);
+    let width = crate::api::closest_thumbnail_width(query.width, &state.config.thumbnail_sizes);
     let ttl = state.config.thumbnail_interval_seconds as u64;
     let cache_header = format!("max-age={}, stale-while-revalidate={}", ttl, ttl * 2);
 
     let thumb_dir = std::path::PathBuf::from(&state.config.media_dir).join("thumbnails");
-    let thumb_path = thumb_dir.join(format!("{}_w{}.jpg", key, width));
+    let thumb_path = thumb_dir.join(format!("{}_w{}.webp", key, width));
 
     match tokio::fs::read(&thumb_path).await {
         Ok(data) => {
             (
                 StatusCode::OK,
                 [
-                    (axum::http::header::CONTENT_TYPE, "image/jpeg"),
+                    (axum::http::header::CONTENT_TYPE, "image/webp"),
                     (axum::http::header::CACHE_CONTROL, cache_header.as_str()),
                 ],
                 data,
@@ -113,7 +98,7 @@ pub async fn thumbnail(
                             (
                                 StatusCode::OK,
                                 [
-                                    (axum::http::header::CONTENT_TYPE, "image/jpeg"),
+                                    (axum::http::header::CONTENT_TYPE, "image/webp"),
                                     (axum::http::header::CACHE_CONTROL, cache_header.as_str()),
                                 ],
                                 data,

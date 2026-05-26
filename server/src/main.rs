@@ -14,7 +14,6 @@ use tracing_subscriber::EnvFilter;
 
 pub struct AppState {
     pub stream_manager: RwLock<rtmp::StreamManager>,
-    pub hls_manager: RwLock<hls::HlsManager>,
     pub config: config::Config,
 }
 
@@ -29,7 +28,6 @@ async fn main() -> anyhow::Result<()> {
 
     let app_state = Arc::new(AppState {
         stream_manager: RwLock::new(rtmp::StreamManager::new()),
-        hls_manager: RwLock::new(hls::HlsManager::new(&cfg.media_dir)),
         config: cfg.clone(),
     });
 

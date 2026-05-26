@@ -33,7 +33,7 @@ pub async fn generate_thumbnails_for_stream(
 
     let mut results = Vec::new();
     for &width in sizes {
-        let thumb_path = dir.join(format!("{}_w{}.jpg", stream_key, width));
+        let thumb_path = dir.join(format!("{}_w{}.webp", stream_key, width));
 
         // Check if existing thumbnail is fresh enough
         let should_generate = if let Ok(meta) = tokio::fs::metadata(&thumb_path).await {
@@ -77,7 +77,7 @@ pub async fn generate_thumbnails_for_file(
 
     let mut results = Vec::new();
     for &width in sizes {
-        let thumb_path = output_dir.join(format!("{}_w{}.jpg", filename, width));
+        let thumb_path = output_dir.join(format!("{}_w{}.webp", filename, width));
         run_ffmpeg_thumbnail(video_path, &thumb_path, Some(width)).await?;
         results.push(thumb_path);
     }
@@ -97,7 +97,8 @@ async fn run_ffmpeg_thumbnail(
         "-i".to_string(), input.to_str().unwrap().to_string(),
         "-ss".to_string(), "00:00:00.5".to_string(),
         "-vframes".to_string(), "1".to_string(),
-        "-q:v".to_string(), "2".to_string(),
+        "-quality".to_string(), "75".to_string(),
+        "-compression_level".to_string(), "4".to_string(),
     ];
 
     if let Some(w) = width {

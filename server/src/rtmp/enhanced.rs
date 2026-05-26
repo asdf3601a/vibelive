@@ -1,5 +1,3 @@
-use bytes::Bytes;
-
 pub const ENHANCED_VIDEO_CODEC_ID: u8 = 0xCC;
 pub const ENHANCED_AUDIO_CODEC_ID: u8 = 0xCA;
 
@@ -41,9 +39,7 @@ pub enum VideoFrameType {
 pub struct EnhancedVideoHeader {
     pub packet_type: VideoPacketType,
     pub frame_type: VideoFrameType,
-    pub fourcc: u32,
     pub codec: EnhancedVideoCodec,
-    pub composition_time: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,22 +61,11 @@ impl EnhancedVideoCodec {
             _ => Self::Unknown(fourcc),
         }
     }
-
-    pub fn mpegts_stream_type(&self) -> u8 {
-        match self {
-            Self::Av1 => 0x06,
-            Self::Avc => 0x1B,
-            Self::Hevc => 0x24,
-            Self::Vp9 => 0x06,
-            Self::Unknown(_) => 0x06,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct EnhancedAudioHeader {
     pub packet_type: AudioPacketType,
-    pub fourcc: u32,
     pub codec: EnhancedAudioCodec,
 }
 
@@ -152,16 +137,12 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
         let codec = EnhancedVideoCodec::from_fourcc(fourcc);
 
         let mut consumed = 6;
-        let composition_time = if codec == EnhancedVideoCodec::Avc || codec == EnhancedVideoCodec::Hevc {
+        if codec == EnhancedVideoCodec::Avc || codec == EnhancedVideoCodec::Hevc {
             if data.len() < 9 {
                 return Err("data too short for avc/hevc header");
             }
-            let ct = read_composition_time(data, 6)?;
             consumed = 9;
-            ct
-        } else {
-            0
-        };
+        }
 
         let frame_type = if packet_type == VideoPacketType::SequenceStart {
             VideoFrameType::KeyFrame
@@ -172,9 +153,7 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
         return Ok((EnhancedVideoHeader {
             packet_type,
             frame_type,
-            fourcc,
             codec,
-            composition_time,
         }, &data[consumed..]));
     }
 
@@ -185,9 +164,9 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
         return Err("not an enhanced video header");
     }
 
-    let frame_type = parse_video_frame_type(((first_byte >> 4) & 0x07) as u8)
+    let frame_type = parse_video_frame_type((first_byte >> 4) & 0x07)
         .ok_or("unknown video frame type")?;
-    let packet_type = parse_video_packet_type((first_byte & 0x0F) as u8)
+    let packet_type = parse_video_packet_type(first_byte & 0x0F)
         .ok_or("unknown video packet type")?;
 
     let fourcc_bytes: [u8; 4] = [data[1], data[2], data[3], data[4]];
@@ -195,21 +174,17 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
     let codec = EnhancedVideoCodec::from_fourcc(fourcc);
 
     let mut consumed = 5;
-    let composition_time = if packet_type == VideoPacketType::CodedFrames
-        && (codec == EnhancedVideoCodec::Avc || codec == EnhancedVideoCodec::Hevc) {
-        let ct = read_composition_time(data, 5)?;
+    if packet_type == VideoPacketType::CodedFrames
+        && (codec == EnhancedVideoCodec::Avc || codec == EnhancedVideoCodec::Hevc)
+    {
+        read_composition_time(data, 5)?;
         consumed = 8;
-        ct
-    } else {
-        0
-    };
+    }
 
     Ok((EnhancedVideoHeader {
         packet_type,
         frame_type,
-        fourcc,
         codec,
-        composition_time,
     }, &data[consumed..]))
 }
 
@@ -231,7 +206,6 @@ pub fn parse_enhanced_audio_header(data: &[u8]) -> Result<(EnhancedAudioHeader, 
 
     Ok((EnhancedAudioHeader {
         packet_type,
-        fourcc,
         codec,
     }, &data[6..]))
 }
@@ -267,96 +241,6 @@ pub fn is_enhanced_audio(data: &[u8]) -> bool {
     data.first() == Some(&ENHANCED_AUDIO_CODEC_ID)
 }
 
-/// Convert AVCC-format H.264 NAL units (4-byte length prefix) to Annex-B format (start code prefix).
-/// Also handles AVCDecoderConfigurationRecord (SPS/PPS) which uses 2-byte length prefixes.
-pub fn avcc_to_annexb(data: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(data.len() + 32);
-
-    // Detect AVCDecoderConfigurationRecord: starts with configurationVersion==1
-    // and has enough bytes for the header fields.
-    if data.len() >= 7 && data[0] == 1 {
-        let length_size = ((data[4] as usize) & 0x03) + 1;
-        if length_size == 2 || length_size == 4 {
-            let num_sps = (data[5] as usize) & 0x1F;
-            let mut offset = 6;
-            for _ in 0..num_sps {
-                if offset + 2 > data.len() { break; }
-                let sps_len = ((data[offset] as usize) << 8) | (data[offset + 1] as usize);
-                offset += 2;
-                if offset + sps_len > data.len() { break; }
-                result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                result.extend_from_slice(&data[offset..offset + sps_len]);
-                offset += sps_len;
-            }
-            if offset < data.len() {
-                let num_pps = data[offset] as usize;
-                offset += 1;
-                for _ in 0..num_pps {
-                    if offset + 2 > data.len() { break; }
-                    let pps_len = ((data[offset] as usize) << 8) | (data[offset + 1] as usize);
-                    offset += 2;
-                    if offset + pps_len > data.len() { break; }
-                    result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-                    result.extend_from_slice(&data[offset..offset + pps_len]);
-                    offset += pps_len;
-                }
-            }
-            return result;
-        }
-    }
-
-    // Standard AVCC NAL unit stream: 4-byte length prefix
-    let mut offset = 0;
-    while offset + 4 <= data.len() {
-        let nal_len = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
-        offset += 4;
-        if nal_len == 0 || offset + nal_len > data.len() {
-            result.extend_from_slice(&data[offset..]);
-            break;
-        }
-        result.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-        result.extend_from_slice(&data[offset..offset + nal_len]);
-        offset += nal_len;
-    }
-    result
-}
-
-/// Strip legacy FLV audio tag header.
-/// For AAC (sound format == 10), strips the 2-byte header (sound format byte + AAC packet type).
-/// For other formats, strips only the 1-byte sound format byte.
-pub fn strip_legacy_audio_header(data: &[u8]) -> Vec<u8> {
-    if data.is_empty() {
-        return Vec::new();
-    }
-    let sound_format = (data[0] & 0xF0) >> 4;
-    if sound_format == 10 && data.len() >= 2 {
-        // AAC: strip sound format byte + AAC packet type byte
-        data[2..].to_vec()
-    } else {
-        data[1..].to_vec()
-    }
-}
-
-pub fn parse_legacy_video_header(data: &[u8]) -> Result<(u8, u8, &[u8]), &'static str> {
-    if data.is_empty() {
-        return Err("empty video data");
-    }
-    let frame_type = (data[0] & 0xF0) >> 4;
-    let codec_id = data[0] & 0x0F;
-    let mut consumed = 1;
-
-    if codec_id == 7 {
-        if data.len() < 5 {
-            return Err("data too short for AVC header");
-        }
-        let _avc_packet_type = data[1];
-        consumed = 5;
-        Ok((frame_type, codec_id, &data[consumed..]))
-    } else {
-        Ok((frame_type, codec_id, &data[consumed..]))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,7 +257,6 @@ mod tests {
         let (header, remainder) = parse_enhanced_video_header(&data).unwrap();
         assert_eq!(header.packet_type, VideoPacketType::CodedFrames);
         assert_eq!(header.codec, EnhancedVideoCodec::Av1);
-        assert_eq!(header.fourcc, FCC_AV1);
         assert_eq!(remainder, &[0x0A, 0x0B, 0x0C]);
     }
 
@@ -390,7 +273,6 @@ mod tests {
         assert_eq!(header.packet_type, VideoPacketType::CodedFrames);
         assert_eq!(header.frame_type, VideoFrameType::KeyFrame);
         assert_eq!(header.codec, EnhancedVideoCodec::Av1);
-        assert_eq!(header.fourcc, FCC_AV1);
         assert_eq!(remainder, &[0x12, 0x00, 0x0A]);
     }
 
@@ -420,7 +302,6 @@ mod tests {
         assert!(is_enhanced_video(&data));
         let (header, remainder) = parse_enhanced_video_header(&data).unwrap();
         assert_eq!(header.packet_type, VideoPacketType::CodedFrames);
-        assert_eq!(header.composition_time, 33);
         assert_eq!(header.codec, EnhancedVideoCodec::Avc);
         assert_eq!(remainder, &[0x67, 0x42, 0xC0]);
     }
@@ -437,86 +318,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_legacy_avc_header() {
-        let data: Vec<u8> = vec![
-            0x17,             // frame_type=1 (key), codec_id=7 (AVC)
-            0x00,             // AVCPacketType=0 (sequence header)
-            0x00, 0x00, 0x00, // composition time
-            0x01, 0x02, 0x03, // SPS/PPS data
-        ];
-        assert!(!is_enhanced_video(&data));
-        let (frame_type, codec_id, remainder) = parse_legacy_video_header(&data).unwrap();
-        assert_eq!(frame_type, 1);
-        assert_eq!(codec_id, 7);
-        assert_eq!(remainder, &[0x01, 0x02, 0x03]);
-    }
-
-    #[test]
-    fn test_parse_legacy_video_non_avc() {
-        // codec_id=2 (Sorenson H.263) — only 1 byte consumed
-        let data: Vec<u8> = vec![0x12, 0xAB, 0xCD];
-        let (frame_type, codec_id, remainder) = parse_legacy_video_header(&data).unwrap();
-        assert_eq!(frame_type, 1);
-        assert_eq!(codec_id, 2);
-        assert_eq!(remainder, &[0xAB, 0xCD]);
-    }
-
-    #[test]
-    fn test_parse_legacy_video_truncated() {
-        let data: Vec<u8> = vec![0x17]; // AVC but too short
-        assert!(parse_legacy_video_header(&data).is_err());
-    }
-
-    #[test]
-    fn test_avcc_to_annexb_single_nal() {
-        // One NAL of length 4: [0x00,0x00,0x00,0x04] + [0x65,0x88,0x84,0x00]
-        let avcc = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-        let annexb = avcc_to_annexb(&avcc);
-        assert_eq!(annexb, vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00]);
-    }
-
-    #[test]
-    fn test_avcc_to_annexb_multiple_nals() {
-        // NAL1 len=2: [0x67, 0xAB]
-        // NAL2 len=3: [0x68, 0xCD, 0xEF]
-        let avcc = vec![
-            0x00, 0x00, 0x00, 0x02, 0x67, 0xAB,
-            0x00, 0x00, 0x00, 0x03, 0x68, 0xCD, 0xEF,
-        ];
-        let annexb = avcc_to_annexb(&avcc);
-        assert_eq!(annexb, vec![
-            0x00, 0x00, 0x00, 0x01, 0x67, 0xAB,
-            0x00, 0x00, 0x00, 0x01, 0x68, 0xCD, 0xEF,
-        ]);
-    }
-
-    #[test]
-    fn test_avcc_to_annexb_empty() {
-        assert!(avcc_to_annexb(&[]).is_empty());
-    }
-
-    #[test]
-    fn test_strip_legacy_audio_aac() {
-        // sound format=10 (AAC), rate=3, size=1, type=1 => 0xAF
-        // AAC packet type=1 (raw) => 0x01
-        // Raw AAC data follows
-        let data = vec![0xAF, 0x01, 0xAB, 0xCD];
-        assert_eq!(strip_legacy_audio_header(&data), vec![0xAB, 0xCD]);
-    }
-
-    #[test]
-    fn test_strip_legacy_audio_mp3() {
-        // sound format=2 (MP3) => 0x2A (any second byte is data)
-        let data = vec![0x2A, 0xAB, 0xCD];
-        assert_eq!(strip_legacy_audio_header(&data), vec![0xAB, 0xCD]);
-    }
-
-    #[test]
-    fn test_strip_legacy_audio_empty() {
-        assert!(strip_legacy_audio_header(&[]).is_empty());
-    }
-
-    #[test]
     fn test_parse_enhanced_audio_header() {
         let data: Vec<u8> = vec![
             0xCA,             // Enhanced Audio CodecID
@@ -528,7 +329,6 @@ mod tests {
         let (header, remainder) = parse_enhanced_audio_header(&data).unwrap();
         assert_eq!(header.packet_type, AudioPacketType::CodedFrames);
         assert_eq!(header.codec, EnhancedAudioCodec::Opus);
-        assert_eq!(header.fourcc, FCC_OPUS);
         assert_eq!(remainder, &[0x0A, 0x0B]);
     }
 }

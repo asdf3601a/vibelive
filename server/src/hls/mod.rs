@@ -1,23 +1,7 @@
 pub mod fmp4;
-pub mod mpegts;
-mod playlist;
 
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
-
-pub struct HlsManager {
-    pub base_dir: PathBuf,
-    pub streams: Vec<String>,
-}
-
-impl HlsManager {
-    pub fn new(media_dir: &str) -> Self {
-        Self {
-            base_dir: PathBuf::from(media_dir).join("hls"),
-            streams: Vec::new(),
-        }
-    }
-}
 
 pub struct HlsStreamState {
     stream_dir: PathBuf,
@@ -42,7 +26,6 @@ pub struct HlsStreamState {
 impl HlsStreamState {
     pub fn new(media_dir: &str, stream_key: &str, segment_duration: u32) -> Self {
         let dir = PathBuf::from(media_dir).join("hls").join(stream_key);
-        std::fs::create_dir_all(&dir).ok();
         Self {
             stream_dir: dir,
             segment_duration,
@@ -76,11 +59,10 @@ impl HlsStreamState {
         self.stream_dir.join("index.m3u8")
     }
 
-    pub async fn set_video_config(&mut self, config: &[u8], codec: fmp4::VideoCodec) -> anyhow::Result<()> {
-        self.fmp4_muxer.set_video_codec(codec, 1920, 1080);
+    pub async fn set_video_config(&mut self, config: &[u8], codec: fmp4::VideoCodec, width: u16, height: u16) -> anyhow::Result<()> {
+        self.fmp4_muxer.set_video_codec(codec, width, height);
         self.fmp4_muxer.set_video_config(config.to_vec());
         self.init_written = false;
-        self.write_init_segment().await?;
         Ok(())
     }
 
@@ -88,6 +70,16 @@ impl HlsStreamState {
         self.audio_codec = Some(codec);
         self.fmp4_muxer.set_audio_codec(codec);
         self.fmp4_muxer.set_audio_config(config.to_vec());
+        self.init_written = false;
+        Ok(())
+    }
+
+    pub async fn update_video_resolution(&mut self, width: u16, height: u16) -> anyhow::Result<()> {
+        self.fmp4_muxer.set_video_codec(
+            self.fmp4_muxer.video_codec().unwrap_or(fmp4::VideoCodec::H264),
+            width,
+            height,
+        );
         self.init_written = false;
         self.write_init_segment().await?;
         Ok(())
@@ -128,7 +120,7 @@ impl HlsStreamState {
             if let Some(codec) = self.audio_codec {
                 self.fmp4_muxer.set_audio_codec(codec);
             } else {
-                self.fmp4_muxer.set_audio_codec(fmp4::AudioCodec::AAC);
+                self.fmp4_muxer.set_audio_codec(fmp4::AudioCodec::Aac);
             }
         }
         if self.current_file.is_none() {
@@ -154,6 +146,7 @@ impl HlsStreamState {
     }
 
     async fn rotate_segment(&mut self) -> anyhow::Result<()> {
+        self.write_init_segment().await?;
         let path = self.segment_path(self.segment_index);
         let file = tokio::fs::File::create(&path).await?;
         self.current_file = Some(file);
@@ -242,46 +235,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_hls_stream_state_new() {
-        let test_dir = "/tmp/hls_test_new";
-        let _ = std::fs::remove_dir_all(test_dir);
-        let state = HlsStreamState::new(test_dir, "testkey", 4);
+        let test_dir = std::env::temp_dir().join("hls_test_new");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
+        let state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 4);
         assert_eq!(state.segment_index, 0);
         assert!(state.current_file.is_none());
         assert!(!state.has_video);
         assert!(!state.has_audio);
-        assert!(state.stream_dir.exists());
-        let _ = std::fs::remove_dir_all(test_dir);
+        assert!(tokio::fs::try_exists(&state.stream_dir).await.unwrap_or(false));
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 
     #[tokio::test]
     async fn test_first_video_triggers_segment_creation() {
-        let test_dir = "/tmp/hls_test_first_video";
-        let _ = std::fs::remove_dir_all(test_dir);
-        let mut state = HlsStreamState::new(test_dir, "testkey", 4);
+        let test_dir = std::env::temp_dir().join("hls_test_first_video");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 4);
 
         // Set config first, then write video
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
-        state.set_video_config(&avcc_config, fmp4::VideoCodec::H264).await.unwrap();
+        state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
         state.write_video(&nal, 0, true).await.unwrap();
 
         assert!(state.has_video);
         assert!(state.current_file.is_some());
-        assert!(state.segment_path(0).exists());
-        assert!(state.playlist_path().exists());
+        assert!(tokio::fs::try_exists(state.segment_path(0)).await.unwrap_or(false));
+        assert!(tokio::fs::try_exists(state.playlist_path()).await.unwrap_or(false));
 
-        let _ = std::fs::remove_dir_all(test_dir);
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 
     #[tokio::test]
     async fn test_playlist_content() {
-        let test_dir = "/tmp/hls_test_playlist";
-        let _ = std::fs::remove_dir_all(test_dir);
-        let mut state = HlsStreamState::new(test_dir, "testkey", 2);
+        let test_dir = std::env::temp_dir().join("hls_test_playlist");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2);
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
-        state.set_video_config(&avcc_config, fmp4::VideoCodec::H264).await.unwrap();
+        state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
         state.write_video(&nal, 0, true).await.unwrap();
@@ -297,14 +293,15 @@ mod tests {
         // Should not contain discontinuity tag
         assert!(!playlist.contains("#EXT-X-DISCONTINUITY"));
 
-        let _ = std::fs::remove_dir_all(test_dir);
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 
     #[tokio::test]
     async fn test_audio_before_video_is_noop() {
-        let test_dir = "/tmp/hls_test_audio_first";
-        let _ = std::fs::remove_dir_all(test_dir);
-        let mut state = HlsStreamState::new(test_dir, "testkey", 4);
+        let test_dir = std::env::temp_dir().join("hls_test_audio_first");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 4);
 
         // Audio before video should not create a segment (no current_file)
         let aac = vec![0x01, 0x02, 0x03];
@@ -312,19 +309,20 @@ mod tests {
 
         assert!(!state.has_video);
         assert!(state.current_file.is_none());
-        assert!(!state.segment_path(0).exists());
+        assert!(!tokio::fs::try_exists(state.segment_path(0)).await.unwrap_or(false));
 
-        let _ = std::fs::remove_dir_all(test_dir);
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 
     #[tokio::test]
     async fn test_segment_rotation() {
-        let test_dir = "/tmp/hls_test_rotation";
-        let _ = std::fs::remove_dir_all(test_dir);
-        let mut state = HlsStreamState::new(test_dir, "testkey", 2); // 2s segment duration
+        let test_dir = std::env::temp_dir().join("hls_test_rotation");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2); // 2s segment duration
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
-        state.set_video_config(&avcc_config, fmp4::VideoCodec::H264).await.unwrap();
+        state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
         // First frame at ts=0
@@ -334,8 +332,8 @@ mod tests {
         // Frame at ts=2500 (> 2s duration) triggers finalize + new segment
         state.write_video(&nal, 2500, true).await.unwrap();
         assert_eq!(state.segment_index, 1);
-        assert!(state.segment_path(0).exists());
-        assert!(state.segment_path(1).exists());
+        assert!(tokio::fs::try_exists(state.segment_path(0)).await.unwrap_or(false));
+        assert!(tokio::fs::try_exists(state.segment_path(1)).await.unwrap_or(false));
 
         let playlist = tokio::fs::read_to_string(state.playlist_path()).await.unwrap();
         // Only finalized segment 0 should be in playlist
@@ -343,6 +341,74 @@ mod tests {
         // Segment 1 is not yet finalized, should not appear
         assert!(!playlist.contains("segment00001.m4s"));
 
-        let _ = std::fs::remove_dir_all(test_dir);
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_grace_period() {
+        let test_dir = std::env::temp_dir().join("hls_test_grace");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2);
+
+        let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
+        state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
+
+        let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
+        state.write_video(&nal, 0, true).await.unwrap();
+        state.finalize_segment().await.unwrap();
+
+        let old_offset = state.timestamp_offset;
+        state.prepare_for_grace_period().await.unwrap();
+        assert!(state.timestamp_offset > old_offset);
+        assert_eq!(state.segment_index, 1);
+        assert!(state.current_file.is_some());
+
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_close_adds_endlist() {
+        let test_dir = std::env::temp_dir().join("hls_test_close");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2);
+
+        let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
+        state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
+
+        let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
+        state.write_video(&nal, 0, true).await.unwrap();
+        state.close().await.unwrap();
+
+        let playlist = tokio::fs::read_to_string(state.playlist_path()).await.unwrap();
+        assert!(playlist.ends_with("#EXT-X-ENDLIST\n"));
+
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_audio_video_combined() {
+        let test_dir = std::env::temp_dir().join("hls_test_av_combined");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2);
+
+        let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
+        state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
+        let aac_config = vec![0x12, 0x10];
+        state.set_audio_config(fmp4::AudioCodec::Aac, &aac_config).await.unwrap();
+
+        let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
+        state.write_video(&nal, 0, true).await.unwrap();
+        let aac = vec![0xAF, 0x01];
+        state.write_audio(&aac, 0).await.unwrap();
+        state.finalize_segment().await.unwrap();
+
+        assert!(tokio::fs::try_exists(state.segment_path(0)).await.unwrap_or(false));
+        let playlist = tokio::fs::read_to_string(state.playlist_path()).await.unwrap();
+        assert!(playlist.contains("segment00000.m4s"));
+
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 }

@@ -10,7 +10,7 @@ pub enum VideoCodec {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AudioCodec {
-    AAC,
+    Aac,
     Opus,
 }
 
@@ -34,7 +34,6 @@ pub struct Fmp4Muxer {
     video_samples: Vec<Sample>,
     audio_samples: Vec<Sample>,
     video_sequence_number: u32,
-    audio_sequence_number: u32,
     video_base_dts: u64,
     audio_base_pts: u64,
 }
@@ -51,10 +50,13 @@ impl Fmp4Muxer {
             video_samples: Vec::new(),
             audio_samples: Vec::new(),
             video_sequence_number: 0,
-            audio_sequence_number: 0,
             video_base_dts: 0,
             audio_base_pts: 0,
         }
+    }
+
+    pub fn video_codec(&self) -> Option<VideoCodec> {
+        self.video_codec
     }
 
     pub fn set_video_codec(&mut self, codec: VideoCodec, width: u16, height: u16) {
@@ -156,6 +158,7 @@ impl Fmp4Muxer {
         }
     }
 
+    #[cfg(test)]
     pub fn set_video_durations(&mut self, durations: Vec<u32>) {
         if durations.len() == self.video_samples.len() {
             for (i, dur) in durations.iter().enumerate() {
@@ -164,6 +167,7 @@ impl Fmp4Muxer {
         }
     }
 
+    #[cfg(test)]
     pub fn set_audio_durations(&mut self, durations: Vec<u32>) {
         if durations.len() == self.audio_samples.len() {
             for (i, dur) in durations.iter().enumerate() {
@@ -172,6 +176,7 @@ impl Fmp4Muxer {
         }
     }
 
+    #[cfg(test)]
     pub fn flush_video_fragment(&mut self) -> Option<Vec<u8>> {
         if self.video_samples.is_empty() {
             return None;
@@ -182,19 +187,6 @@ impl Fmp4Muxer {
         self.write_moof(&mut buf, 1, self.video_sequence_number, self.video_base_dts, &self.video_samples);
         self.write_mdat(&mut buf, &self.video_samples);
         self.video_samples.clear();
-        Some(buf)
-    }
-
-    pub fn flush_audio_fragment(&mut self) -> Option<Vec<u8>> {
-        if self.audio_samples.is_empty() {
-            return None;
-        }
-        self.compute_and_set_durations();
-        self.audio_sequence_number += 1;
-        let mut buf = Vec::new();
-        self.write_moof(&mut buf, 2, self.audio_sequence_number, self.audio_base_pts, &self.audio_samples);
-        self.write_mdat(&mut buf, &self.audio_samples);
-        self.audio_samples.clear();
         Some(buf)
     }
 
@@ -587,6 +579,7 @@ impl Fmp4Muxer {
 
     // --- Fragment writers ---
 
+    #[cfg(test)]
     fn write_moof(&self, w: &mut Vec<u8>, track_id: u32, sequence_number: u32, base_dts: u64, samples: &[Sample]) {
         let mut moof_data = Vec::new();
         self.write_mfhd(&mut moof_data, sequence_number);
@@ -618,6 +611,7 @@ impl Fmp4Muxer {
         write_box(w, b"moof", &moof_data);
     }
 
+    #[cfg(test)]
     fn compute_single_track_data_offset(&self, samples: &[Sample]) -> u32 {
         let traf_size = self.compute_traf_size(samples);
         let moof_size = 8 + 16 + traf_size; // moof header + mfhd + traf
@@ -679,6 +673,7 @@ impl Fmp4Muxer {
         write_fullbox(w, b"trun", 0, flags, &data);
     }
 
+    #[cfg(test)]
     fn write_mdat(&self, w: &mut Vec<u8>, samples: &[Sample]) {
         let mut data = Vec::new();
         for s in samples {
@@ -826,7 +821,7 @@ mod tests {
     fn test_moov_structure() {
         let mut muxer = Fmp4Muxer::new();
         muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
-        muxer.set_audio_codec(AudioCodec::AAC);
+        muxer.set_audio_codec(AudioCodec::Aac);
         muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00]);
         let init = muxer.init_segment();
         // Should contain ftyp + moov
@@ -856,7 +851,7 @@ mod tests {
     fn test_combined_fragment() {
         let mut muxer = Fmp4Muxer::new();
         muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
-        muxer.set_audio_codec(AudioCodec::AAC);
+        muxer.set_audio_codec(AudioCodec::Aac);
         muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
         muxer.set_audio_config(vec![0x12, 0x10]);
 
@@ -865,7 +860,20 @@ mod tests {
         muxer.set_video_durations(vec![33]);
         muxer.set_audio_durations(vec![21]);
 
-        let frag = muxer.flush_combined_fragment();
-        assert!(frag.is_some());
+        let frag = muxer.flush_combined_fragment().unwrap();
+        assert!(frag.len() > 16);
+        assert!(frag.windows(4).any(|w| w == b"moof"));
+        assert!(frag.windows(4).any(|w| w == b"mdat"));
+    }
+
+    #[test]
+    fn test_moov_video_only() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H264, 1280, 720);
+        muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
+        let init = muxer.init_segment();
+        // Should contain exactly one trak (video only)
+        assert_eq!(init.windows(4).filter(|w| *w == b"trak").count(), 1);
+        assert!(init.windows(4).any(|w| w == b"avc1"));
     }
 }

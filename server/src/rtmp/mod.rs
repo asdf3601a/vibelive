@@ -1,7 +1,6 @@
 pub mod enhanced;
 pub mod server;
 pub mod session;
-pub mod stream;
 
 pub use server::start_rtmp_server;
 
@@ -86,10 +85,10 @@ impl StreamManager {
 
     pub fn reconnect(&mut self, stream_key: &str) -> Option<PendingStream> {
         let pending = self.pending_streams.remove(stream_key);
-        if pending.is_some() {
-            if let Some(ref mut info) = self.publishers.get_mut(stream_key) {
-                info.disconnected_at = None;
-            }
+        if pending.is_some()
+            && let Some(ref mut info) = self.publishers.get_mut(stream_key)
+        {
+            info.disconnected_at = None;
         }
         pending
     }
