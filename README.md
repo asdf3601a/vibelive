@@ -101,8 +101,10 @@ Environment variables (all in `.env`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `RTMP_HOST` | `0.0.0.0` | RTMP listen address |
 | `RTMP_PORT` | 1935 | RTMP ingestion port |
-| `API_PORT` | 8081 | Internal API/HLS port |
+| `API_HOST` | `0.0.0.0` | API/HLS listen address |
+| `API_PORT` | 8080 | Internal API/HLS port |
 | `MEDIA_DIR` | `./data` | Root for HLS, recordings, thumbnails |
 | `HLS_SEGMENT_DURATION` | 4 | Target segment duration in seconds |
 | `HLS_SEGMENTS_KEEP` | 10 | Unused (legacy) |
@@ -183,7 +185,7 @@ Environment variables (all in `.env`):
 
 ### 7.1 Prerequisites
 
-- Rust 1.85+ (for 2024 edition)
+- Rust 1.95+ (for 2024 edition with `let` chains)
 - Node.js 22+ + npm
 - ffmpeg (for thumbnails and test scripts)
 - nginx (for reverse proxy in production-like setups)
@@ -222,12 +224,44 @@ cd frontend && npm run dev   # port 3000, proxies to localhost:8080
 
 ### 7.3 Docker Setup
 
+The project provides a split-container deployment via Docker Compose:
+
+- **`livestream-backend`** — Rust server (RTMP 1935 + API/HLS 8080)
+- **`livestream-nginx`** — nginx serving the Vue frontend and proxying `/api/`, `/hls/` to the backend
+
 ```bash
-docker build -t livestream-server .
-docker run -p 1935:1935 -p 8080:8080 -v media:/data livestream-server
+# Build images and start containers
+docker compose up --build -d
+
+# Check status
+docker compose ps
+
+# View logs
+docker compose logs -f backend
+docker compose logs -f nginx
 ```
 
-Or use `docker-compose up`.
+**Port mapping (Docker):**
+
+| Host | Container | Service |
+|------|-----------|---------|
+| `1935` | `backend:1935` | RTMP ingestion |
+| `8080` | `nginx:80` | HTTP (SPA + API proxy + HLS proxy + recordings) |
+
+**Environment variables (Docker Compose):**
+
+Set in `docker-compose.yml` or via `.env`:
+
+```yaml
+RTMP_HOST=0.0.0.0
+RTMP_PORT=1935
+API_HOST=0.0.0.0
+API_PORT=8080
+MEDIA_DIR=/data
+RUST_LOG=info
+```
+
+For a single-image build (legacy multi-stage), use the root `Dockerfile` instead.
 
 ## 8. Maintenance
 
@@ -390,9 +424,12 @@ vibe-livestream/
 │   ├── stores/              # Pinia stores
 │   ├── router/              # Vue Router config
 │   └── types/               # TypeScript interfaces
-├── nginx.local.conf         # nginx reverse proxy config
-├── Dockerfile               # Multi-stage build
-├── docker-compose.yml       # Docker Compose setup
+├── nginx.local.conf         # nginx reverse proxy config (local dev)
+├── nginx.docker.conf        # nginx config for Docker Compose
+├── Dockerfile               # Legacy single-image multi-stage build
+├── Dockerfile.backend       # Rust backend image
+├── Dockerfile.nginx         # Frontend + nginx image
+├── docker-compose.yml       # Docker Compose setup (backend + nginx)
 └── test_auto.sh             # Automated integration tests
 ```
 
