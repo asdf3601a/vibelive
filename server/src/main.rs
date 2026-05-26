@@ -39,6 +39,30 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Background task: periodically generate thumbnails for all active streams
+    let thumb_state = app_state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+            thumb_state.config.thumbnail_interval_seconds.max(5) as u64,
+        ));
+        loop {
+            interval.tick().await;
+            let sm = thumb_state.stream_manager.read().await;
+            let keys: Vec<String> = sm.publishers.keys().cloned().collect();
+            let media_dir = thumb_state.config.media_dir.clone();
+            let sizes = thumb_state.config.thumbnail_sizes.clone();
+            let iv = thumb_state.config.thumbnail_interval_seconds;
+            drop(sm);
+            for key in keys {
+                let md = media_dir.clone();
+                let sz = sizes.clone();
+                tokio::spawn(async move {
+                    let _ = crate::thumbnail::generate_thumbnails_for_stream(&md, &key, &sz, iv).await;
+                });
+            }
+        }
+    });
+
     let api_router = api::create_router(app_state.clone());
     let api_addr: SocketAddr = format!("{}:{}", cfg.api_host, cfg.api_port).parse()?;
 

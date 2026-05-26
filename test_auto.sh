@@ -22,7 +22,9 @@ api_call() {
 
 count_recordings() {
     local key=$1
-    (ls "$MEDIA_DIR/recordings/" 2>/dev/null | grep -c "^${key}_") 2>/dev/null || echo 0
+    local count
+    count=$(ls "$MEDIA_DIR/recordings/" 2>/dev/null | grep -c "^${key}_" 2>/dev/null) || count=0
+    echo "$count"
 }
 
 check_mp4_integrity() {
@@ -291,6 +293,7 @@ echo ""
 echo "========== VIDEO + AUDIO CODEC TESTS =========="
 
 run_codec_test "H264 + AAC (legacy baseline)" libx264 aac "-preset ultrafast -tune zerolatency"
+run_codec_test "HEVC + AAC (enhanced video)" libx265 aac "-preset ultrafast -tune zerolatency"
 run_codec_test "AV1 + AAC (enhanced video)" libsvtav1 aac "-svtav1-params preset=12:crf=35"
 run_codec_test "H264 + Opus (enhanced audio)" libx264 libopus "-preset ultrafast -tune zerolatency -ar 48000"
 run_codec_test "AV1 + Opus (both enhanced)" libsvtav1 libopus "-svtav1-params preset=12:crf=35 -ar 48000"

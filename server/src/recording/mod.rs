@@ -2,12 +2,114 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
+fn hash_bytes(data: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Scan an fMP4 segment for tfdt box and rewrite base_media_decode_time.
+/// Returns the new base_media_decode_time if found.
+fn rewrite_segment_tfdt(segment: &mut [u8], offset: u64) -> Option<u64> {
+    // Find moof box
+    let moof_pos = find_box(segment, b"moof")?;
+    let moof_size = read_u32(&segment[moof_pos..moof_pos + 4]) as usize;
+    let moof_end = moof_pos + moof_size;
+    if moof_end > segment.len() {
+        return None;
+    }
+
+    // Find traf inside moof
+    let traf_pos = find_box_in_range(&segment[moof_pos + 8..moof_end], b"traf")?;
+    let traf_pos = moof_pos + 8 + traf_pos;
+    let traf_size = read_u32(&segment[traf_pos..traf_pos + 4]) as usize;
+    let traf_end = traf_pos + traf_size;
+    if traf_end > segment.len() {
+        return None;
+    }
+
+    // Find tfdt inside traf
+    let tfdt_pos = find_box_in_range(&segment[traf_pos + 8..traf_end], b"tfdt")?;
+    let tfdt_pos = traf_pos + 8 + tfdt_pos;
+    let tfdt_size = read_u32(&segment[tfdt_pos..tfdt_pos + 4]) as usize;
+    if tfdt_pos + tfdt_size > segment.len() || tfdt_size < 20 {
+        return None;
+    }
+
+    // tfdt version at offset 8
+    let version = segment[tfdt_pos + 8];
+    let data_start = tfdt_pos + 12; // after size(4) + type(4) + version/flags(4)
+
+    if version == 1 && data_start + 8 <= segment.len() {
+        let base_media_decode_time = read_u64(&segment[data_start..data_start + 8]);
+        let new_time = base_media_decode_time + offset;
+        write_u64(&mut segment[data_start..data_start + 8], new_time);
+        Some(new_time)
+    } else if version == 0 && data_start + 4 <= segment.len() {
+        let base_media_decode_time = read_u32(&segment[data_start..data_start + 4]) as u64;
+        let new_time = base_media_decode_time + offset;
+        write_u32(&mut segment[data_start..data_start + 4], new_time as u32);
+        Some(new_time)
+    } else {
+        None
+    }
+}
+
+fn find_box(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
+    find_box_in_range(data, box_type)
+}
+
+fn find_box_in_range(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
+    let mut offset = 0;
+    while offset + 8 <= data.len() {
+        let size = read_u32(&data[offset..offset + 4]) as usize;
+        if size == 0 {
+            // Box extends to end of parent
+            break;
+        }
+        if size == 1 {
+            // Extended size (64-bit) - skip for simplicity
+            offset += 16;
+            continue;
+        }
+        if &data[offset + 4..offset + 8] == box_type {
+            return Some(offset);
+        }
+        offset += size;
+    }
+    None
+}
+
+fn read_u32(data: &[u8]) -> u32 {
+    u32::from_be_bytes([data[0], data[1], data[2], data[3]])
+}
+
+fn write_u32(data: &mut [u8], value: u32) {
+    data[..4].copy_from_slice(&value.to_be_bytes());
+}
+
+fn read_u64(data: &[u8]) -> u64 {
+    u64::from_be_bytes([
+        data[0], data[1], data[2], data[3],
+        data[4], data[5], data[6], data[7],
+    ])
+}
+
+fn write_u64(data: &mut [u8], value: u64) {
+    data[..8].copy_from_slice(&value.to_be_bytes());
+}
+
 pub struct Fmp4Recorder {
     dir: PathBuf,
     stream_key: String,
     file: Option<tokio::fs::File>,
     closed: bool,
     saved_path: Option<PathBuf>,
+    last_init_hash: Option<u64>,
+    recording_time_offset: u64,
+    last_tfdt: Option<u64>,
 }
 
 impl Fmp4Recorder {
@@ -19,10 +121,22 @@ impl Fmp4Recorder {
             file: None,
             closed: false,
             saved_path: None,
+            last_init_hash: None,
+            recording_time_offset: 0,
+            last_tfdt: None,
         }
     }
 
     pub async fn write_init(&mut self, init: &[u8]) -> std::io::Result<()> {
+        let new_hash = hash_bytes(init);
+        if let Some(last_hash) = self.last_init_hash {
+            if last_hash != new_hash && self.file.is_some() {
+                // Init changed while file is open: close current and start new recording
+                let _ = self.close().await;
+                self.closed = false;
+            }
+        }
+
         if self.file.is_none() {
             let path = self.dir.join(format!(
                 "{}_{}.mp4",
@@ -35,13 +149,35 @@ impl Fmp4Recorder {
             file.sync_all().await?;
             self.saved_path = Some(path);
             self.file = Some(file);
+            self.last_tfdt = None;
         }
+        self.last_init_hash = Some(new_hash);
         Ok(())
     }
 
     pub async fn write_segment(&mut self, segment: &[u8]) -> std::io::Result<()> {
         if let Some(ref mut file) = self.file {
-            file.write_all(segment).await?;
+            let mut segment = segment.to_vec();
+
+            if let Some(rewritten_tfdt) = rewrite_segment_tfdt(&mut segment, self.recording_time_offset) {
+                if let Some(last_tfdt) = self.last_tfdt {
+                    if rewritten_tfdt < last_tfdt {
+                        // Gap or backward jump detected: bridge it
+                        let gap = last_tfdt.saturating_sub(rewritten_tfdt) + 1;
+                        self.recording_time_offset += gap;
+                        // Re-rewrite with adjusted offset
+                        if let Some(new_tfdt) = rewrite_segment_tfdt(&mut segment, self.recording_time_offset) {
+                            self.last_tfdt = Some(new_tfdt);
+                        }
+                    } else {
+                        self.last_tfdt = Some(rewritten_tfdt);
+                    }
+                } else {
+                    self.last_tfdt = Some(rewritten_tfdt);
+                }
+            }
+
+            file.write_all(&segment).await?;
             file.flush().await?;
             file.sync_all().await?;
         }

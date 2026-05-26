@@ -120,6 +120,16 @@ impl Fmp4Muxer {
         });
     }
 
+    /// Returns the duration of the last video sample, or a default if none.
+    pub fn last_video_sample_duration(&self) -> u64 {
+        self.video_samples.last().map(|s| s.duration as u64).unwrap_or(33)
+    }
+
+    /// Returns the duration of the last audio sample, or a default if none.
+    pub fn last_audio_sample_duration(&self) -> u64 {
+        self.audio_samples.last().map(|s| s.duration as u64).unwrap_or(21)
+    }
+
     pub fn compute_and_set_durations(&mut self) {
         // Video durations
         if self.video_samples.len() > 1 {
@@ -431,8 +441,11 @@ impl Fmp4Muxer {
         data.extend_from_slice(&1u32.to_be_bytes()); // entry_count
         if let Some(codec) = self.video_codec {
             match codec {
-                VideoCodec::H264 | VideoCodec::H265 => {
+                VideoCodec::H264 => {
                     self.write_avc1_sample_entry(&mut data);
+                }
+                VideoCodec::H265 => {
+                    self.write_hvc1_sample_entry(&mut data);
                 }
                 VideoCodec::AV1 => {
                     self.write_av01_sample_entry(&mut data);
@@ -483,6 +496,33 @@ impl Fmp4Muxer {
         write_box(w, b"avc1", &data);
     }
 
+    fn write_hvc1_sample_entry(&self, w: &mut Vec<u8>) {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 6]); // reserved
+        data.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+        data.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
+        data.extend_from_slice(&0u16.to_be_bytes()); // reserved
+        data.extend_from_slice(&[0u8; 12]); // pre_defined
+        data.extend_from_slice(&self.video_width.to_be_bytes());
+        data.extend_from_slice(&self.video_height.to_be_bytes());
+        data.extend_from_slice(&0x00480000u32.to_be_bytes()); // horizresolution
+        data.extend_from_slice(&0x00480000u32.to_be_bytes()); // vertresolution
+        data.extend_from_slice(&0u32.to_be_bytes()); // reserved
+        data.extend_from_slice(&1u16.to_be_bytes()); // frame_count
+        data.extend_from_slice(&[0u8; 32]); // compressorname
+        data.extend_from_slice(&0x0018u16.to_be_bytes()); // depth
+        data.extend_from_slice(&0xFFFFu16.to_be_bytes()); // pre_defined
+
+        // hvcC box
+        if let Some(ref config) = self.video_config {
+            write_box(&mut data, b"hvcC", config);
+        } else {
+            write_box(&mut data, b"hvcC", &[]);
+        }
+
+        write_box(w, b"hvc1", &data);
+    }
+
     fn write_av01_sample_entry(&self, w: &mut Vec<u8>) {
         let mut data = Vec::new();
         data.extend_from_slice(&[0u8; 6]); // reserved
@@ -502,7 +542,8 @@ impl Fmp4Muxer {
 
         // av1C box
         if let Some(ref config) = self.video_config {
-            write_box(&mut data, b"av1C", config);
+            let av1c = av1c_box_from_config(config);
+            write_box(&mut data, b"av1C", &av1c);
         } else {
             // Minimal av1C with version=1, marker=1
             write_box(&mut data, b"av1C", &[0x81, 0x00, 0x00, 0x00]);
@@ -684,6 +725,166 @@ impl Fmp4Muxer {
         w.extend_from_slice(b"mdat");
         w.extend_from_slice(&data);
     }
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    byte_offset: usize,
+    bit_offset: u8, // 0-7, MSB first
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, byte_offset: 0, bit_offset: 0 }
+    }
+
+    fn read_bit(&mut self) -> u8 {
+        if self.byte_offset >= self.data.len() {
+            return 0;
+        }
+        let bit = (self.data[self.byte_offset] >> (7 - self.bit_offset)) & 1;
+        self.bit_offset += 1;
+        if self.bit_offset == 8 {
+            self.bit_offset = 0;
+            self.byte_offset += 1;
+        }
+        bit
+    }
+
+    fn read_bits(&mut self, n: u8) -> u64 {
+        let mut result = 0u64;
+        for _ in 0..n {
+            result = (result << 1) | self.read_bit() as u64;
+        }
+        result
+    }
+}
+
+/// Parse raw AV1 OBUs and construct a valid av1C box content.
+/// If config already starts with AV1CodecConfigurationRecord (marker=1, version=1 = 0x81),
+/// return it as-is. Otherwise, parse the sequence header OBU to extract profile and level.
+pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
+    if config.is_empty() {
+        return vec![0x81, 0x00, 0x00, 0x00];
+    }
+    if config[0] == 0x81 {
+        // Already an AV1CodecConfigurationRecord
+        return config.to_vec();
+    }
+
+    // Parse OBU header to find sequence header
+    let mut offset = 0;
+    let mut seq_header_payload: Option<&[u8]> = None;
+
+    while offset < config.len() && seq_header_payload.is_none() {
+        let obu_header = config[offset];
+        offset += 1;
+        let obu_type = ((obu_header >> 3) & 0x0F) as u8;
+        let obu_extension_flag = (obu_header >> 2) & 1;
+        let obu_has_size_field = (obu_header >> 1) & 1;
+
+        if obu_extension_flag == 1 {
+            offset += 1; // skip temporal_id / spatial_id
+        }
+
+        let mut obu_size = 0usize;
+        if obu_has_size_field == 1 {
+            let mut shift = 0;
+            loop {
+                if offset >= config.len() { break; }
+                let byte = config[offset];
+                offset += 1;
+                obu_size |= ((byte & 0x7F) as usize) << shift;
+                if byte & 0x80 == 0 { break; }
+                shift += 7;
+            }
+        } else {
+            // OBU extends to end of data
+            obu_size = config.len() - offset;
+        }
+
+        if obu_type == 1 { // OBU_SEQUENCE_HEADER
+            if offset + obu_size <= config.len() {
+                seq_header_payload = Some(&config[offset..offset + obu_size]);
+            }
+            break;
+        }
+
+        offset += obu_size;
+    }
+
+    let (seq_profile, seq_level_idx_0) = if let Some(payload) = seq_header_payload {
+        let mut r = BitReader::new(payload);
+        let seq_profile = r.read_bits(3) as u8;
+        let _still_picture = r.read_bit();
+        let reduced_still_picture_header = r.read_bit();
+
+        if reduced_still_picture_header == 1 {
+            let seq_level_idx_0 = r.read_bits(5) as u8;
+            (seq_profile, seq_level_idx_0)
+        } else {
+            let timing_info_present_flag = r.read_bit();
+            if timing_info_present_flag == 1 {
+                let _ = r.read_bits(32); // num_units_in_display_tick
+                let _ = r.read_bits(32); // time_scale
+                let equal_picture_interval = r.read_bit();
+                if equal_picture_interval == 0 {
+                    // Skip UVLC num_ticks_per_picture_minus_1
+                    // UVLC: leadingZeroBits, then (leadingZeroBits+1) bits
+                    // Simplified: skip up to 8 bytes max to find non-zero start
+                    let mut leading_zeros = 0u8;
+                    while r.read_bit() == 0 && leading_zeros < 8 {
+                        leading_zeros += 1;
+                    }
+                    if leading_zeros > 0 {
+                        let _ = r.read_bits(leading_zeros);
+                    }
+                }
+                let decoder_model_info_present_flag = r.read_bit();
+                if decoder_model_info_present_flag == 1 {
+                    let _ = r.read_bits(5);  // buffer_delay_length_minus_1
+                    let _ = r.read_bits(32); // num_units_in_decoding_tick
+                    let _ = r.read_bits(5);  // buffer_removal_time_length_minus_1
+                    let _ = r.read_bits(5);  // frame_presentation_time_length_minus_1
+                }
+                let initial_display_delay_present_flag = r.read_bit();
+                if initial_display_delay_present_flag == 1 {
+                    let _ = r.read_bits(4); // initial_display_delay_minus_1
+                }
+            } else {
+                let initial_display_delay_present_flag = r.read_bit();
+                if initial_display_delay_present_flag == 1 {
+                    let _ = r.read_bits(4); // initial_display_delay_minus_1
+                }
+            }
+
+            let operating_points_cnt_minus_1 = r.read_bits(5) as u8;
+            let mut seq_level_idx_0 = 0u8;
+            for i in 0..=operating_points_cnt_minus_1 {
+                let _ = r.read_bits(12); // operating_point_idc[i]
+                let seq_level_idx = r.read_bits(5) as u8;
+                if i == 0 {
+                    seq_level_idx_0 = seq_level_idx;
+                    if seq_level_idx > 7 {
+                        let _ = r.read_bit(); // seq_tier[0]
+                    }
+                } else if seq_level_idx > 7 {
+                    let _ = r.read_bit(); // seq_tier[i]
+                }
+            }
+            (seq_profile, seq_level_idx_0)
+        }
+    } else {
+        (0, 0)
+    };
+
+    let profile_level = (seq_profile << 5) | (seq_level_idx_0 & 0x1F);
+    let chroma_flags = 0x00; // chroma_subsampling_x=1, chroma_subsampling_y=1, chroma_sample_position=0
+    let delay_flags = 0x00;  // initial_presentation_delay_present=0
+
+    let mut av1c = vec![0x81, profile_level, chroma_flags, delay_flags];
+    av1c.extend_from_slice(config);
+    av1c
 }
 
 fn write_box(w: &mut Vec<u8>, box_type: &[u8; 4], data: &[u8]) {
@@ -875,5 +1076,59 @@ mod tests {
         // Should contain exactly one trak (video only)
         assert_eq!(init.windows(4).filter(|w| *w == b"trak").count(), 1);
         assert!(init.windows(4).any(|w| w == b"avc1"));
+    }
+
+    #[test]
+    fn test_hevc_init_segment() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H265, 1920, 1080);
+        muxer.set_video_config(vec![0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 0x03, 0x20, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xAC, 0x09]);
+        let init = muxer.init_segment();
+        assert!(init.windows(4).any(|w| w == b"hvc1"));
+        assert!(init.windows(4).any(|w| w == b"hvcC"));
+    }
+
+    #[test]
+    fn test_av1c_passthrough() {
+        // Already an AV1CodecConfigurationRecord (starts with 0x81)
+        let config = vec![0x81, 0x04, 0x0c, 0x00];
+        let av1c = av1c_box_from_config(&config);
+        assert_eq!(av1c, config);
+    }
+
+    #[test]
+    fn test_av1c_from_raw_obu() {
+        // Raw AV1 sequence header OBU:
+        // OBU header: 0x0a = type=1 (SEQ_HDR), has_size=1
+        // OBU size: 0x04 = 4 bytes
+        // Sequence header payload (simplified):
+        // seq_profile=0 (3 bits), still_picture=0 (1 bit), reduced_still_picture_header=0 (1 bit)
+        // timing_info_present_flag=0 (1 bit), initial_display_delay_present_flag=0 (1 bit)
+        // operating_points_cnt_minus_1=0 (5 bits)
+        // operating_point_idc[0]=0 (12 bits)
+        // seq_level_idx[0]=8 (5 bits) -> level 4.0
+        // seq_tier[0]=0 (1 bit, since level > 7)
+        //
+        // Byte layout (MSB first):
+        // Byte 0: seq_profile(3) | still(1) | reduced(1) | timing_info(1) | initial_disp(1) | op_cnt(2 MSB)
+        //         = 000 | 0 | 0 | 0 | 0 | 00 = 0x00
+        // Byte 1: op_cnt(3 LSB) | op_idc(4 MSB)
+        //         = 000 | 0000 = 0x00
+        // Byte 2: op_idc(8 LSB)
+        //         = 0000_0000 = 0x00
+        // Byte 3: seq_level_idx(5) | seq_tier(1) | remaining(2)
+        //         = 01000 | 0 | 00 = 0x40
+        //
+        // So payload = [0x00, 0x00, 0x00, 0x40]
+        // Full OBU = [0x0a, 0x04, 0x00, 0x00, 0x00, 0x40]
+        let obu = vec![0x0a, 0x04, 0x00, 0x00, 0x00, 0x40];
+        let av1c = av1c_box_from_config(&obu);
+        // av1C header: marker=1, version=1, profile_level=(0<<5)|8=8, chroma=0, delay=0
+        assert_eq!(av1c[0], 0x81);
+        assert_eq!(av1c[1], 0x08); // profile=0, level=8
+        assert_eq!(av1c[2], 0x00);
+        assert_eq!(av1c[3], 0x00);
+        // configOBUs appended
+        assert_eq!(&av1c[4..], &obu[..]);
     }
 }

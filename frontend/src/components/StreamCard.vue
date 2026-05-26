@@ -58,7 +58,6 @@ import BaseCard from '@/components/ui/BaseCard.vue'
 import BaseBadge from '@/components/ui/BaseBadge.vue'
 import BaseTag from '@/components/ui/BaseTag.vue'
 import ThumbnailImg from '@/components/ThumbnailImg.vue'
-import { getThumbnailUrl } from '@/api/streams'
 import { useRelativeTime } from '@/composables/useRelativeTime'
 import { formatDateTime } from '@/utils/format'
 
@@ -69,7 +68,9 @@ interface Props {
 const props = defineProps<Props>()
 
 const thumbnailUrl = computed(() =>
-  getThumbnailUrl(props.stream.stream_key, 400),
+  props.stream.thumbnails['480']
+    || props.stream.thumbnails['320']
+    || props.stream.thumbnail_url
 )
 
 const relativeTime = useRelativeTime(props.stream.started_at)

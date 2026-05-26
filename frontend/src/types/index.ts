@@ -21,6 +21,8 @@ export interface Stream {
   metadata: StreamMetadata | null
   hls_url: string | null
   player_url: string | null
+  thumbnail_url: string
+  thumbnails: Record<string, string>
 }
 
 /** Represents a saved recording (fMP4 → MP4). */

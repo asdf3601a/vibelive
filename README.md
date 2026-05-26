@@ -24,8 +24,9 @@ LiveStream Platform is a self-hosted live streaming server that ingests RTMP str
 │  (HLS.js player)│               │  - /api/   → localhost:8081 │
 │                 │               │  - /hls/   → localhost:8081 │
 │                 │               │  - /       → frontend/dist  │
-└─────────────────┘               │  - /recordings/ → static    │
-                                  └─────────────────────────────┘
+│                 │               │  - /recordings/ → static    │
+│                 │               │  - /thumbnails/ → static    │
+└─────────────────┘               └─────────────────────────────┘
 ```
 
 ### Port Allocation
@@ -73,10 +74,12 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - On `close()`, concatenates into a single `.mp4` file (`{stream_key}_{YYYYMMDD}_{HHMMSS}.mp4`)
   - `write_index_json()` scans the recordings directory and writes `recordings/index.json` with metadata and thumbnail URLs
 - **`thumbnail.rs`** — Thumbnail generation using ffmpeg:
-  - **Live thumbnails**: Concatenates `init.mp4` + `segment00000.m4s` into a temp MP4, then runs ffmpeg
+  - **Live thumbnails**: Concatenates `init.mp4` + latest `segment*.m4s` into a temp MP4, then runs ffmpeg
   - **Recording thumbnails**: Directly from the finalized MP4
+  - **Atomic writes**: ffmpeg writes to `{output}.webp.tmp`, then renames to `{output}.webp` only after success. nginx never serves a partially-written file.
   - Uses `scale={width}:-1` maintaining aspect ratio
-  - Output format: **WebP** (`-quality 75 -compression_level 4`)
+  - Output format: **WebP** (`-q:v 75`)
+  - **Cleanup**: Live stream thumbnails are deleted when the stream ends; recording thumbnails persist indefinitely.
 
 ### 3.4 API (`api/`)
 
@@ -87,13 +90,13 @@ Axum router with these endpoints:
 | `GET /api/health` | Health check |
 | `GET /api/streams` | List active streams with metadata |
 | `GET /api/streams/{key}` | Get single stream details |
-| `GET /api/streams/{key}/thumbnail?width=W` | Stream thumbnail (WebP) |
 | `GET /api/recordings` | List recordings (from index.json or fallback scan) |
-| `GET /api/recordings/{filename}/thumbnail?width=W` | Recording thumbnail (WebP) |
+| `GET /api/recordings/{filename}/thumbnail?width=W` | Recording thumbnail fallback (generates on-the-fly if missing) |
 
 Static file serving:
 - `/hls/*` → `MEDIA_DIR/hls/*`
 - `/recordings/*` → `MEDIA_DIR/recordings/*`
+- `/thumbnails/*` → `MEDIA_DIR/thumbnails/*`
 
 ### 3.5 Configuration (`config/`)
 
@@ -104,9 +107,9 @@ Environment variables (all in `.env`):
 | `RTMP_HOST` | `0.0.0.0` | RTMP listen address |
 | `RTMP_PORT` | 1935 | RTMP ingestion port |
 | `API_HOST` | `0.0.0.0` | API/HLS listen address |
-| `API_PORT` | 8080 | Internal API/HLS port |
+| `API_PORT` | 8080 | Internal API/HLS port (use 8081 in local dev when nginx listens on 8080) |
 | `MEDIA_DIR` | `./data` | Root for HLS, recordings, thumbnails |
-| `HLS_SEGMENT_DURATION` | 4 | Target segment duration in seconds |
+| `HLS_SEGMENT_DURATION` | 2 | Target segment duration in seconds |
 | `HLS_SEGMENTS_KEEP` | 10 | Unused (legacy) |
 | `RECORDING_ENABLED` | true | Enable MP4 recording |
 | `THUMBNAIL_SIZES` | `320,480` | Comma-separated thumbnail widths |
@@ -138,6 +141,12 @@ Environment variables (all in `.env`):
 - **Polling**: `usePolling()` composable fetches data every 3s, pauses when tab is hidden, and only updates reactive state when data actually changes (deep equality check).
 - **Two-stage updates**: The Recordings page shows a "有新的錄影可查看 / Refresh" toast instead of abruptly re-rendering the list.
 - **Player**: `Player.vue` uses hls.js with `enableWorker` and `lowLatencyMode`. Falls back to native HLS on Safari.
+- **Thumbnail loading**: `ThumbnailImg.vue` handles the fact that thumbnails are generated asynchronously by ffmpeg:
+  - Displays a loading spinner placeholder (gray background + animated spinner) while the image is not yet available.
+  - If the image fails to load, auto-retries every 5 seconds up to 12 retries.
+  - Uses `?_retry={tick}` cache-busting query parameter so the browser does not cache the 404 response.
+  - Once the thumbnail file is written atomically (see atomic writes in 3.3), the next retry succeeds and the placeholder is replaced by the actual image.
+  - Stream thumbnails are cleaned up when the stream ends; recording thumbnails persist indefinitely.
 
 ### 4.4 API Client
 
@@ -152,7 +161,7 @@ Environment variables (all in `.env`):
 - **`/api/`** → `localhost:8081`
 - **`/hls/`** → `localhost:8081` (with `Cache-Control: no-cache`)
 - **`/recordings/`** — static alias to `data/recordings/`
-- **`/recordings/thumbnails/`** — static alias to `data/thumbnails/recordings/`
+- **`/thumbnails/`** — static alias to `data/thumbnails/` (serves both stream and recording thumbnails)
 
 **Important**: When nginx runs as a non-root user, you must set `proxy_temp_path` to a writable directory (e.g., `/tmp/nginx_proxy_temp`) to avoid permission errors when proxying large HLS segments.
 
@@ -171,7 +180,7 @@ Environment variables (all in `.env`):
 
 1. **Recording**: `Fmp4Recorder` collects init + segments in memory
 2. **Finalize on stop**: `close()` concatenates all data into `{key}_{timestamp}.mp4`
-3. **Thumbnail**: ffmpeg generates `{filename}_w{size}.webp` thumbnails
+3. **Thumbnail**: ffmpeg generates `thumbnails/recordings/{filename}_w{size}.webp` thumbnails
 4. **Index**: `write_index_json()` updates `recordings/index.json`
 
 ### Grace Period Flow
@@ -246,7 +255,7 @@ docker compose logs -f nginx
 | Host | Container | Service |
 |------|-----------|---------|
 | `1935` | `backend:1935` | RTMP ingestion |
-| `8080` | `nginx:80` | HTTP (SPA + API proxy + HLS proxy + recordings) |
+| `8080` | `nginx:80` | HTTP (SPA + API proxy + HLS proxy + recordings + thumbnails) |
 
 **Environment variables (Docker Compose):**
 
@@ -294,8 +303,8 @@ nginx -s reload -c $(pwd)/nginx.local.conf
 Recorded content accumulates in `MEDIA_DIR/`:
 - `MEDIA_DIR/hls/{stream_key}/` — HLS segments and playlists (cleaned up after recording)
 - `MEDIA_DIR/recordings/` — MP4 files + `index.json`
-- `MEDIA_DIR/thumbnails/recordings/` — WebP thumbnails
-- `MEDIA_DIR/thumbnails/{stream_key}_w{size}.webp` — Live stream thumbnails
+- `MEDIA_DIR/thumbnails/recordings/` — Recording WebP thumbnails
+- `MEDIA_DIR/thumbnails/streams/` — Live stream WebP thumbnails
 
 Implement a retention policy (e.g., cron job) to delete old recordings:
 ```bash
@@ -310,6 +319,8 @@ Change thumbnail sizes via `THUMBNAIL_SIZES`:
 ```bash
 THUMBNAIL_SIZES=320,480,640,1280
 ```
+
+Control how often live stream thumbnails are regenerated via `THUMBNAIL_INTERVAL_SECONDS` (default 10s). Lower values increase thumbnail freshness but use more CPU.
 
 Existing `.jpg` thumbnails are **not** auto-migrated after the WebP switch. They will simply be ignored by the new code.
 
@@ -329,6 +340,7 @@ Key metrics to monitor:
 | "Permission denied" on HLS segments in nginx | nginx `proxy_temp_path` not writable | Set `proxy_temp_path` in nginx config to `/tmp/nginx_proxy_temp` |
 | Player shows "Waiting for stream" | No active RTMP publisher | Check OBS is streaming to correct RTMP URL |
 | Thumbnails not generating | ffmpeg not installed or not in PATH | Install ffmpeg |
+| Stream thumbnails show spinner forever | Stream too short for ffmpeg to generate a thumbnail before it ends | This is expected for very short streams (< 3s); recording thumbnails are generated after finalization |
 | API_PORT conflict | Port 8080 already used | Set `API_PORT=8081` in `.env` and update nginx upstream |
 | Recordings not appearing in list | `index.json` stale | Restart server or trigger a new recording finalization |
 
@@ -448,3 +460,8 @@ GitHub Actions (`.github/workflows/ci.yml`):
 2. **Tests** — `cargo test --lib`
 3. **Frontend Build** — `npm ci && npm run build`
 4. **Docker Build** — `docker build`
+
+## 13. References
+
+- [AV1 Bitstream & Decoding Process Specification](https://aomediacodec.github.io/av1-spec/av1-spec.pdf)
+- [HTTP Live Streaming 2nd Edition (draft-pantos-hls-rfc8216bis-22)](https://www.ietf.org/archive/id/draft-pantos-hls-rfc8216bis-22.txt)

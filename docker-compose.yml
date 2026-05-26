@@ -16,7 +16,7 @@ services:
       - MEDIA_DIR=/data
       - RUST_LOG=info
     volumes:
-      - media:/data
+      - ./data:/data
     restart: unless-stopped
 
   nginx:
@@ -27,10 +27,7 @@ services:
     ports:
       - "8080:80"
     volumes:
-      - media:/data:ro
+      - ./data:/data:ro
     depends_on:
       - backend
     restart: unless-stopped
-
-volumes:
-  media:

@@ -5,6 +5,8 @@ use tokio::io::AsyncWriteExt;
 
 pub struct HlsStreamState {
     stream_dir: PathBuf,
+    track_id: u32,
+    is_audio_only: bool,
     segment_duration: u32,
     current_segment_start: u64,
     segment_index: u32,
@@ -34,6 +36,9 @@ pub struct HlsStreamState {
     // Versioned init files
     init_version: u32,
     last_init_hash: Option<u64>,
+    // Wall-clock time mapping
+    stream_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    segment_start_offsets: Vec<u64>,
 }
 
 fn hash_bytes(data: &[u8]) -> u64 {
@@ -45,10 +50,15 @@ fn hash_bytes(data: &[u8]) -> u64 {
 }
 
 impl HlsStreamState {
-    pub fn new(media_dir: &str, stream_key: &str, segment_duration: u32, hls_segments_keep: u32) -> Self {
-        let dir = PathBuf::from(media_dir).join("hls").join(stream_key);
+    pub fn new(media_dir: &str, stream_key: &str, track_id: u32, is_audio_only: bool, segment_duration: u32, hls_segments_keep: u32) -> Self {
+        let mut dir = PathBuf::from(media_dir).join("hls").join(stream_key);
+        if track_id > 0 {
+            dir = dir.join(format!("track_{}", track_id));
+        }
         Self {
             stream_dir: dir,
+            track_id,
+            is_audio_only,
             segment_duration,
             current_segment_start: 0,
             segment_index: 0,
@@ -75,6 +85,8 @@ impl HlsStreamState {
             pending_rotation_pts: 0,
             init_version: 0,
             last_init_hash: None,
+            stream_started_at: None,
+            segment_start_offsets: Vec::new(),
         }
     }
 
@@ -116,6 +128,9 @@ impl HlsStreamState {
     }
 
     pub async fn write_video(&mut self, data: &[u8], timestamp: u32, is_keyframe: bool) -> anyhow::Result<()> {
+        if self.is_audio_only {
+            return Ok(());
+        }
         if self.first_video_ts.is_none() {
             self.first_video_ts = Some(timestamp);
         }
@@ -124,6 +139,7 @@ impl HlsStreamState {
 
         if !self.has_video {
             self.has_video = true;
+            self.stream_started_at = Some(chrono::Utc::now());
             self.current_segment_start = pts;
             self.rotate_segment().await?;
         }
@@ -143,21 +159,12 @@ impl HlsStreamState {
             self.pending_rotation_pts = pts;
         }
 
-        if self.pending_rotation {
-            let should_rotate = if is_keyframe {
-                true
-            } else {
-                let max_extra = threshold / 2;
-                pts.saturating_sub(self.pending_rotation_pts) > max_extra
-            };
-
-            if should_rotate {
-                self.finalize_segment().await?;
-                self.current_segment_start = pts;
-                self.segment_index += 1;
-                self.pending_rotation = false;
-                self.rotate_segment().await?;
-            }
+        if self.pending_rotation && is_keyframe {
+            self.finalize_segment().await?;
+            self.current_segment_start = pts;
+            self.segment_index += 1;
+            self.pending_rotation = false;
+            self.rotate_segment().await?;
         }
 
         self.fmp4_muxer.add_video_sample(data.to_vec(), pts, pts, is_keyframe);
@@ -178,12 +185,39 @@ impl HlsStreamState {
             }
         }
         if self.current_file.is_none() {
-            return Ok(());
+            if self.is_audio_only {
+                // Audio-only track: create segment on first audio frame
+                let base_ts = self.first_audio_ts.unwrap_or(0);
+                let pts = (timestamp - base_ts) as u64 + self.timestamp_offset;
+                self.stream_started_at = Some(chrono::Utc::now());
+                self.current_segment_start = pts;
+                self.rotate_segment().await?;
+            } else {
+                return Ok(());
+            }
         }
         let base_ts = self.first_audio_ts.unwrap_or(0);
         let pts = (timestamp - base_ts) as u64 + self.timestamp_offset;
         self.fmp4_muxer.add_audio_sample(data.to_vec(), pts);
         self.last_audio_pts = pts;
+
+        // Audio-only segment rotation (no keyframe concept)
+        if self.is_audio_only {
+            let elapsed_since_start = pts.saturating_sub(self.current_segment_start);
+            let threshold = self.segment_duration as u64 * 1000;
+            if elapsed_since_start > threshold && self.current_file.is_some() && !self.pending_rotation {
+                self.pending_rotation = true;
+                self.pending_rotation_pts = pts;
+            }
+            if self.pending_rotation {
+                self.finalize_segment().await?;
+                self.current_segment_start = pts;
+                self.segment_index += 1;
+                self.pending_rotation = false;
+                self.rotate_segment().await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -227,13 +261,20 @@ impl HlsStreamState {
 
     pub async fn finalize_segment(&mut self) -> anyhow::Result<()> {
         if let Some(mut file) = self.current_file.take() {
+            // Capture last sample duration before flush clears samples
+            let last_sample_duration = if self.last_video_pts >= self.last_audio_pts {
+                self.fmp4_muxer.last_video_sample_duration()
+            } else {
+                self.fmp4_muxer.last_audio_sample_duration()
+            };
             if let Some(fragment) = self.fmp4_muxer.flush_combined_fragment() {
                 file.write_all(&fragment).await?;
                 self.segment_data.push(fragment);
 
                 let last_pts = self.last_video_pts.max(self.last_audio_pts);
-                let duration = (last_pts.saturating_sub(self.current_segment_start)) as f64 / 1000.0;
+                let duration = ((last_pts + last_sample_duration).saturating_sub(self.current_segment_start)) as f64 / 1000.0;
                 self.segment_durations.push(duration.max(0.001));
+                self.segment_start_offsets.push(self.current_segment_start);
                 let prev_init = self.segment_init_versions.last().copied();
                 let is_discontinuity = prev_init.is_some() && prev_init != Some(self.init_version);
                 self.discontinuity_before.push(is_discontinuity);
@@ -306,6 +347,7 @@ impl HlsStreamState {
             self.segment_durations.drain(0..to_remove);
             self.segment_init_versions.drain(0..to_remove);
             self.discontinuity_before.drain(0..to_remove);
+            self.segment_start_offsets.drain(0..to_remove);
             self.first_segment_index += to_remove as u32;
         }
 
@@ -346,6 +388,10 @@ impl HlsStreamState {
                 playlist.push_str(&format!("#EXT-X-MAP:URI=\"{}\"\n", init_name));
             }
             playlist.push_str(&format!("#EXTINF:{:.3},\n", self.segment_durations[i]));
+            if let Some(started_at) = self.stream_started_at {
+                let seg_time = started_at + chrono::Duration::milliseconds(self.segment_start_offsets[i] as i64);
+                playlist.push_str(&format!("#EXT-X-PROGRAM-DATE-TIME:{}\n", seg_time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)));
+            }
             playlist.push_str(&format!("segment{:05}.m4s\n", abs_seg_idx));
         }
 
@@ -376,7 +422,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_new");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 4, 10);
+        let state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10);
         assert_eq!(state.segment_index, 0);
         assert!(state.current_file.is_none());
         assert!(!state.has_video);
@@ -390,7 +436,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_first_video");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 4, 10);
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10);
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
@@ -411,7 +457,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_playlist");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2, 10);
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
@@ -427,6 +473,7 @@ mod tests {
         assert!(playlist.contains("segment00000.m4s"));
         assert!(playlist.contains("init.mp4"));
         assert!(!playlist.contains("#EXT-X-DISCONTINUITY\n"));
+        assert!(playlist.contains("#EXT-X-PROGRAM-DATE-TIME:"));
 
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
@@ -436,7 +483,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_audio_first");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 4, 10);
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10);
 
         let aac = vec![0x01, 0x02, 0x03];
         state.write_audio(&aac, 0).await.unwrap();
@@ -453,7 +500,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_rotation");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2, 10); // 2s segment duration
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10); // 2s segment duration
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
@@ -481,7 +528,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_keyframe_rotation");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2, 10);
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
@@ -505,11 +552,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_nonkeyframe_never_force_rotates() {
+        let test_dir = std::env::temp_dir().join("hls_test_nonkeyframe_no_force");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
+
+        let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
+        state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
+
+        let nal_key = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
+        let nal_nonkey = vec![0x00, 0x00, 0x00, 0x04, 0x41, 0x88, 0x84, 0x00];
+
+        state.write_video(&nal_key, 0, true).await.unwrap();
+        assert_eq!(state.segment_index, 0);
+
+        // Write many non-keyframes well beyond target duration + max_extra
+        for i in 1..=10 {
+            state.write_video(&nal_nonkey, i * 1000, false).await.unwrap();
+        }
+
+        // Segment should still not have rotated
+        assert_eq!(state.segment_index, 0);
+        assert!(state.pending_rotation);
+
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
     async fn test_sliding_window() {
         let test_dir = std::env::temp_dir().join("hls_test_sliding");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2, 3); // keep 3
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 3); // keep 3
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
@@ -547,7 +622,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_atomic");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2, 10);
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
@@ -571,7 +646,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_versioned_init");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2, 10);
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
 
         let avcc_config1 = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config1, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
@@ -603,7 +678,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_discontinuity");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2, 10);
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
 
         let avcc_config1 = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config1, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
@@ -629,7 +704,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_grace");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2, 10);
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
@@ -652,7 +727,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_close");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2, 10);
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
@@ -672,7 +747,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join("hls_test_av_combined");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey")).await.unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 2, 10);
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();

@@ -34,7 +34,7 @@ async fn hls_content_type_middleware(
     } else if uri.ends_with(".m3u8") {
         response.headers_mut().insert(
             axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
+            axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl; charset=utf-8"),
         );
     }
     response
@@ -49,7 +49,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }))
         .route("/api/streams", get(streams::list))
         .route("/api/streams/{key}", get(streams::get))
-        .route("/api/streams/{key}/thumbnail", get(streams::thumbnail))
         .route("/api/recordings", get(recordings::list))
         .route("/api/recordings/{filename}/thumbnail", get(recordings::thumbnail));
 
