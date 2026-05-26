@@ -167,7 +167,12 @@ impl HlsStreamState {
             self.rotate_segment().await?;
         }
 
-        self.fmp4_muxer.add_video_sample(data.to_vec(), pts, pts, is_keyframe);
+        let sample_data = if self.fmp4_muxer.video_codec() == Some(fmp4::VideoCodec::AV1) {
+            fmp4::ensure_av1_obu_size_fields(data)
+        } else {
+            data.to_vec()
+        };
+        self.fmp4_muxer.add_video_sample(sample_data, pts, pts, is_keyframe);
         self.last_video_pts = pts;
         Ok(())
     }
