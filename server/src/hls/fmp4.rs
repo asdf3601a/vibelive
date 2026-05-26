@@ -12,6 +12,7 @@ pub enum VideoCodec {
 pub enum AudioCodec {
     Aac,
     Opus,
+    Flac,
 }
 
 #[derive(Clone, Debug)]
@@ -466,6 +467,9 @@ impl Fmp4Muxer {
             Some(AudioCodec::Opus) => {
                 self.write_opus_sample_entry(&mut data);
             }
+            Some(AudioCodec::Flac) => {
+                self.write_flac_sample_entry(&mut data);
+            }
             _ => {
                 self.write_mp4a_sample_entry(&mut data);
             }
@@ -606,6 +610,34 @@ impl Fmp4Muxer {
         }
 
         write_box(w, b"Opus", &data);
+    }
+
+    fn write_flac_sample_entry(&self, w: &mut Vec<u8>) {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 6]); // reserved
+        data.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+        data.extend_from_slice(&[0u8; 8]); // reserved
+
+        // Parse STREAMINFO from config to get sample_rate and channels
+        let (sample_rate, channel_count) = self.audio_config.as_ref()
+            .and_then(|c| parse_flac_streaminfo(c))
+            .unwrap_or((44100u32, 1u16));
+
+        data.extend_from_slice(&channel_count.to_be_bytes());
+        data.extend_from_slice(&16u16.to_be_bytes()); // samplesize
+        data.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
+        data.extend_from_slice(&0u16.to_be_bytes()); // reserved
+        data.extend_from_slice(&((sample_rate as u32) << 16).to_be_bytes()); // samplerate in 16.16
+
+        // dfLa box (FullBox per FLAC-in-ISOBMFF spec)
+        if let Some(ref config) = self.audio_config {
+            let dfla = build_dfla(config);
+            write_fullbox(&mut data, b"dfLa", 0, 0, &dfla);
+        } else {
+            write_fullbox(&mut data, b"dfLa", 0, 0, &[]);
+        }
+
+        write_box(w, b"fLaC", &data);
     }
 
     fn write_mvex(&self, w: &mut Vec<u8>) {
@@ -1289,6 +1321,44 @@ fn write_descriptor_length(w: &mut Vec<u8>, mut len: usize) {
     }
 }
 
+/// Parse FLAC STREAMINFO from config data.
+/// Config is expected to start with "fLaC" followed by 34-byte STREAMINFO.
+/// Returns (sample_rate, channel_count).
+fn parse_flac_streaminfo(config: &[u8]) -> Option<(u32, u16)> {
+    if config.len() < 38 {
+        return None;
+    }
+    if &config[..4] != b"fLaC" {
+        return None;
+    }
+    let si = &config[4..38];
+    // bytes 10-17 contain sample_rate(20), channels-1(3), bps-1(5), total_samples(36)
+    let val = u64::from_be_bytes([
+        si[10], si[11], si[12], si[13], si[14], si[15], si[16], si[17],
+    ]);
+    let sample_rate = ((val >> 44) & 0xFFFFF) as u32;
+    let channel_count = (((val >> 41) & 0x7) + 1) as u16;
+    Some((sample_rate, channel_count))
+}
+
+/// Build dfLa box content from FLAC config.
+/// Config is expected to start with "fLaC" followed by 34-byte STREAMINFO.
+/// Returns a sequence of FLACMetadataBlock structures (no FullBox header).
+fn build_dfla(config: &[u8]) -> Vec<u8> {
+    let mut dfla = Vec::new();
+
+    if config.len() >= 38 && &config[..4] == b"fLaC" {
+        // STREAMINFO metadata block header: last=1, type=0, length=34
+        dfla.push(0x80); // last-metadata-block-flag=1, block-type=0 (STREAMINFO)
+        dfla.push(0x00);
+        dfla.push(0x00);
+        dfla.push(0x22); // block length = 34
+        dfla.extend_from_slice(&config[4..38]); // STREAMINFO data
+    }
+
+    dfla
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1370,6 +1440,45 @@ mod tests {
         let init = muxer.init_segment();
         assert!(init.windows(4).any(|w| w == b"hvc1"));
         assert!(init.windows(4).any(|w| w == b"hvcC"));
+    }
+
+    #[test]
+    fn test_flac_sample_entry() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Flac);
+        // FLV FLAC config: "fLaC" + 34-byte STREAMINFO
+        let config = vec![
+            0x66, 0x4c, 0x61, 0x43, // "fLaC"
+            0x12, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x24, 0x15, 0x0a, 0xc4, 0x40, 0xf0, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(config.len(), 38);
+        muxer.set_audio_config(config);
+        let init = muxer.init_segment();
+        assert!(init.windows(4).any(|w| w == b"fLaC"));
+        assert!(init.windows(4).any(|w| w == b"dfLa"));
+
+        // Verify dfLa is a FullBox with correct STREAMINFO
+        let dfla_pos = init.windows(4).position(|w| w == b"dfLa").unwrap();
+        let dfla_size = u32::from_be_bytes([init[dfla_pos-4], init[dfla_pos-3], init[dfla_pos-2], init[dfla_pos-1]]) as usize;
+        let dfla_data = &init[dfla_pos+4..dfla_pos-4+dfla_size];
+        // FullBox header: version(1) + flags(3) = 4 bytes
+        assert_eq!(dfla_data[0], 0x00); // version
+        assert_eq!(&dfla_data[1..4], &[0x00, 0x00, 0x00]); // flags
+        // First metadata block header: last=1, type=0, length=34
+        assert_eq!(dfla_data[4], 0x80);
+        assert_eq!(u32::from_be_bytes([0x00, dfla_data[5], dfla_data[6], dfla_data[7]]), 34);
+        // STREAMINFO data should match config[4..38]
+        assert_eq!(&dfla_data[8..42], &[
+            0x12, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x24, 0x15, 0x0a, 0xc4, 0x40, 0xf0, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ]);
     }
 
     #[test]

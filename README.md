@@ -493,3 +493,4 @@ GitHub Actions (`.github/workflows/ci.yml`):
 - [AV1 Bitstream & Decoding Process Specification](https://github.com/AOMediaCodec/av1-spec.git)
 - [HTTP Live Streaming 2nd Edition (draft-pantos-hls-rfc8216bis-22)](https://www.ietf.org/archive/id/draft-pantos-hls-rfc8216bis-22.txt)
 - [FFmpeg](https://github.com/ffmpeg/ffmpeg)
+- [RFC 9639 — Free Lossless Audio Codec (FLAC)](https://www.rfc-editor.org/rfc/rfc9639.txt)

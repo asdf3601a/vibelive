@@ -659,7 +659,7 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
                 let _ = hls.write_audio(remainder, ts).await;
             }
         } else if sound_format == 9 && data.len() > 5 {
-            // FFmpeg uses FLV audio format 9 for Opus, prefixing data with "Opus"
+            // FFmpeg uses FLV audio format 9 for Opus ("Opus" prefix) and FLAC ("fLaC" prefix)
             let remainder = &data[1..];
             if remainder.starts_with(b"Opus") {
                 let opus_data = &remainder[4..];
@@ -672,8 +672,22 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
                         let _ = hls.write_audio(opus_data, ts).await;
                     }
                 }
+            } else if remainder.starts_with(b"fLaC") {
+                if let Some(ref mut hls) = ctx.hls_state {
+                    if hls.audio_codec() != Some(crate::hls::fmp4::AudioCodec::Flac) && remainder.len() >= 38 {
+                        // First packet: store config (includes "fLaC" prefix)
+                        let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Flac, remainder).await;
+                    } else if hls.audio_codec() == Some(crate::hls::fmp4::AudioCodec::Flac) && remainder.len() > 4 {
+                        // Subsequent packets: strip "fLaC" prefix before writing as audio sample.
+                        // FFmpeg prepends "fLaC" to every FLAC packet in FLV.
+                        let frame_data = &remainder[4..];
+                        // Valid FLAC frames start with 0xFF (frame sync); skip non-frame packets.
+                        if frame_data[0] == 0xFF {
+                            let _ = hls.write_audio(frame_data, ts).await;
+                        }
+                    }
+                }
             } else {
-                let remainder = &data[1..];
                 if let Some(ref mut hls) = ctx.hls_state {
                     let _ = hls.write_audio(remainder, ts).await;
                 }

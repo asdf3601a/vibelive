@@ -8,6 +8,7 @@ services:
       - "1935:1935"
     expose:
       - "8080"
+    env_file: .env
     environment:
       - RTMP_HOST=0.0.0.0
       - RTMP_PORT=1935

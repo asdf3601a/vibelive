@@ -94,6 +94,10 @@ impl HlsStreamState {
         &self.stream_dir
     }
 
+    pub fn audio_codec(&self) -> Option<fmp4::AudioCodec> {
+        self.audio_codec
+    }
+
     fn segment_path(&self, index: u32) -> PathBuf {
         self.stream_dir.join(format!("segment{:05}.m4s", index))
     }
@@ -238,8 +242,14 @@ impl HlsStreamState {
             return Ok(());
         }
 
-        // Only increment version if this is not the very first init
-        if self.last_init_hash.is_some() {
+        // Allow overwriting init.mp4 if no segment has been finalized yet.
+        // This handles the common case where audio config arrives after video config
+        // but before the first segment is closed, avoiding a mismatched init.
+        let can_overwrite = self.last_init_hash.is_some()
+            && self.init_version == 0
+            && self.segment_init_versions.is_empty();
+
+        if self.last_init_hash.is_some() && !can_overwrite {
             self.init_version += 1;
         }
         let path = if self.init_version == 0 {
@@ -248,7 +258,10 @@ impl HlsStreamState {
             self.stream_dir.join(format!("init_v{}.mp4", self.init_version))
         };
 
-        tokio::fs::write(&path, &init).await?;
+        // Atomic write: tmp + rename so clients never see a partially-written init
+        let tmp_path = path.with_extension("mp4.tmp");
+        tokio::fs::write(&tmp_path, &init).await?;
+        tokio::fs::rename(&tmp_path, &path).await?;
         self.init_data = Some(init);
         self.init_written = true;
         self.last_init_hash = Some(new_hash);
@@ -258,7 +271,9 @@ impl HlsStreamState {
     async fn rotate_segment(&mut self) -> anyhow::Result<()> {
         self.write_init_segment().await?;
         let path = self.segment_path(self.segment_index);
-        let file = tokio::fs::File::create(&path).await?;
+        // Write to a temp file; finalize_segment will rename it atomically
+        let tmp_path = path.with_extension("m4s.tmp");
+        let file = tokio::fs::File::create(&tmp_path).await?;
         self.current_file = Some(file);
         self.update_playlist().await?;
         Ok(())
@@ -272,7 +287,7 @@ impl HlsStreamState {
             } else {
                 self.fmp4_muxer.last_audio_sample_duration()
             };
-            if let Some(fragment) = self.fmp4_muxer.flush_combined_fragment() {
+            let has_fragment = if let Some(fragment) = self.fmp4_muxer.flush_combined_fragment() {
                 file.write_all(&fragment).await?;
                 self.segment_data.push(fragment);
 
@@ -284,9 +299,23 @@ impl HlsStreamState {
                 let is_discontinuity = prev_init.is_some() && prev_init != Some(self.init_version);
                 self.discontinuity_before.push(is_discontinuity);
                 self.segment_init_versions.push(self.init_version);
-            }
+                true
+            } else {
+                false
+            };
             file.flush().await?;
             file.sync_all().await?;
+            drop(file);
+
+            // Atomic rename: tmp -> final segment file
+            let path = self.segment_path(self.segment_index);
+            let tmp_path = path.with_extension("m4s.tmp");
+            if has_fragment {
+                let _ = tokio::fs::rename(&tmp_path, &path).await;
+            } else {
+                // No data written: remove the empty temp file
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+            }
         }
         self.update_playlist().await?;
         Ok(())
@@ -451,7 +480,8 @@ mod tests {
 
         assert!(state.has_video);
         assert!(state.current_file.is_some());
-        assert!(tokio::fs::try_exists(state.segment_path(0)).await.unwrap_or(false));
+        // Segment file is a temp file until finalize_segment renames it
+        assert!(tokio::fs::try_exists(state.segment_path(0).with_extension("m4s.tmp")).await.unwrap_or(false));
         assert!(tokio::fs::try_exists(state.playlist_path()).await.unwrap_or(false));
 
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
@@ -519,7 +549,8 @@ mod tests {
         state.write_video(&nal, 2500, true).await.unwrap();
         assert_eq!(state.segment_index, 1);
         assert!(tokio::fs::try_exists(state.segment_path(0)).await.unwrap_or(false));
-        assert!(tokio::fs::try_exists(state.segment_path(1)).await.unwrap_or(false));
+        // New segment is still a temp file until it gets finalized
+        assert!(tokio::fs::try_exists(state.segment_path(1).with_extension("m4s.tmp")).await.unwrap_or(false));
 
         let playlist = tokio::fs::read_to_string(state.playlist_path()).await.unwrap();
         assert!(playlist.contains("segment00000.m4s"));
