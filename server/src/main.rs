@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
         config: cfg.clone(),
     });
 
-    let rtmp_addr: SocketAddr = format!("0.0.0.0:{}", cfg.rtmp_port).parse()?;
+    let rtmp_addr: SocketAddr = format!("{}:{}", cfg.rtmp_host, cfg.rtmp_port).parse()?;
     let rtmp_state = app_state.clone();
     tokio::spawn(async move {
         if let Err(e) = rtmp::start_rtmp_server(rtmp_addr, rtmp_state).await {
@@ -40,15 +40,17 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let api_router = api::create_router(app_state.clone());
-    let api_addr: SocketAddr = format!("0.0.0.0:{}", cfg.api_port).parse()?;
+    let api_addr: SocketAddr = format!("{}:{}", cfg.api_host, cfg.api_port).parse()?;
 
     let app = api_router
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
     tracing::info!(
-        "Server starting: API={}, RTMP={}",
+        "Server starting: API={}:{}, RTMP={}:{}",
+        cfg.api_host,
         cfg.api_port,
+        cfg.rtmp_host,
         cfg.rtmp_port,
     );
 

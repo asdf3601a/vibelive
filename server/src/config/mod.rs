@@ -2,7 +2,9 @@ use std::env;
 
 #[derive(Clone)]
 pub struct Config {
+    pub rtmp_host: String,
     pub rtmp_port: u16,
+    pub api_host: String,
     pub api_port: u16,
     pub media_dir: String,
     pub hls_segment_duration: u32,
@@ -23,9 +25,11 @@ impl Config {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
+            rtmp_host: env::var("RTMP_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
             rtmp_port: env::var("RTMP_PORT")
                 .unwrap_or_else(|_| "1935".into())
                 .parse()?,
+            api_host: env::var("API_HOST").unwrap_or_else(|_| "0.0.0.0".into()),
             api_port: env::var("API_PORT")
                 .unwrap_or_else(|_| "8080".into())
                 .parse()?,
