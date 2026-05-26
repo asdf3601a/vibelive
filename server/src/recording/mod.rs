@@ -5,8 +5,7 @@ use tokio::io::AsyncWriteExt;
 pub struct Fmp4Recorder {
     dir: PathBuf,
     stream_key: String,
-    init_data: Option<Vec<u8>>,
-    segments: Vec<Vec<u8>>,
+    file: Option<tokio::fs::File>,
     closed: bool,
     saved_path: Option<PathBuf>,
 }
@@ -17,21 +16,36 @@ impl Fmp4Recorder {
         Self {
             dir,
             stream_key: stream_key.to_string(),
-            init_data: None,
-            segments: Vec::new(),
+            file: None,
             closed: false,
             saved_path: None,
         }
     }
 
-    pub async fn set_init(&mut self, init: Vec<u8>) {
-        self.init_data = Some(init);
+    pub async fn write_init(&mut self, init: &[u8]) -> std::io::Result<()> {
+        if self.file.is_none() {
+            let path = self.dir.join(format!(
+                "{}_{}.mp4",
+                self.stream_key,
+                chrono::Utc::now().format("%Y%m%d_%H%M%S")
+            ));
+            let mut file = tokio::fs::File::create(&path).await?;
+            file.write_all(init).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            self.saved_path = Some(path);
+            self.file = Some(file);
+        }
+        Ok(())
     }
 
-    pub async fn write_segment(&mut self, segment: Vec<u8>) {
-        if !segment.is_empty() {
-            self.segments.push(segment);
+    pub async fn write_segment(&mut self, segment: &[u8]) -> std::io::Result<()> {
+        if let Some(ref mut file) = self.file {
+            file.write_all(segment).await?;
+            file.flush().await?;
+            file.sync_all().await?;
         }
+        Ok(())
     }
 
     pub async fn write_video(&mut self, _data: &[u8], _ts: u32) -> std::io::Result<()> {
@@ -50,24 +64,14 @@ impl Fmp4Recorder {
         }
         self.closed = true;
 
-        let path = self.dir.join(format!(
-            "{}_{}.mp4",
-            self.stream_key,
-            chrono::Utc::now().format("%Y%m%d_%H%M%S")
-        ));
-        let mut file = tokio::fs::File::create(&path).await?;
-
-        if let Some(ref init) = self.init_data {
-            file.write_all(init).await?;
+        if let Some(mut file) = self.file.take() {
+            file.flush().await?;
+            file.sync_all().await?;
         }
-        for seg in &self.segments {
-            file.write_all(seg).await?;
-        }
-        file.flush().await?;
-        file.sync_all().await?;
 
-        self.saved_path = Some(path.clone());
-        Ok(path)
+        self.saved_path.clone().ok_or_else(|| {
+            std::io::Error::other("no file was written")
+        })
     }
 
     pub fn saved_path(&self) -> Option<&PathBuf> {
@@ -187,8 +191,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("recordings")).await.unwrap();
         let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "teststream");
 
-        recorder.set_init(vec![0x66, 0x74, 0x79, 0x70]).await;
-        recorder.write_segment(vec![0x6d, 0x6f, 0x6f, 0x66]).await;
+        recorder.write_init(&[0x66, 0x74, 0x79, 0x70]).await.unwrap();
+        recorder.write_segment(&[0x6d, 0x6f, 0x6f, 0x66]).await.unwrap();
         let path = recorder.close().await.unwrap();
         assert!(tokio::fs::try_exists(&path).await.unwrap_or(false));
 
@@ -217,10 +221,10 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("recordings")).await.unwrap();
         let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "multistream");
 
-        recorder.set_init(vec![0x01, 0x02]).await;
-        recorder.write_segment(vec![0x03, 0x04]).await;
-        recorder.write_segment(vec![0x05, 0x06]).await;
-        recorder.write_segment(vec![0x07, 0x08]).await;
+        recorder.write_init(&[0x01, 0x02]).await.unwrap();
+        recorder.write_segment(&[0x03, 0x04]).await.unwrap();
+        recorder.write_segment(&[0x05, 0x06]).await.unwrap();
+        recorder.write_segment(&[0x07, 0x08]).await.unwrap();
         let path = recorder.close().await.unwrap();
         assert!(tokio::fs::try_exists(&path).await.unwrap_or(false));
 
@@ -248,8 +252,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("recordings")).await.unwrap();
         let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "indexstream");
 
-        recorder.set_init(vec![0x66, 0x74, 0x79, 0x70]).await;
-        recorder.write_segment(vec![0x6d, 0x6f, 0x6f, 0x66]).await;
+        recorder.write_init(&[0x66, 0x74, 0x79, 0x70]).await.unwrap();
+        recorder.write_segment(&[0x6d, 0x6f, 0x6f, 0x66]).await.unwrap();
         let _path = recorder.close().await.unwrap();
 
         crate::recording::write_index_json(
@@ -276,7 +280,7 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("recordings")).await.unwrap();
         let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "doublestream");
 
-        recorder.set_init(vec![0x01, 0x02]).await;
+        recorder.write_init(&[0x01, 0x02]).await.unwrap();
         let path1 = recorder.close().await.unwrap();
         let path2 = recorder.close().await.unwrap();
         assert_eq!(path1, path2);

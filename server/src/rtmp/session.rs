@@ -135,17 +135,16 @@ async fn finalize_stream(
     app_state: &Arc<AppState>,
     stream_key: &str,
     mut hls: HlsStreamState,
-    recorder: Option<Fmp4Recorder>,
+    mut recorder: Option<Fmp4Recorder>,
     remove_publisher: bool,
 ) {
     let _ = hls.close().await;
-    if let Some(mut r) = recorder {
-        let (init_data, segments) = hls.take_recording_data();
-        if let Some(init) = init_data {
-            r.set_init(init).await;
+    if let Some(ref mut r) = recorder {
+        if let Some(init) = hls.drain_init_data() {
+            let _ = r.write_init(&init).await;
         }
-        for seg in segments {
-            r.write_segment(seg).await;
+        for seg in hls.drain_segment_data() {
+            let _ = r.write_segment(&seg).await;
         }
         if let Ok(mp4_path) = r.close().await {
             let sizes = app_state.config.thumbnail_sizes.clone();
@@ -198,6 +197,14 @@ async fn enter_grace_period(app_state: &Arc<AppState>, ctx: &mut SessionContext)
     if let Some(ref key) = ctx.current_stream_key.clone() {
         if let Some(mut hls) = ctx.hls_state.take() {
             let _ = hls.prepare_for_grace_period().await;
+            if let Some(ref mut recorder) = ctx.recorder {
+                if let Some(init) = hls.drain_init_data() {
+                    let _ = recorder.write_init(&init).await;
+                }
+                for seg in hls.drain_segment_data() {
+                    let _ = recorder.write_segment(&seg).await;
+                }
+            }
             let recorder = ctx.recorder.take();
             {
                 let mut sm = app_state.stream_manager.write().await;
@@ -318,7 +325,7 @@ async fn handle_event(
                 let media_dir = app_state.config.media_dir.clone();
                 let hls_dir = std::path::PathBuf::from(&media_dir).join("hls").join(&stream_key);
                 let _ = tokio::fs::create_dir_all(&hls_dir).await;
-                ctx.hls_state = Some(HlsStreamState::new(&media_dir, &stream_key, app_state.config.hls_segment_duration));
+                ctx.hls_state = Some(HlsStreamState::new(&media_dir, &stream_key, app_state.config.hls_segment_duration, app_state.config.hls_segments_keep));
                 if app_state.config.recording_enabled {
                     let recordings_dir = std::path::PathBuf::from(&media_dir).join("recordings");
                     let _ = tokio::fs::create_dir_all(&recordings_dir).await;
@@ -447,6 +454,15 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_
         }
     }
 
+    if let (Some(ref mut hls), Some(ref mut recorder)) = (ctx.hls_state.as_mut(), ctx.recorder.as_mut()) {
+        if let Some(init) = hls.drain_init_data() {
+            let _ = recorder.write_init(&init).await;
+        }
+        for seg in hls.drain_segment_data() {
+            let _ = recorder.write_segment(&seg).await;
+        }
+    }
+
     if let Some(ref mut r) = ctx.recorder {
         let _ = r.write_video(data, ts).await;
     }
@@ -512,6 +528,15 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
             if let Some(ref mut hls) = ctx.hls_state {
                 let _ = hls.write_audio(remainder, ts).await;
             }
+        }
+    }
+
+    if let (Some(ref mut hls), Some(ref mut recorder)) = (ctx.hls_state.as_mut(), ctx.recorder.as_mut()) {
+        if let Some(init) = hls.drain_init_data() {
+            let _ = recorder.write_init(&init).await;
+        }
+        for seg in hls.drain_segment_data() {
+            let _ = recorder.write_segment(&seg).await;
         }
     }
 

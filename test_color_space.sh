@@ -29,7 +29,7 @@ api_call() {
 
 count_recordings() {
     local key=$1
-    ls "$MEDIA_DIR/recordings/" 2>/dev/null | grep -c "^${key}_" || echo 0
+    (ls "$MEDIA_DIR/recordings/" 2>/dev/null | grep -c "^${key}_") 2>/dev/null || echo 0
 }
 
 check_mp4_integrity() {
