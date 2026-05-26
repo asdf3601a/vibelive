@@ -361,22 +361,49 @@ Covers:
 
 ### 9.2 Integration Tests
 
-```bash
-# Full automated test suite (requires running server + ffmpeg)
-./test_auto.sh
-```
-
-Tests:
-- H264 + AAC, AV1 + AAC, H264 + Opus, AV1 + Opus codec combinations
-- Graceful stop + HLS cleanup
-- Abnormal disconnect + reconnect grace period
-- MP4 integrity (ffprobe + ffmpeg remux)
-- Thumbnail generation
+The project includes a unified test script `./test.sh` that covers codec compatibility, resolution/aspect-ratio coverage, color-space validation, graceful-stop, reconnect, and HLS streaming tests.
 
 ```bash
-# Color space / HDR compatibility test
-./test_color_space.sh
+# Quick mode (recommended for CI): codec matrix at 480p/720p + all resolutions +
+# color space + graceful stop + reconnect + HLS
+./test.sh
+
+# Full Cartesian product: every video × audio × resolution combination
+./test.sh --full
+
+# Filter by codecs, audio, or resolutions
+./test.sh --video h264,av1 --audio aac,opus
+./test.sh --res 480p,1080p --tests res
+
+# Test non-16:9 aspect ratios
+./test.sh --aspect 16:9,4:3,9:16 --tests res
+
+# Run only the color-space suite with shorter streams
+./test.sh --tests color --duration 4
+
+# Quick codec check for a single codec at 720p
+./test.sh --video hevc --res 720p --tests codec --duration 3
 ```
+
+**Test suites (`--tests`):**
+| Suite | Description |
+|-------|-------------|
+| `codec` | Video + audio codec matrix (quick: 480p & 720p; full: all resolutions) |
+| `res` | Resolution matrix across all specified aspect ratios |
+| `color` | Color-space / HDR compatibility (H.264 & AV1, SDR & HDR) |
+| `graceful` | Graceful stop & HLS cleanup verification |
+| `reconnect` | Abnormal disconnect + reconnect grace period |
+| `hls` | Live HLS segment verification |
+| `all` | Every suite (default) |
+
+**Available options:**
+- `--video LIST` — `h264`, `hevc`, `av1`
+- `--audio LIST` — `aac`, `opus`, `flac`
+- `--res LIST` — `240p`, `480p`, `720p`, `1080p`, `2k`, `4k`, `8k`
+- `--aspect LIST` — `16:9`, `4:3`, `1:1`, `21:9`, `9:16`, `3:4`
+- `--full` — Full Cartesian product for codec/res matrices
+- `--duration N` — Stream duration per test in seconds (default: 6)
+- `-h, --help` — Show usage and examples
 
 ### 9.3 Manual Testing with ffmpeg
 
@@ -442,7 +469,7 @@ vibe-livestream/
 ├── Dockerfile.backend       # Rust backend image
 ├── Dockerfile.nginx         # Frontend + nginx image
 ├── docker-compose.yml       # Docker Compose setup (backend + nginx)
-└── test_auto.sh             # Automated integration tests
+└── test.sh                  # Unified integration test suite
 ```
 
 ## 11. Security Notes
@@ -465,3 +492,4 @@ GitHub Actions (`.github/workflows/ci.yml`):
 
 - [AV1 Bitstream & Decoding Process Specification](https://github.com/AOMediaCodec/av1-spec.git)
 - [HTTP Live Streaming 2nd Edition (draft-pantos-hls-rfc8216bis-22)](https://www.ietf.org/archive/id/draft-pantos-hls-rfc8216bis-22.txt)
+- [FFmpeg](https://github.com/ffmpeg/ffmpeg)

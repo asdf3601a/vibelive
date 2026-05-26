@@ -1,0 +1,880 @@
+#!/bin/bash
+set -e
+
+cd "$(dirname "$0")"
+
+# ── Colors ─────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+PASS=0
+WARN=0
+FAIL=0
+
+MEDIA_DIR="./data"
+REPORT_DIR="$MEDIA_DIR/test_reports"
+API_BASE="http://localhost:8080"
+RTMP_BASE="rtmp://localhost:1935/live"
+
+# Temp file for collecting results
+RESULTS_FILE=$(mktemp)
+trap 'rm -f "$RESULTS_FILE"' EXIT
+
+# ── Defaults ───────────────────────────────────────────────────────
+VIDEO_CODECS="h264 hevc av1"
+AUDIO_CODECS="aac opus flac"
+RESOLUTIONS="240p 480p 720p 1080p 2k 4k 8k"
+TESTS="codec res color graceful reconnect hls"
+FULL_MATRIX=0
+DEFAULT_RES="480p 720p"
+DEFAULT_VCODEC="h264"
+DEFAULT_ACODEC="aac"
+STREAM_DURATION=6
+ASPECTS="16:9"
+
+# ── Help ───────────────────────────────────────────────────────────
+show_help() {
+    cat <<'EOF'
+Usage: ./test_merged.sh [OPTIONS]
+
+Merged end-to-end test suite for livestream server.  Combines codec
+compatibility, resolution/aspect-ratio coverage, color-space validation,
+graceful-stop, reconnect, and HLS streaming tests.
+
+Options:
+  --video LIST    Comma-separated video codecs: h264,hevc,av1
+                  (default: h264,hevc,av1)
+  --audio LIST    Comma-separated audio codecs: aac,opus,flac
+                  (default: aac,opus,flac)
+  --res LIST      Comma-separated resolutions: 240p,480p,720p,1080p,2k,4k,8k
+                  (default: 240p,480p,720p,1080p,2k,4k,8k)
+  --aspect LIST   Comma-separated aspect ratios: 16:9,4:3,1:1,21:9,9:16,3:4
+                  (default: 16:9)
+  --tests LIST    Comma-separated test suites:
+                    codec     – video+audio codec matrix
+                    res       – resolution matrix (all resolutions × all aspects)
+                    color     – color-space / HDR compatibility
+                    graceful  – graceful stop & HLS cleanup
+                    reconnect – abnormal disconnect + reconnect
+                    hls       – live HLS segment verification
+                    all       – run every suite (default)
+  --full          Run full Cartesian product for codec/res matrices.
+                  Without this flag the suite runs in quick mode:
+                    • codec matrix uses only 480p and 720p
+                    • res matrix skips if codec already covers it
+  --duration N    Stream duration in seconds for each test (default: 6)
+  -h, --help      Show this help message
+
+Quick-start Examples:
+  # Run everything in quick mode (recommended for CI)
+  ./test_merged.sh
+
+  # Full matrix: every codec × every audio × every resolution
+  ./test_merged.sh --full
+
+  # Test only AV1 and H.264 with AAC and Opus
+  ./test_merged.sh --video h264,av1 --audio aac,opus
+
+  # Validate non-16:9 aspect ratios across all resolutions
+  ./test_merged.sh --aspect 16:9,4:3,9:16 --tests res
+
+  # Run only the color-space suite with 4-second streams
+  ./test_merged.sh --tests color --duration 4
+
+  # Quick codec check for HEVC at 720p only
+  ./test_merged.sh --video hevc --res 720p --tests codec --duration 3
+EOF
+}
+
+# ── Arg parse ──────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --video)
+            shift
+            VIDEO_CODECS=$(echo "$1" | tr ',' ' ')
+            shift
+            ;;
+        --audio)
+            shift
+            AUDIO_CODECS=$(echo "$1" | tr ',' ' ')
+            shift
+            ;;
+        --res)
+            shift
+            RESOLUTIONS=$(echo "$1" | tr ',' ' ')
+            shift
+            ;;
+        --aspect)
+            shift
+            ASPECTS=$(echo "$1" | tr ',' ' ')
+            shift
+            ;;
+        --tests)
+            shift
+            TESTS=$(echo "$1" | tr ',' ' ')
+            shift
+            ;;
+        --full)
+            FULL_MATRIX=1
+            shift
+            ;;
+        --duration)
+            shift
+            STREAM_DURATION="$1"
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# ── Resolution mapping ─────────────────────────────────────────────
+res_and_aspect_to_size() {
+    local res="$1"
+    local aspect="${2:-16:9}"
+    local height
+
+    case "$res" in
+        240p)  height=240 ;;
+        480p)  height=480 ;;
+        720p)  height=720 ;;
+        1080p) height=1080 ;;
+        2k)    height=1440 ;;
+        4k)    height=2160 ;;
+        8k)    height=4320 ;;
+        *)     height=360 ;;
+    esac
+
+    local aspect_w aspect_h
+    aspect_w=$(echo "$aspect" | cut -d':' -f1)
+    aspect_h=$(echo "$aspect" | cut -d':' -f2)
+
+    local width
+    width=$(awk "BEGIN { w = int($height * $aspect_w / $aspect_h); if (w % 2 == 1) w += 1; print w }")
+    echo "${width}x${height}"
+}
+
+# ── Codec args mapping ─────────────────────────────────────────────
+get_vcodec_args() {
+    case "$1" in
+        h264) echo "libx264 -preset ultrafast -tune zerolatency" ;;
+        hevc) echo "libx265 -preset ultrafast" ;;
+        av1)  echo "libsvtav1 -svtav1-params preset=12:crf=35" ;;
+        *)    echo "libx264" ;;
+    esac
+}
+
+get_acodec_args() {
+    case "$1" in
+        aac)  echo "aac" ;;
+        opus) echo "libopus -ar 48000" ;;
+        flac) echo "flac" ;;
+        *)    echo "aac" ;;
+    esac
+}
+
+get_vcodec_display() {
+    case "$1" in
+        h264) echo "H.264" ;;
+        hevc) echo "HEVC" ;;
+        av1)  echo "AV1" ;;
+        *)    echo "$1" ;;
+    esac
+}
+
+get_acodec_display() {
+    case "$1" in
+        aac)  echo "AAC" ;;
+        opus) echo "Opus" ;;
+        flac) echo "FLAC" ;;
+        *)    echo "$1" ;;
+    esac
+}
+
+# ── Helpers ────────────────────────────────────────────────────────
+api_call() {
+    curl -s "${API_BASE}$1"
+}
+
+count_recordings() {
+    local key=$1
+    local count
+    count=$(ls "$MEDIA_DIR/recordings/" 2>/dev/null | grep -c "^${key}_" 2>/dev/null) || count=0
+    echo "$count"
+}
+
+check_mp4_integrity() {
+    local mp4_path="$1"
+    local key="$2"
+    local max_expected_duration="${3:-30}"
+    local corrupt=0
+
+    local duration
+    duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$mp4_path" 2>&1) || {
+        echo -e "${RED}  ✗ ffprobe failed to read $key${NC}"
+        corrupt=1
+    }
+
+    if [ "$corrupt" -eq 0 ]; then
+        if [ -z "$duration" ] || [ "$duration" = "N/A" ]; then
+            echo -e "${RED}  ✗ Duration is N/A for $key${NC}"
+            corrupt=1
+        else
+            local too_long
+            too_long=$(awk "BEGIN { print ($duration > $max_expected_duration) ? 1 : 0 }")
+            local too_short
+            too_short=$(awk "BEGIN { print ($duration < 0.5) ? 1 : 0 }")
+            if [ "$too_long" -eq 1 ]; then
+                echo -e "${RED}  ✗ Duration overflow: ${duration}s for $key${NC}"
+                corrupt=1
+            fi
+            if [ "$too_short" -eq 1 ]; then
+                echo -e "${RED}  ✗ Duration too short: ${duration}s for $key${NC}"
+                corrupt=1
+            fi
+        fi
+    fi
+
+    if [ "$corrupt" -eq 0 ]; then
+        local ffmpeg_err
+        ffmpeg_err=$(ffmpeg -v error -i "$mp4_path" -c copy -f null - 2>&1) || true
+        if [ -n "$ffmpeg_err" ]; then
+            echo -e "${RED}  ✗ ffmpeg remux errors for $key:${NC}"
+            echo "$ffmpeg_err" | head -5 | sed 's/^/    /'
+            corrupt=1
+        fi
+    fi
+
+    if [ "$corrupt" -eq 0 ]; then
+        local frame_count
+        frame_count=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=noprint_wrappers=1:nokey=1 "$mp4_path" 2>/dev/null || echo 0)
+        if [ "$frame_count" -lt 10 ]; then
+            echo -e "${RED}  ✗ Too few frames ($frame_count) for $key${NC}"
+            corrupt=1
+        fi
+    fi
+
+    if [ "$corrupt" -eq 0 ]; then
+        echo -e "${GREEN}  ✓ MP4 integrity OK (duration=${duration}s, frames=${frame_count})${NC}"
+        return 0
+    else
+        return 1
+    fi
+}
+
+extract_color_info() {
+    local mp4_path="$1"
+    ffprobe -v error -select_streams v:0 \
+        -show_entries stream=pix_fmt,color_space,color_primaries,color_transfer,profile \
+        -of default=noprint_wrappers=1 "$mp4_path" 2>/dev/null
+}
+
+# ── Core stream test ───────────────────────────────────────────────
+run_stream_test() {
+    local name="$1"
+    local vcodec_raw="$2"
+    local acodec_raw="$3"
+    local size="$4"
+    local key="$5"
+    local check_hls="${6:-0}"
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Test: $name"
+    echo "Key:  $key"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # Build ffmpeg args array safely
+    local ffmpeg_cmd=(ffmpeg -y -re -f lavfi -i "testsrc=duration=${STREAM_DURATION}:size=${size}:rate=30")
+    ffmpeg_cmd+=(-f lavfi -i "sine=frequency=440:duration=${STREAM_DURATION}")
+
+    # Parse video codec args
+    read -r venc vrest <<< "$vcodec_raw"
+    ffmpeg_cmd+=(-c:v "$venc")
+    if [ -n "$vrest" ]; then
+        ffmpeg_cmd+=($vrest)
+    fi
+    ffmpeg_cmd+=(-pix_fmt yuv420p -g 60 -keyint_min 60)
+
+    # Parse audio codec args
+    read -r aenc arest <<< "$acodec_raw"
+    ffmpeg_cmd+=(-c:a "$aenc")
+    if [ -n "$arest" ]; then
+        ffmpeg_cmd+=($arest)
+    fi
+
+    ffmpeg_cmd+=(-t "$STREAM_DURATION" -f flv "${RTMP_BASE}/${key}")
+
+    # Start ffmpeg in background
+    "${ffmpeg_cmd[@]}" >/dev/null 2>&1 &
+    local ffmpeg_pid=$!
+
+    # Optionally check HLS while streaming
+    if [ "$check_hls" -eq 1 ]; then
+        sleep 4
+        local hls_dir="$MEDIA_DIR/hls/$key"
+        if [ -d "$hls_dir" ] && [ -f "$hls_dir/index.m3u8" ]; then
+            local seg_count
+            seg_count=$(ls -1 "$hls_dir"/*.ts 2>/dev/null | wc -l)
+            echo -e "${GREEN}  ✓ HLS output active ($seg_count segment(s))${NC}"
+        else
+            echo -e "${YELLOW}  ⚠ HLS output not yet available${NC}"
+        fi
+    fi
+
+    wait $ffmpeg_pid 2>/dev/null || true
+    sleep 3
+
+    local mp4_count
+    mp4_count=$(count_recordings "$key")
+
+    local result="FAIL"
+    local result_color="$RED"
+
+    if [ "$mp4_count" -gt 0 ]; then
+        echo -e "${GREEN}  ✓ Recording generated ($mp4_count file(s))${NC}"
+
+        local thumb_count
+        thumb_count=$(find "$MEDIA_DIR/thumbnails/recordings" -name "${key}_*.mp4_w*.webp" 2>/dev/null | wc -l)
+        if [ "$thumb_count" -gt 0 ]; then
+            echo -e "${GREEN}  ✓ Thumbnails generated ($thumb_count)${NC}"
+        else
+            echo -e "${YELLOW}  ⚠ No thumbnails found${NC}"
+        fi
+
+        if [ -f "$MEDIA_DIR/recordings/index.json" ]; then
+            echo -e "${GREEN}  ✓ index.json exists${NC}"
+        else
+            echo -e "${YELLOW}  ⚠ index.json not found${NC}"
+        fi
+
+        local integrity_ok=1
+        for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do
+            if [ -f "$f" ]; then
+                if ! check_mp4_integrity "$f" "$key" 15; then
+                    integrity_ok=0
+                fi
+            fi
+        done
+
+        if [ "$integrity_ok" -eq 1 ]; then
+            result="PASS"
+            result_color="$GREEN"
+        fi
+    fi
+
+    echo -e "${result_color}  ● Result: $result${NC}"
+    echo "$name|$result" >> "$RESULTS_FILE"
+
+    if [ "$result" = "PASS" ]; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+    fi
+}
+
+# ── Codec matrix ───────────────────────────────────────────────────
+run_codec_matrix() {
+    echo ""
+    echo "========== VIDEO + AUDIO CODEC MATRIX =========="
+
+    local res_list
+    if [ "$FULL_MATRIX" -eq 1 ]; then
+        res_list="$RESOLUTIONS"
+    else
+        res_list="$DEFAULT_RES"
+    fi
+
+    # Use first aspect for codec matrix to keep test count manageable
+    local default_aspect
+    default_aspect=$(echo "$ASPECTS" | awk '{print $1}')
+
+    for v in $VIDEO_CODECS; do
+        for a in $AUDIO_CODECS; do
+            for r in $res_list; do
+                local size
+                size=$(res_and_aspect_to_size "$r" "$default_aspect")
+                local vargs
+                vargs=$(get_vcodec_args "$v")
+                local aargs
+                aargs=$(get_acodec_args "$a")
+                local vdisp
+                vdisp=$(get_vcodec_display "$v")
+                local adisp
+                adisp=$(get_acodec_display "$a")
+                local key="codec_${v}_${a}_${r}_$(date +%s)"
+                run_stream_test "${vdisp} + ${adisp} @ ${r} (${default_aspect})" "$vargs" "$aargs" "$size" "$key" 0
+            done
+        done
+    done
+}
+
+# ── Resolution matrix ──────────────────────────────────────────────
+run_res_matrix() {
+    if [ "$FULL_MATRIX" -eq 1 ]; then
+        echo ""
+        echo "========== RESOLUTION MATRIX (covered by --full codec matrix) =========="
+        return
+    fi
+
+    echo ""
+    echo "========== RESOLUTION MATRIX =========="
+
+    local vargs
+    vargs=$(get_vcodec_args "$DEFAULT_VCODEC")
+    local aargs
+    aargs=$(get_acodec_args "$DEFAULT_ACODEC")
+    local vdisp
+    vdisp=$(get_vcodec_display "$DEFAULT_VCODEC")
+    local adisp
+    adisp=$(get_acodec_display "$DEFAULT_ACODEC")
+
+    for r in $RESOLUTIONS; do
+        for aspect in $ASPECTS; do
+            local size
+            size=$(res_and_aspect_to_size "$r" "$aspect")
+            local key="res_${DEFAULT_VCODEC}_${DEFAULT_ACODEC}_${r}_${aspect}_$(date +%s)"
+            run_stream_test "Resolution ${r} @ ${aspect} (${vdisp}+${adisp})" "$vargs" "$aargs" "$size" "$key" 0
+        done
+    done
+}
+
+# ── Color space tests ──────────────────────────────────────────────
+run_color_test() {
+    local name="$1"
+    local encoder="$2"
+    local pix_fmt="$3"
+    local profile_name="$4"
+    local hdr="$5"
+    local expected="$6"
+    local key="color_${encoder}_${pix_fmt}_${hdr}_$(date +%s)"
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Color Test: $name"
+    echo "Encoder: $encoder | Pixel Format: $pix_fmt | HDR: $hdr"
+    if [ -n "$profile_name" ]; then
+        echo "Profile: $profile_name"
+    fi
+    echo "Key:  $key"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    local ffmpeg_args=(
+        -y -re -f lavfi -i "testsrc=duration=10:size=640x360:rate=30"
+        -f lavfi -i "sine=frequency=440:duration=10"
+        -c:v "$encoder"
+        -pix_fmt "$pix_fmt"
+        -g 60 -keyint_min 60
+        -c:a aac
+        -t 6 -f flv
+    )
+
+    if [ -n "$profile_name" ]; then
+        ffmpeg_args+=(-profile:v "$profile_name")
+    fi
+
+    if [ "$hdr" = "hdr" ]; then
+        ffmpeg_args+=(-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc)
+    fi
+
+    if [ "$encoder" = "libsvtav1" ]; then
+        ffmpeg_args+=(-svtav1-params preset=12:crf=35)
+    fi
+
+    ffmpeg "${ffmpeg_args[@]}" "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+    local ffmpeg_pid=$!
+
+    wait $ffmpeg_pid 2>/dev/null || true
+    sleep 3
+
+    local mp4_count
+    mp4_count=$(count_recordings "$key")
+
+    local result="FAIL"
+    local result_color="$RED"
+    local details=""
+
+    if [ "$mp4_count" -gt 0 ]; then
+        echo -e "${GREEN}  ✓ Recording generated ($mp4_count file(s))${NC}"
+
+        local integrity_ok=1
+        local mp4_path=""
+        for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do
+            if [ -f "$f" ]; then
+                mp4_path="$f"
+                if ! check_mp4_integrity "$f" "$key" 15; then
+                    integrity_ok=0
+                fi
+            fi
+        done
+
+        if [ "$integrity_ok" -eq 1 ] && [ -n "$mp4_path" ]; then
+            local color_info
+            color_info=$(extract_color_info "$mp4_path")
+            echo "  Color info:"
+            echo "$color_info" | sed 's/^/    /'
+
+            if [ "$expected" = "WARN" ]; then
+                result="WARN"
+                result_color="$YELLOW"
+                if [ "$hdr" = "hdr" ]; then
+                    details="Records correctly; HDR metadata lost in output (expected with current muxer)"
+                else
+                    details="Records correctly; may not play in browser (expected)"
+                fi
+            else
+                result="PASS"
+                result_color="$GREEN"
+                details="Baseline compatible"
+            fi
+        else
+            result="FAIL"
+            result_color="$RED"
+            details="MP4 integrity check failed"
+        fi
+    else
+        result="FAIL"
+        result_color="$RED"
+        details="No recording generated"
+    fi
+
+    echo -e "${result_color}  ● Result: $result${NC} — $details"
+    echo "$name|$encoder|$pix_fmt|$hdr|$expected|$result|$details" >> "$RESULTS_FILE"
+
+    if [ "$result" = "PASS" ]; then
+        PASS=$((PASS+1))
+    elif [ "$result" = "WARN" ]; then
+        WARN=$((WARN+1))
+    else
+        FAIL=$((FAIL+1))
+    fi
+}
+
+run_color_matrix() {
+    echo ""
+    echo "========== COLOR SPACE TEST MATRIX =========="
+
+    run_color_test "H.264 4:2:0 8-bit SDR"      libx264  yuv420p     ""      sdr  PASS
+    run_color_test "AV1 4:2:0 8-bit SDR"        libsvtav1 yuv420p    ""      sdr  PASS
+    run_color_test "H.264 4:2:2 8-bit SDR"      libx264  yuv422p     high422 sdr  WARN
+    run_color_test "H.264 4:4:4 8-bit SDR"      libx264  yuv444p     high444 sdr  WARN
+    run_color_test "H.264 NV12 8-bit SDR"       libx264  nv12        ""      sdr  PASS
+    run_color_test "H.264 4:2:0 10-bit SDR"     libx264  yuv420p10le ""      sdr  WARN
+    run_color_test "H.264 4:2:0 10-bit HDR"     libx264  yuv420p10le ""      hdr  WARN
+    run_color_test "AV1 4:2:0 10-bit SDR"       libsvtav1 yuv420p10le ""     sdr  PASS
+    run_color_test "AV1 4:2:0 10-bit HDR"       libsvtav1 yuv420p10le ""     hdr  WARN
+}
+
+# ── Graceful stop test ─────────────────────────────────────────────
+run_graceful_stop_test() {
+    echo ""
+    echo "========== GRACEFUL STOP + HLS CLEANUP =========="
+
+    local key="graceful_$(date +%s)"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Test: Graceful stop (HLS cleanup)"
+    echo "Key:  $key"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    ffmpeg -y -re -f lavfi -i "testsrc=duration=10:size=640x360:rate=30" \
+        -f lavfi -i "sine=frequency=440:duration=10" \
+        -c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
+        -c:a aac -t 4 -f flv \
+        "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+    local ff_pid=$!
+
+    wait $ff_pid 2>/dev/null || true
+    sleep 3
+
+    local hls_dir="$MEDIA_DIR/hls/$key"
+    local mp4_count
+    mp4_count=$(count_recordings "$key")
+
+    local result="FAIL"
+    local result_color="$RED"
+
+    if [ "$mp4_count" -gt 0 ] && [ ! -d "$hls_dir" ]; then
+        echo -e "${GREEN}  ✓ Recording exists and HLS directory cleaned up${NC}"
+
+        local integrity_ok=1
+        for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do
+            if [ -f "$f" ]; then
+                if ! check_mp4_integrity "$f" "$key" 10; then
+                    integrity_ok=0
+                fi
+            fi
+        done
+
+        if [ "$integrity_ok" -eq 1 ]; then
+            result="PASS"
+            result_color="$GREEN"
+        else
+            result="FAIL"
+            result_color="$RED"
+        fi
+    elif [ "$mp4_count" -eq 0 ]; then
+        echo -e "${RED}  ✗ No recording generated${NC}"
+    else
+        echo -e "${RED}  ✗ HLS directory still exists${NC}"
+    fi
+
+    echo -e "${result_color}  ● Result: $result${NC}"
+    echo "graceful_stop|$result" >> "$RESULTS_FILE"
+
+    if [ "$result" = "PASS" ]; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+    fi
+}
+
+# ── Reconnect test ─────────────────────────────────────────────────
+run_reconnect_test() {
+    echo ""
+    echo "========== ABNORMAL DISCONNECT / RECONNECT =========="
+
+    local key="reconnect_$(date +%s)"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Test: Abnormal disconnect + reconnect"
+    echo "Key:  $key"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # First push (long duration, will be killed abruptly)
+    ffmpeg -y -re -f lavfi -i "testsrc=duration=30:size=640x360:rate=30" \
+        -f lavfi -i "sine=frequency=440:duration=30" \
+        -c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
+        -c:a aac -f flv \
+        "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+    local ff_pid=$!
+
+    sleep 4
+
+    # Abruptly kill ffmpeg
+    kill -9 $ff_pid 2>/dev/null || true
+    sleep 1
+
+    local stream_json
+    stream_json=$(api_call "/api/streams")
+    if echo "$stream_json" | grep -q "$key"; then
+        echo -e "${GREEN}  ✓ Stream still visible in API during grace period${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ Stream not visible in API during grace period${NC}"
+    fi
+
+    echo "  --- Reconnecting within grace period ---"
+    ffmpeg -y -re -f lavfi -i "testsrc=duration=10:size=640x360:rate=30" \
+        -f lavfi -i "sine=frequency=1000:duration=10" \
+        -c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 \
+        -c:a aac -t 4 -f flv \
+        "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+    ff_pid=$!
+
+    wait $ff_pid 2>/dev/null || true
+    sleep 3
+
+    local mp4_count
+    mp4_count=$(count_recordings "$key")
+
+    local result="FAIL"
+    local result_color="$RED"
+
+    if [ "$mp4_count" -eq 1 ]; then
+        local integrity_ok=1
+        for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do
+            if [ -f "$f" ]; then
+                if ! check_mp4_integrity "$f" "$key" 15; then
+                    integrity_ok=0
+                fi
+            fi
+        done
+
+        if [ "$integrity_ok" -eq 1 ]; then
+            result="PASS"
+            result_color="$GREEN"
+            echo -e "${GREEN}  ✓ Reconnect test PASSED (1 merged recording)${NC}"
+        else
+            echo -e "${RED}  ✗ Reconnect test FAILED (file corrupt)${NC}"
+        fi
+    else
+        echo -e "${RED}  ✗ Reconnect test FAILED (expected 1 recording, got $mp4_count)${NC}"
+    fi
+
+    echo -e "${result_color}  ● Result: $result${NC}"
+    echo "reconnect|$result" >> "$RESULTS_FILE"
+
+    if [ "$result" = "PASS" ]; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+    fi
+}
+
+# ── HLS / E2E test ─────────────────────────────────────────────────
+run_hls_test() {
+    echo ""
+    echo "========== HLS / E2E STREAMING TEST =========="
+
+    local key="hls_$(date +%s)"
+    local size="640x360"
+    local vargs
+    vargs=$(get_vcodec_args "h264")
+    local aargs
+    aargs=$(get_acodec_args "aac")
+
+    run_stream_test "HLS E2E (H.264 + AAC @ 360p)" "$vargs" "$aargs" "$size" "$key" 1
+}
+
+# ── JSON report ────────────────────────────────────────────────────
+generate_json_report() {
+    local output_path="$1"
+    mkdir -p "$(dirname "$output_path")"
+
+    python3 - "$RESULTS_FILE" "$PASS" "$WARN" "$FAIL" "$output_path" <<'PYEOF'
+import json, sys, time
+from datetime import datetime
+
+results_file = sys.argv[1]
+pass_count = int(sys.argv[2])
+warn_count = int(sys.argv[3])
+fail_count = int(sys.argv[4])
+output_path = sys.argv[5]
+
+results = []
+with open(results_file) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split('|')
+        entry = {"name": parts[0], "result": parts[1]}
+        if len(parts) > 2:
+            entry["encoder"] = parts[1]
+            entry["pix_fmt"] = parts[2]
+            entry["hdr"] = parts[3]
+            entry["expected"] = parts[4]
+            entry["result"] = parts[5]
+            entry["details"] = '|'.join(parts[6:]) if len(parts) > 6 else ""
+            entry["name"] = parts[0]
+        results.append(entry)
+
+report = {
+    "timestamp": int(time.time()),
+    "date": datetime.now().isoformat(),
+    "config": {
+        "video_codecs": " ".join(sys.argv[6].split()) if len(sys.argv) > 6 else "",
+        "audio_codecs": " ".join(sys.argv[7].split()) if len(sys.argv) > 7 else "",
+        "resolutions": " ".join(sys.argv[8].split()) if len(sys.argv) > 8 else "",
+        "aspects": " ".join(sys.argv[9].split()) if len(sys.argv) > 9 else "",
+        "full_matrix": sys.argv[10] if len(sys.argv) > 10 else "0"
+    },
+    "summary": {
+        "pass": pass_count,
+        "warn": warn_count,
+        "fail": fail_count,
+        "total": pass_count + warn_count + fail_count
+    },
+    "results": results
+}
+
+with open(output_path, 'w') as f:
+    json.dump(report, f, indent=2)
+
+print(f"JSON report written to: {output_path}")
+PYEOF
+}
+
+# ── Main ───────────────────────────────────────────────────────────
+echo "=== Livestream Merged Test Suite ==="
+echo "API:      $API_BASE"
+echo "RTMP:     $RTMP_BASE"
+echo "Video:    $VIDEO_CODECS"
+echo "Audio:    $AUDIO_CODECS"
+echo "Res:      $RESOLUTIONS"
+echo "Aspect:   $ASPECTS"
+echo "Tests:    $TESTS"
+echo "Duration: ${STREAM_DURATION}s"
+if [ "$FULL_MATRIX" -eq 1 ]; then
+    echo "Mode:     FULL MATRIX"
+else
+    echo "Mode:     QUICK"
+fi
+echo ""
+
+api_call "/api/health" || { echo "Health check failed, is the server running?"; exit 1; }
+
+# Expand "all" in TESTS
+if echo "$TESTS" | grep -qw "all"; then
+    TESTS="codec res color graceful reconnect hls"
+fi
+
+# Run selected test suites
+for t in $TESTS; do
+    case $t in
+        codec)
+            run_codec_matrix
+            ;;
+        res)
+            run_res_matrix
+            ;;
+        color)
+            run_color_matrix
+            ;;
+        graceful)
+            run_graceful_stop_test
+            ;;
+        reconnect)
+            run_reconnect_test
+            ;;
+        hls)
+            run_hls_test
+            ;;
+        *)
+            echo "Unknown test suite: $t"
+            ;;
+    esac
+done
+
+# Final summary
+echo ""
+echo "============================================"
+echo "              TEST SUMMARY"
+echo "============================================"
+echo -e "${GREEN}Passed: $PASS${NC}"
+if [ "$WARN" -gt 0 ]; then
+    echo -e "${YELLOW}Warned: $WARN${NC}"
+fi
+echo -e "${RED}Failed: $FAIL${NC}"
+echo "============================================"
+
+# Generate JSON report
+REPORT_PATH="$REPORT_DIR/merged_report_$(date +%s).json"
+if command -v python3 >/dev/null 2>&1; then
+    echo ""
+    generate_json_report "$REPORT_PATH" "$VIDEO_CODECS" "$AUDIO_CODECS" "$RESOLUTIONS" "$ASPECTS" "$FULL_MATRIX"
+else
+    echo ""
+    echo -e "${YELLOW}⚠ python3 not found; skipping JSON report${NC}"
+fi
+
+# List streams and recordings
+echo ""
+echo "========== API CHECK =========="
+echo "Health:   $(api_call "/api/health")"
+echo "Streams:  $(api_call "/api/streams")"
+
+if [ "$FAIL" -gt 0 ]; then
+    exit 1
+fi
+exit 0
