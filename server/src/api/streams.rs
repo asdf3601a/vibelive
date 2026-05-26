@@ -70,7 +70,7 @@ pub async fn thumbnail(
     let ttl = state.config.thumbnail_interval_seconds as u64;
     let cache_header = format!("max-age={}, stale-while-revalidate={}", ttl, ttl * 2);
 
-    let thumb_dir = std::path::PathBuf::from(&state.config.media_dir).join("thumbnails");
+    let thumb_dir = std::path::PathBuf::from(&state.config.media_dir).join("thumbnails").join("streams");
     let thumb_path = thumb_dir.join(format!("{}_w{}.webp", key, width));
 
     match tokio::fs::read(&thumb_path).await {

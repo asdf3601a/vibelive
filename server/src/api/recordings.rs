@@ -88,7 +88,7 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 if tokio::fs::try_exists(&thumb_path).await.unwrap_or(false) {
                     thumbnails.insert(
                         width.to_string(),
-                        format!("{}/thumbnails/{}", state.config.recordings_base_url, thumb_filename),
+                        format!("/thumbnails/recordings/{}", thumb_filename),
                     );
                 }
             }

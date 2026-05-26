@@ -8,7 +8,7 @@ pub async fn generate_thumbnails_for_stream(
     sizes: &[u32],
     interval_seconds: u32,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    let dir = PathBuf::from(media_dir).join("thumbnails");
+    let dir = PathBuf::from(media_dir).join("thumbnails").join("streams");
     tokio::fs::create_dir_all(&dir).await?;
 
     // Build a temporary MP4 from init + first segment so ffmpeg can decode it
@@ -94,11 +94,10 @@ async fn run_ffmpeg_thumbnail(
         "-y".to_string(),
         "-hide_banner".to_string(),
         "-loglevel".to_string(), "error".to_string(),
-        "-i".to_string(), input.to_str().unwrap().to_string(),
         "-ss".to_string(), "00:00:00.5".to_string(),
+        "-i".to_string(), input.to_str().unwrap().to_string(),
         "-vframes".to_string(), "1".to_string(),
-        "-quality".to_string(), "75".to_string(),
-        "-compression_level".to_string(), "4".to_string(),
+        "-q:v".to_string(), "75".to_string(),
     ];
 
     if let Some(w) = width {
@@ -116,6 +115,12 @@ async fn run_ffmpeg_thumbnail(
     if !cmd_output.status.success() {
         let stderr = String::from_utf8_lossy(&cmd_output.stderr);
         return Err(anyhow::anyhow!("ffmpeg failed: {}", stderr));
+    }
+
+    let meta = tokio::fs::metadata(output).await?;
+    if meta.len() == 0 {
+        let _ = tokio::fs::remove_file(output).await;
+        return Err(anyhow::anyhow!("ffmpeg produced empty output"));
     }
 
     Ok(output.to_path_buf())

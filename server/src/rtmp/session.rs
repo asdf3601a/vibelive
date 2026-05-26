@@ -154,11 +154,19 @@ async fn finalize_stream(
             let key = stream_key.to_string();
             tokio::spawn(async move {
                 let thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("recordings");
-                let _ = crate::thumbnail::generate_thumbnails_for_file(&mp4_path, &thumb_dir, &sizes).await;
-                let _ = crate::recording::write_index_json(&media_dir, &base_url, &sizes).await;
+                if let Err(e) = crate::thumbnail::generate_thumbnails_for_file(&mp4_path, &thumb_dir, &sizes).await {
+                    tracing::warn!("Post-recording thumbnail generation failed for {}: {}", key, e);
+                }
+                if let Err(e) = crate::recording::write_index_json(&media_dir, &base_url, &sizes).await {
+                    tracing::warn!("write_index_json failed for {}: {}", key, e);
+                }
                 // Clean up HLS files after recording is saved
                 let hls_dir = PathBuf::from(&media_dir).join("hls").join(&key);
                 let _ = tokio::fs::remove_dir_all(&hls_dir).await;
+                let stream_thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("streams");
+                for &w in &sizes {
+                    let _ = tokio::fs::remove_file(stream_thumb_dir.join(format!("{}_w{}.webp", key, w))).await;
+                }
             });
         }
     }
@@ -270,7 +278,7 @@ async fn handle_event(
 ) -> anyhow::Result<()> {
     match event {
         ServerSessionEvent::ConnectionRequested { request_id, app_name } => {
-            tracing::info!("RTMP connect: app={}", app_name);
+            tracing::debug!("RTMP connect: app={}", app_name);
             ctx.current_app = Some(app_name);
             let responses = session.accept_request(request_id)
                 .map_err(|e| anyhow::anyhow!("accept: {}", e))?;
@@ -283,7 +291,7 @@ async fn handle_event(
         }
 
         ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
-            tracing::info!("Publish request: stream_key={}", stream_key);
+            tracing::debug!("Publish request: stream_key={}", stream_key);
             let responses = session.accept_request(request_id)
                 .map_err(|e| anyhow::anyhow!("publish accept: {}", e))?;
             tracing::debug!("Sending {} outbound responses for publish accept", responses.len());
@@ -382,7 +390,7 @@ async fn handle_event(
 }
 
 async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_state: &Arc<AppState>, _stream_key: &str) {
-    tracing::info!("handle_video_data: ts={}, len={}, first_bytes={:02x?}", ts, data.len(), &data[..data.len().min(8)]);
+    tracing::debug!("handle_video_data: ts={}, len={}, first_bytes={:02x?}", ts, data.len(), &data[..data.len().min(8)]);
     if crate::rtmp::enhanced::is_enhanced_video(data) {
         if let Ok((header, remainder)) = crate::rtmp::enhanced::parse_enhanced_video_header(data) {
             let codec = match header.codec {
@@ -412,12 +420,12 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_
         let frame_type = (data[0] & 0xF0) >> 4;
         let codec_id = data[0] & 0x0F;
         let is_keyframe = frame_type == 1;
-        tracing::info!("legacy video: frame_type={}, codec_id={}, len={}", frame_type, codec_id, data.len());
+        tracing::debug!("legacy video: frame_type={}, codec_id={}, len={}", frame_type, codec_id, data.len());
 
         if codec_id == 7 && data.len() >= 2 {
             let avc_packet_type = data[1];
             let remainder = if data.len() >= 5 { &data[5..] } else { &[] };
-            tracing::info!("avc_packet_type={}, remainder_len={}", avc_packet_type, remainder.len());
+            tracing::debug!("avc_packet_type={}, remainder_len={}", avc_packet_type, remainder.len());
 
             if avc_packet_type == 0 {
                 // AVC sequence header -> avcC config

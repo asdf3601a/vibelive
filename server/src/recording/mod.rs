@@ -147,7 +147,7 @@ pub async fn write_index_json(
                 if tokio::fs::try_exists(&thumb_path).await.unwrap_or(false) {
                     thumbnails.insert(
                         width.to_string(),
-                        format!("{}/thumbnails/{}", recordings_base_url, thumb_filename),
+                        format!("/thumbnails/recordings/{}", thumb_filename),
                     );
                 }
             }

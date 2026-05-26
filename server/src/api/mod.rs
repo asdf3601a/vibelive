@@ -43,6 +43,7 @@ async fn hls_content_type_middleware(
 pub fn create_router(state: Arc<AppState>) -> Router {
     let hls_dir = format!("{}/hls", state.config.media_dir);
     let recordings_dir = format!("{}/recordings", state.config.media_dir);
+    let thumbnails_dir = format!("{}/thumbnails", state.config.media_dir);
 
     let api_routes = Router::new()
         .route("/api/health", get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }))
@@ -57,6 +58,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .nest_service("/hls", hls_service)
         .nest_service("/recordings", tower_http::services::ServeDir::new(recordings_dir))
+        .nest_service("/thumbnails", tower_http::services::ServeDir::new(thumbnails_dir))
         .layer(axum::middleware::from_fn(hls_content_type_middleware))
         .merge(api_routes)
         .with_state(state)
