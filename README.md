@@ -49,9 +49,9 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Session event loop (`ServerSession::handle_input`)
   - Event dispatch: `ConnectionRequested`, `PublishStreamRequested`, `VideoDataReceived`, `AudioDataReceived`, `StreamMetadataChanged`, `PublishStreamFinished`
   - **Grace period**: On disconnect, the stream enters a grace period (default 30s). If the publisher reconnects within the grace period, the existing `HlsStreamState` and `Fmp4Recorder` are resumed. Otherwise, the stream is finalized.
-- **`rtmp/enhanced.rs`** — Parses Enhanced RTMP headers (ExVideo/ExAudio, FFmpeg veovera format) to detect AV1, H.264, H.265, Opus, AAC codecs.
+- **`rtmp/enhanced.rs`** — Parses Enhanced RTMP headers (ExVideo/ExAudio, FFmpeg veovera format) to detect AV1, H.264, H.265, Opus, AAC, FLAC codecs. Supports **multitrack** streams (OBS/FFmpeg veovera v2 spec) with per-track codec detection and OneTrack / ManyTracks / ManyTracksManyCodecs layouts.
 - **`rtmp/mod.rs`** — `StreamManager` holds two `HashMap`s:
-  - `publishers`: active publishers with metadata
+  - `publishers`: active publishers with metadata and a `tracks` array (track_id, hls_url, video_codec, audio_codec)
   - `pending_streams`: disconnected but grace-period-active streams
 
 ### 3.2 HLS Generation (`hls/`)
@@ -60,6 +60,7 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Writes `init.mp4` (ftyp + moov with codec config)
   - Writes `.m4s` segments (moof + mdat)
   - Maintains `index.m3u8` playlist
+  - **Multitrack**: Each additional video track gets its own `track_N/` subdirectory with independent `init.mp4`, segments, and playlist. A `master.m3u8` references all available tracks.
   - **init.mp4 timing**: `write_init_segment()` is called inside `rotate_segment()`, ensuring init.mp4 is written when the first segment is created (after both video and audio configs have typically arrived).
   - **Resolution**: `set_video_config()` receives actual width/height from RTMP metadata (defaults 1920×1080). If metadata arrives later, `update_video_resolution()` rewrites init.mp4.
 - **`hls/fmp4.rs`** — Low-level fMP4 (CMAF) muxer:
@@ -88,8 +89,8 @@ Axum router with these endpoints:
 | Endpoint | Description |
 |----------|-------------|
 | `GET /api/health` | Health check |
-| `GET /api/streams` | List active streams with metadata |
-| `GET /api/streams/{key}` | Get single stream details |
+| `GET /api/streams` | List active streams with metadata and `tracks` array |
+| `GET /api/streams/{key}` | Get single stream details (includes `tracks` with per-track HLS URLs and codecs) |
 | `GET /api/recordings` | List recordings (from index.json or fallback scan) |
 | `GET /api/recordings/{filename}/thumbnail?width=W` | Recording thumbnail fallback (generates on-the-fly if missing) |
 
@@ -133,14 +134,14 @@ Environment variables (all in `.env`):
 | Route | View | Purpose |
 |-------|------|---------|
 | `/` | `Home.vue` | Active stream grid with polling |
-| `/live/:key` | `LiveWatch.vue` | HLS player + stream metadata sidebar |
+| `/live/:key` | `LiveWatch.vue` | HLS player + stream metadata sidebar + **track switcher** for multitrack streams |
 | `/recordings` | `Recordings.vue` | Recordings library with filters (stream key, date range) |
 
 ### 4.3 Key Patterns
 
 - **Polling**: `usePolling()` composable fetches data every 3s, pauses when tab is hidden, and only updates reactive state when data actually changes (deep equality check).
 - **Two-stage updates**: The Recordings page shows a "有新的錄影可查看 / Refresh" toast instead of abruptly re-rendering the list.
-- **Player**: `Player.vue` uses hls.js with `enableWorker` and `lowLatencyMode`. Falls back to native HLS on Safari.
+- **Player**: `Player.vue` uses hls.js with `enableWorker` and `lowLatencyMode`. Falls back to native HLS on Safari. Supports dynamic `src` switching for multitrack track selection.
 - **Thumbnail loading**: `ThumbnailImg.vue` handles the fact that thumbnails are generated asynchronously by ffmpeg:
   - Displays a loading spinner placeholder (gray background + animated spinner) while the image is not yet available.
   - If the image fails to load, auto-retries every 5 seconds up to 12 retries.
@@ -172,13 +173,13 @@ Environment variables (all in `.env`):
 1. **Publish**: OBS/ffmpeg pushes RTMP to `:1935/live/{stream_key}`
 2. **Handshake**: `rtmp/server.rs` accepts TCP, `session.rs` performs RTMP handshake
 3. **Codec detection**: `enhanced.rs` parses video/audio headers → determines codec (H.264/AV1/Opus/AAC)
-4. **HLS muxing**: `HlsStreamState` receives video/audio frames → `fmp4.rs` builds init.mp4 + segments
-5. **Playlist update**: `update_playlist()` writes `index.m3u8` referencing `init.mp4` and segments
-6. **Playback**: Browser loads `/hls/{key}/index.m3u8` via nginx → hls.js fetches init.mp4 + segments
+4. **HLS muxing**: `HlsStreamState` receives video/audio frames → `fmp4.rs` builds init.mp4 + segments. For multitrack streams, additional `HlsStreamState` instances are created per track_id under `track_N/`.
+5. **Playlist update**: `update_playlist()` writes `index.m3u8` (default track) and `track_N/index.m3u8` (per-track). A `master.m3u8` aggregates all track playlists.
+6. **Playback**: Browser loads `/hls/{key}/index.m3u8` (default) or `/hls/{key}/track_1/index.m3u8` (track 1) via nginx → hls.js fetches init.mp4 + segments
 
 ### Recording Flow
 
-1. **Recording**: `Fmp4Recorder` collects init + segments in memory
+1. **Recording**: `Fmp4Recorder` collects init + segments from the **default track only** (track_id == 0). Additional tracks are not recorded.
 2. **Finalize on stop**: `close()` concatenates all data into `{key}_{timestamp}.mp4`
 3. **Thumbnail**: ffmpeg generates `thumbnails/recordings/{filename}_w{size}.webp` thumbnails
 4. **Index**: `write_index_json()` updates `recordings/index.json`
@@ -363,6 +364,14 @@ Covers:
 
 The project includes a unified test script `./test.sh` that covers codec compatibility, resolution/aspect-ratio coverage, color-space validation, graceful-stop, reconnect, and HLS streaming tests.
 
+Additionally, `./test_multitrack.sh` validates **Enhanced RTMP multitrack** ingestion:
+- Verifies multiple video tracks are parsed and muxed into independent HLS playlists
+- Checks `master.m3u8` and per-track `track_N/index.m3u8`
+- Validates per-track `init.mp4` + segment fMP4 integrity via ffprobe
+- Confirms `/api/streams` returns a `tracks` array with `video_codec` and `audio_codec` for each track
+- Ensures recording produces exactly **one** MP4 file (default track only)
+- Supports mixed codec matrices (e.g. track 0 = AV1 + Opus, track 1 = H.264 + AAC)
+
 ```bash
 # Quick mode (recommended for CI): codec matrix at 480p/720p + all resolutions +
 # color space + graceful stop + reconnect + HLS
@@ -408,15 +417,27 @@ The project includes a unified test script `./test.sh` that covers codec compati
 ### 9.3 Manual Testing with ffmpeg
 
 ```bash
-# Push a test stream
+# Push a single-track test stream
 ffmpeg -re -f lavfi -i testsrc=duration=30:size=1280x720:rate=30 \
   -f lavfi -i "sine=frequency=440:duration=30" \
   -c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency \
   -c:a aac -ar 44100 \
   -f flv rtmp://localhost:1935/live/testkey
+
+# Push a multitrack stream (2 video + 2 audio)
+ffmpeg -re \
+  -f lavfi -i "testsrc=duration=30:size=1280x720:rate=30" \
+  -f lavfi -i "testsrc=duration=30:size=640x360:rate=30" \
+  -f lavfi -i "sine=frequency=440:duration=30" \
+  -f lavfi -i "sine=frequency=880:duration=30" \
+  -map 0:v -c:v:0 libsvtav1 -preset:v:0 12 -pix_fmt:v:0 yuv420p -b:v:0 1500k -g:v:0 60 \
+  -map 1:v -c:v:1 libx264 -preset:v:1 ultrafast -pix_fmt:v:1 yuv420p -b:v:1 500k -g:v:1 60 \
+  -map 2:a -c:a:0 libopus -ar:a:0 48000 -b:a:0 128k \
+  -map 3:a -c:a:1 aac -ar:a:1 44100 -b:a:1 128k \
+  -f flv rtmp://localhost:1935/live/testkey
 ```
 
-Then open `http://localhost:8080/live/testkey` in a browser.
+Then open `http://localhost:8080/live/testkey` in a browser. For multitrack streams, the player page shows a **Video Tracks** switcher below the player to toggle between Default and Track 1.
 
 ## 10. Development Guidelines
 
