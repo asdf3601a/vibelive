@@ -99,6 +99,182 @@ Static file serving:
 - `/recordings/*` → `MEDIA_DIR/recordings/*`
 - `/thumbnails/*` → `MEDIA_DIR/thumbnails/*`
 
+---
+
+#### API Reference
+
+##### `GET /api/health`
+
+Health check. Returns immediately with HTTP 200.
+
+**Response (200 OK):**
+```json
+{
+  "status": "ok"
+}
+```
+
+---
+
+##### `GET /api/streams`
+
+List all currently active (live) streams.
+
+**Response (200 OK):** `StreamResponse[]`
+
+```json
+[
+  {
+    "stream_key": "testkey",
+    "status": "live",
+    "started_at": "2026-05-27T06:30:00Z",
+    "metadata": {
+      "width": 1280,
+      "height": 720,
+      "video_codec": "AV1",
+      "audio_codec": "Opus",
+      "video_bitrate": 1500000,
+      "audio_bitrate": 128000,
+      "framerate": 30.0
+    },
+    "hls_url": "/hls/testkey/index.m3u8",
+    "player_url": "/live/testkey",
+    "thumbnail_url": "/thumbnails/streams/testkey_w320.webp",
+    "thumbnails": {
+      "320": "/thumbnails/streams/testkey_w320.webp",
+      "480": "/thumbnails/streams/testkey_w480.webp"
+    },
+    "tracks": [
+      {
+        "track_id": 0,
+        "hls_url": "/hls/testkey/index.m3u8",
+        "video_codec": "AV1",
+        "audio_codec": "Opus"
+      },
+      {
+        "track_id": 1,
+        "hls_url": "/hls/testkey/track_1/index.m3u8",
+        "video_codec": "H264",
+        "audio_codec": "Aac"
+      }
+    ]
+  }
+]
+```
+
+**Field descriptions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `stream_key` | `string` | Unique stream identifier (from RTMP publish path) |
+| `status` | `"live" \| "ended"` | Always `"live"` for this endpoint |
+| `started_at` | `string \| null` | ISO 8601 timestamp when the stream started |
+| `metadata` | `StreamMeta \| null` | Video/audio metadata extracted from RTMP |
+| `metadata.width` | `number` | Video width in pixels |
+| `metadata.height` | `number` | Video height in pixels |
+| `metadata.video_codec` | `string` | Detected video codec (e.g. `H264`, `HEVC`, `AV1`) |
+| `metadata.audio_codec` | `string` | Detected audio codec (e.g. `AAC`, `Opus`, `FLAC`) |
+| `metadata.video_bitrate` | `number` | Video bitrate (bps) |
+| `metadata.audio_bitrate` | `number` | Audio bitrate (bps) |
+| `metadata.framerate` | `number` | Frames per second |
+| `hls_url` | `string \| null` | Default track HLS playlist URL |
+| `player_url` | `string \| null` | Frontend player page URL |
+| `thumbnail_url` | `string` | Primary thumbnail URL (smallest configured size) |
+| `thumbnails` | `Record<string, string>` | Map of width → thumbnail URL |
+| `tracks` | `TrackInfo[]` | Per-track HLS URLs and codecs (multitrack streams) |
+| `tracks[].track_id` | `number` | Track index (0 = default) |
+| `tracks[].hls_url` | `string` | HLS playlist for this track |
+| `tracks[].video_codec` | `string \| null` | Video codec for this track (null if not yet detected) |
+| `tracks[].audio_codec` | `string \| null` | Audio codec for this track (null if not yet detected) |
+
+**Side effect:** Calling this endpoint triggers asynchronous thumbnail generation for each active stream so that nginx can serve fresh thumbnails.
+
+---
+
+##### `GET /api/streams/{key}`
+
+Get details for a single active stream.
+
+**Path parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `key` | `string` | Stream key |
+
+**Response (200 OK):** `StreamResponse` (same schema as list item above)
+
+**Response (404 Not Found):**
+```json
+{
+  "error": "Stream not found"
+}
+```
+
+---
+
+##### `GET /api/recordings`
+
+List all finalized recordings.
+
+**Response (200 OK):** `RecordingResponse[]`
+
+```json
+[
+  {
+    "filename": "testkey_20260527_063000.mp4",
+    "stream_key": "testkey",
+    "created_at": "2026-05-27T06:30:00Z",
+    "size_bytes": 12345678,
+    "duration_seconds": 120,
+    "url": "/recordings/testkey_20260527_063000.mp4",
+    "thumbnail_url": "/thumbnails/recordings/testkey_20260527_063000.mp4_w320.webp",
+    "thumbnails": {
+      "320": "/thumbnails/recordings/testkey_20260527_063000.mp4_w320.webp",
+      "480": "/thumbnails/recordings/testkey_20260527_063000.mp4_w480.webp"
+    }
+  }
+]
+```
+
+**Field descriptions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `filename` | `string` | Recording file name |
+| `stream_key` | `string` | Source stream key |
+| `created_at` | `string` | ISO 8601 timestamp (from `index.json` or file mtime fallback) |
+| `size_bytes` | `number` | File size in bytes |
+| `duration_seconds` | `number \| undefined` | Video duration (seconds) — may be missing if ffprobe fails |
+| `url` | `string` | Direct download URL |
+| `thumbnail_url` | `string` | Primary thumbnail URL |
+| `thumbnails` | `Record<string, string>` | Map of width → thumbnail URL (only existing files are listed) |
+
+**Implementation note:** The endpoint first attempts to read `recordings/index.json`. If the index is missing or corrupt, it falls back to scanning the `recordings/` directory and probing each MP4 with ffprobe.
+
+---
+
+##### `GET /api/recordings/{filename}/thumbnail?width={W}`
+
+Return a recording thumbnail image. If the pre-generated thumbnail does not exist, the server generates it on-the-fly using ffmpeg.
+
+**Path parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filename` | `string` | Full MP4 file name (e.g. `testkey_20260527_063000.mp4`) |
+
+**Query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `width` | `number` | smallest configured size | Requested thumbnail width. The server returns the closest configured size that is **≤** the requested width. |
+
+**Response (200 OK):** `image/webp` binary data
+
+**Response (404 Not Found):** Recording or thumbnail not available.
+
+**Response (500 Internal Server Error):** Thumbnail generation or read failed.
+
 ### 3.5 Configuration (`config/`)
 
 Environment variables (all in `.env`):
