@@ -177,6 +177,15 @@ async fn write_master_playlist(media_dir: &str, stream_key: &str, track_ids: &[u
     Ok(())
 }
 
+async fn drain_hls_to_recorder(hls: &mut HlsStreamState, recorder: &mut Fmp4Recorder) {
+    if let Some(init) = hls.drain_init_data() {
+        let _ = recorder.write_init(&init).await;
+    }
+    for seg in hls.drain_segment_data() {
+        let _ = recorder.write_segment(seg).await;
+    }
+}
+
 async fn finalize_stream(
     app_state: &Arc<AppState>,
     stream_key: &str,
@@ -198,13 +207,8 @@ async fn finalize_stream(
         tracing::warn!("Failed to write master playlist for {}: {}", stream_key, e);
     }
 
-    if let Some(ref mut r) = recorder {
-        if let Some(init) = hls.drain_init_data() {
-            let _ = r.write_init(&init).await;
-        }
-        for seg in hls.drain_segment_data() {
-            let _ = r.write_segment(&seg).await;
-        }
+if let Some(ref mut r) = recorder {
+        drain_hls_to_recorder(&mut hls, r).await;
         if let Ok(mp4_path) = r.close().await {
             let sizes = app_state.config.thumbnail_sizes.clone();
             let base_url = app_state.config.recordings_base_url.clone();
@@ -271,12 +275,7 @@ async fn enter_grace_period(app_state: &Arc<AppState>, ctx: &mut SessionContext)
         if let Some(mut hls) = ctx.hls_state.take() {
             let _ = hls.prepare_for_grace_period().await;
             if let Some(ref mut recorder) = ctx.recorder {
-                if let Some(init) = hls.drain_init_data() {
-                    let _ = recorder.write_init(&init).await;
-                }
-                for seg in hls.drain_segment_data() {
-                    let _ = recorder.write_segment(&seg).await;
-                }
+                drain_hls_to_recorder(&mut hls, recorder).await;
             }
             let recorder = ctx.recorder.take();
             {
@@ -292,7 +291,7 @@ async fn enter_grace_period(app_state: &Arc<AppState>, ctx: &mut SessionContext)
 
                 let pending = {
                     let mut sm = app_state_clone.stream_manager.write().await;
-                    sm.pending_streams.remove(&key_clone)
+                    sm.remove_pending_stream(&key_clone)
                 };
 
                 if let Some(pending) = pending {
@@ -457,7 +456,7 @@ async fn handle_event(
             };
             if let Some(ref key) = ctx.current_stream_key {
                 let mut sm = app_state.stream_manager.write().await;
-                if let Some(ref mut pi) = sm.publishers.get_mut(key) {
+                if let Some(ref mut pi) = sm.publishers_mut().get_mut(key) {
                     pi.metadata = Some(meta);
                 }
             }
@@ -491,15 +490,15 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_
                             let video_width = ctx.video_width;
                             let video_height = ctx.video_height;
                             // Default hls_state gets only the first video track
-                            if i == 0 {
-                                if let Some(ref mut hls) = ctx.hls_state {
-                                    match inner_pt {
-                                        Some(crate::rtmp::enhanced::VideoPacketType::SequenceStart) => {
-                                            let _ = hls.set_video_config(track.payload, codec, video_width, video_height).await;
-                                        }
-                                        _ => {
-                                            let _ = hls.write_video(track.payload, ts, is_keyframe).await;
-                                        }
+                            if i == 0
+                                && let Some(ref mut hls) = ctx.hls_state
+                            {
+                                match inner_pt {
+                                    Some(crate::rtmp::enhanced::VideoPacketType::SequenceStart) => {
+                                        let _ = hls.set_video_config(track.payload, codec, video_width, video_height).await;
+                                    }
+                                    _ => {
+                                        let _ = hls.write_video(track.payload, ts, is_keyframe).await;
                                     }
                                 }
                             }
@@ -570,24 +569,15 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_
 
     // Drain default hls_state to recorder
     if let (Some(ref mut hls), Some(ref mut recorder)) = (ctx.hls_state.as_mut(), ctx.recorder.as_mut()) {
-        if let Some(init) = hls.drain_init_data() {
-            let _ = recorder.write_init(&init).await;
-        }
-        for seg in hls.drain_segment_data() {
-            let _ = recorder.write_segment(&seg).await;
-        }
+        drain_hls_to_recorder(hls, recorder).await;
     }
 
-    // Drain track states to recorder (not needed for default track; recording uses default hls_state only)
-    // But we still need to drain segment data from track states to free memory
+    // Drain track states to free memory
     for track_state in ctx.track_states.values_mut() {
         let _ = track_state.drain_init_data();
         let _ = track_state.drain_segment_data();
     }
 
-    if let Some(ref mut r) = ctx.recorder {
-        let _ = r.write_video(data, ts).await;
-    }
 }
 
 async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
@@ -602,15 +592,15 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
                                 _ => crate::hls::fmp4::AudioCodec::Aac,
                             };
                             // Default hls_state gets only the first audio track
-                            if i == 0 {
-                                if let Some(ref mut hls) = ctx.hls_state {
-                                    match inner_pt {
-                                        Some(crate::rtmp::enhanced::AudioPacketType::SequenceStart) => {
-                                            let _ = hls.set_audio_config(codec, track.payload).await;
-                                        }
-                                        _ => {
-                                            let _ = hls.write_audio(track.payload, ts).await;
-                                        }
+                            if i == 0
+                                && let Some(ref mut hls) = ctx.hls_state
+                            {
+                                match inner_pt {
+                                    Some(crate::rtmp::enhanced::AudioPacketType::SequenceStart) => {
+                                        let _ = hls.set_audio_config(codec, track.payload).await;
+                                    }
+                                    _ => {
+                                        let _ = hls.write_audio(track.payload, ts).await;
                                     }
                                 }
                             }
@@ -702,12 +692,7 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
 
     // Drain default hls_state to recorder
     if let (Some(ref mut hls), Some(ref mut recorder)) = (ctx.hls_state.as_mut(), ctx.recorder.as_mut()) {
-        if let Some(init) = hls.drain_init_data() {
-            let _ = recorder.write_init(&init).await;
-        }
-        for seg in hls.drain_segment_data() {
-            let _ = recorder.write_segment(&seg).await;
-        }
+        drain_hls_to_recorder(hls, recorder).await;
     }
 
     // Drain track states to free memory
@@ -716,7 +701,4 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
         let _ = track_state.drain_segment_data();
     }
 
-    if let Some(ref mut r) = ctx.recorder {
-        let _ = r.write_audio(data, ts).await;
     }
-}

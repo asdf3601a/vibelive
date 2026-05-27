@@ -260,7 +260,7 @@ pub fn parse_enhanced_audio_header(data: &[u8]) -> Result<(EnhancedAudioHeader, 
     }, &data[6..]))
 }
 
-pub fn parse_enhanced_video_multitrack(data: &[u8]) -> Result<(MultitrackType, Option<VideoPacketType>, Vec<EnhancedVideoTrack>), &'static str> {
+pub fn parse_enhanced_video_multitrack(data: &[u8]) -> Result<(MultitrackType, Option<VideoPacketType>, Vec<EnhancedVideoTrack<'_>>), &'static str> {
     if data.is_empty() {
         return Err("data too short for multitrack header");
     }
@@ -337,7 +337,7 @@ pub fn parse_enhanced_video_multitrack(data: &[u8]) -> Result<(MultitrackType, O
     Ok((multitrack_type, inner_packet_type, tracks))
 }
 
-pub fn parse_enhanced_audio_multitrack(data: &[u8]) -> Result<(MultitrackType, Option<AudioPacketType>, Vec<EnhancedAudioTrack>), &'static str> {
+pub fn parse_enhanced_audio_multitrack(data: &[u8]) -> Result<(MultitrackType, Option<AudioPacketType>, Vec<EnhancedAudioTrack<'_>>), &'static str> {
     if data.is_empty() {
         return Err("data too short for multitrack header");
     }

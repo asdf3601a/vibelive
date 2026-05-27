@@ -12,10 +12,10 @@ async fn find_latest_segment(dir: &PathBuf) -> anyhow::Result<PathBuf> {
             let idx_str = &name_str[7..name_str.len()-4];
             if let Ok(idx) = idx_str.parse::<u32>() {
                 let meta = entry.metadata().await?;
-                if meta.len() > 0 {
-                    if latest.is_none() || idx > latest.as_ref().unwrap().0 {
-                        latest = Some((idx, entry.path()));
-                    }
+                if meta.len() > 0
+                    && (latest.is_none() || idx > latest.as_ref().unwrap().0)
+                {
+                    latest = Some((idx, entry.path()));
                 }
             }
         }
@@ -49,7 +49,8 @@ pub async fn generate_thumbnails_for_stream(
     let seg = tokio::fs::read(&seg_path).await?;
 
     let tmp_path = dir.join(format!("{}_tmp.mp4", stream_key));
-    let mut tmp_data = init;
+    let mut tmp_data = Vec::with_capacity(init.len() + seg.len());
+    tmp_data.extend_from_slice(&init);
     tmp_data.extend_from_slice(&seg);
     tokio::fs::write(&tmp_path, &tmp_data).await?;
 
@@ -58,10 +59,10 @@ pub async fn generate_thumbnails_for_stream(
         let thumb_path = dir.join(format!("{}_w{}.webp", stream_key, width));
 
         // Remove stale 0-byte thumbnail files before deciding whether to regenerate
-        if let Ok(meta) = tokio::fs::metadata(&thumb_path).await {
-            if meta.len() == 0 {
-                let _ = tokio::fs::remove_file(&thumb_path).await;
-            }
+        if let Ok(meta) = tokio::fs::metadata(&thumb_path).await
+            && meta.len() == 0
+        {
+            let _ = tokio::fs::remove_file(&thumb_path).await;
         }
 
         // Check if existing thumbnail is fresh enough

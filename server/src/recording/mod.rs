@@ -2,18 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
-fn hash_bytes(data: &[u8]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// Scan an fMP4 segment for tfdt box and rewrite base_media_decode_time.
 /// Returns the new base_media_decode_time if found.
 fn rewrite_segment_tfdt(segment: &mut [u8], offset: u64) -> Option<u64> {
-    // Find moof box
+    use crate::util::{find_box, find_box_in_range, read_u32, read_u64, write_u32, write_u64};
     let moof_pos = find_box(segment, b"moof")?;
     let moof_size = read_u32(&segment[moof_pos..moof_pos + 4]) as usize;
     let moof_end = moof_pos + moof_size;
@@ -21,7 +13,6 @@ fn rewrite_segment_tfdt(segment: &mut [u8], offset: u64) -> Option<u64> {
         return None;
     }
 
-    // Find traf inside moof
     let traf_pos = find_box_in_range(&segment[moof_pos + 8..moof_end], b"traf")?;
     let traf_pos = moof_pos + 8 + traf_pos;
     let traf_size = read_u32(&segment[traf_pos..traf_pos + 4]) as usize;
@@ -30,7 +21,6 @@ fn rewrite_segment_tfdt(segment: &mut [u8], offset: u64) -> Option<u64> {
         return None;
     }
 
-    // Find tfdt inside traf
     let tfdt_pos = find_box_in_range(&segment[traf_pos + 8..traf_end], b"tfdt")?;
     let tfdt_pos = traf_pos + 8 + tfdt_pos;
     let tfdt_size = read_u32(&segment[tfdt_pos..tfdt_pos + 4]) as usize;
@@ -38,9 +28,8 @@ fn rewrite_segment_tfdt(segment: &mut [u8], offset: u64) -> Option<u64> {
         return None;
     }
 
-    // tfdt version at offset 8
     let version = segment[tfdt_pos + 8];
-    let data_start = tfdt_pos + 12; // after size(4) + type(4) + version/flags(4)
+    let data_start = tfdt_pos + 12;
 
     if version == 1 && data_start + 8 <= segment.len() {
         let base_media_decode_time = read_u64(&segment[data_start..data_start + 8]);
@@ -57,50 +46,6 @@ fn rewrite_segment_tfdt(segment: &mut [u8], offset: u64) -> Option<u64> {
     }
 }
 
-fn find_box(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
-    find_box_in_range(data, box_type)
-}
-
-fn find_box_in_range(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
-    let mut offset = 0;
-    while offset + 8 <= data.len() {
-        let size = read_u32(&data[offset..offset + 4]) as usize;
-        if size == 0 {
-            // Box extends to end of parent
-            break;
-        }
-        if size == 1 {
-            // Extended size (64-bit) - skip for simplicity
-            offset += 16;
-            continue;
-        }
-        if &data[offset + 4..offset + 8] == box_type {
-            return Some(offset);
-        }
-        offset += size;
-    }
-    None
-}
-
-fn read_u32(data: &[u8]) -> u32 {
-    u32::from_be_bytes([data[0], data[1], data[2], data[3]])
-}
-
-fn write_u32(data: &mut [u8], value: u32) {
-    data[..4].copy_from_slice(&value.to_be_bytes());
-}
-
-fn read_u64(data: &[u8]) -> u64 {
-    u64::from_be_bytes([
-        data[0], data[1], data[2], data[3],
-        data[4], data[5], data[6], data[7],
-    ])
-}
-
-fn write_u64(data: &mut [u8], value: u64) {
-    data[..8].copy_from_slice(&value.to_be_bytes());
-}
-
 pub struct Fmp4Recorder {
     dir: PathBuf,
     stream_key: String,
@@ -108,6 +53,7 @@ pub struct Fmp4Recorder {
     closed: bool,
     saved_path: Option<PathBuf>,
     last_init_hash: Option<u64>,
+    init_written: bool,
     recording_time_offset: u64,
     last_tfdt: Option<u64>,
 }
@@ -122,19 +68,25 @@ impl Fmp4Recorder {
             closed: false,
             saved_path: None,
             last_init_hash: None,
+            init_written: false,
             recording_time_offset: 0,
             last_tfdt: None,
         }
     }
 
     pub async fn write_init(&mut self, init: &[u8]) -> std::io::Result<()> {
-        let new_hash = hash_bytes(init);
-        if let Some(last_hash) = self.last_init_hash {
-            if last_hash != new_hash && self.file.is_some() {
-                // Init changed while file is open: close current and start new recording
-                let _ = self.close().await;
-                self.closed = false;
-            }
+        let new_hash = crate::util::hash_bytes(init);
+        if let Some(last_hash) = self.last_init_hash
+            && last_hash != new_hash && self.file.is_some()
+        {
+            // Init changed while file is open: close current and start new recording
+            let _ = self.close().await;
+            self.closed = false;
+        }
+
+        if self.init_written && self.file.is_some() {
+            // Init already written to this file; refuse to write another
+            return Ok(());
         }
 
         if self.file.is_none() {
@@ -151,13 +103,13 @@ impl Fmp4Recorder {
             self.file = Some(file);
             self.last_tfdt = None;
         }
+        self.init_written = true;
         self.last_init_hash = Some(new_hash);
         Ok(())
     }
 
-    pub async fn write_segment(&mut self, segment: &[u8]) -> std::io::Result<()> {
+    pub async fn write_segment(&mut self, mut segment: Vec<u8>) -> std::io::Result<()> {
         if let Some(ref mut file) = self.file {
-            let mut segment = segment.to_vec();
 
             if let Some(rewritten_tfdt) = rewrite_segment_tfdt(&mut segment, self.recording_time_offset) {
                 if let Some(last_tfdt) = self.last_tfdt {
@@ -184,14 +136,6 @@ impl Fmp4Recorder {
         Ok(())
     }
 
-    pub async fn write_video(&mut self, _data: &[u8], _ts: u32) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    pub async fn write_audio(&mut self, _data: &[u8], _ts: u32) -> std::io::Result<()> {
-        Ok(())
-    }
-
     pub async fn close(&mut self) -> std::io::Result<PathBuf> {
         if self.closed {
             return self.saved_path.clone().ok_or_else(|| {
@@ -199,6 +143,8 @@ impl Fmp4Recorder {
             });
         }
         self.closed = true;
+        self.last_init_hash = None;
+        self.init_written = false;
 
         if let Some(mut file) = self.file.take() {
             file.flush().await?;
@@ -328,7 +274,7 @@ mod tests {
         let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "teststream");
 
         recorder.write_init(&[0x66, 0x74, 0x79, 0x70]).await.unwrap();
-        recorder.write_segment(&[0x6d, 0x6f, 0x6f, 0x66]).await.unwrap();
+        recorder.write_segment(vec![0x6d, 0x6f, 0x6f, 0x66]).await.unwrap();
         let path = recorder.close().await.unwrap();
         assert!(tokio::fs::try_exists(&path).await.unwrap_or(false));
 
@@ -358,9 +304,9 @@ mod tests {
         let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "multistream");
 
         recorder.write_init(&[0x01, 0x02]).await.unwrap();
-        recorder.write_segment(&[0x03, 0x04]).await.unwrap();
-        recorder.write_segment(&[0x05, 0x06]).await.unwrap();
-        recorder.write_segment(&[0x07, 0x08]).await.unwrap();
+        recorder.write_segment(vec![0x03, 0x04]).await.unwrap();
+        recorder.write_segment(vec![0x05, 0x06]).await.unwrap();
+        recorder.write_segment(vec![0x07, 0x08]).await.unwrap();
         let path = recorder.close().await.unwrap();
         assert!(tokio::fs::try_exists(&path).await.unwrap_or(false));
 
@@ -389,7 +335,7 @@ mod tests {
         let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "indexstream");
 
         recorder.write_init(&[0x66, 0x74, 0x79, 0x70]).await.unwrap();
-        recorder.write_segment(&[0x6d, 0x6f, 0x6f, 0x66]).await.unwrap();
+        recorder.write_segment(vec![0x6d, 0x6f, 0x6f, 0x66]).await.unwrap();
         let _path = recorder.close().await.unwrap();
 
         crate::recording::write_index_json(
@@ -442,5 +388,53 @@ mod tests {
             parse_stream_key_from_filename("invalid.mp4"),
             "invalid"
         );
+    }
+
+    #[tokio::test]
+    async fn test_no_duplicate_moov_on_reconnect() {
+        let test_dir = std::env::temp_dir().join("recording_moov_test");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
+        tokio::fs::create_dir_all(&test_dir.join("recordings")).await.unwrap();
+        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "moovstream");
+
+        // Build a minimal valid init segment (ftyp + moov)
+        let mut init_a = Vec::new();
+        init_a.extend_from_slice(&(8u32).to_be_bytes());
+        init_a.extend_from_slice(b"ftyp");
+        init_a.extend_from_slice(b"iso5");
+        init_a.extend_from_slice(&(8u32).to_be_bytes());
+        init_a.extend_from_slice(b"moov");
+
+        // Write init A + 2 segments
+        recorder.write_init(&init_a).await.unwrap();
+        recorder.write_segment(vec![0x00, 0x00, 0x00, 0x14, 0x6d, 0x6f, 0x6f, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await.unwrap();
+        recorder.write_segment(vec![0x00, 0x00, 0x00, 0x14, 0x6d, 0x6f, 0x6f, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await.unwrap();
+
+        // Simulate close + reconnect with changed init
+        recorder.close().await.unwrap();
+
+        // Build init B (different size/content to trigger hash change)
+        let mut init_b = Vec::new();
+        init_b.extend_from_slice(&(12u32).to_be_bytes());
+        init_b.extend_from_slice(b"ftyp");
+        init_b.extend_from_slice(b"mp42");
+        init_b.extend_from_slice(b"mp41");
+        init_b.extend_from_slice(&(8u32).to_be_bytes());
+        init_b.extend_from_slice(b"moov");
+
+        recorder.write_init(&init_b).await.unwrap();
+        recorder.write_segment(vec![0x00, 0x00, 0x00, 0x14, 0x6d, 0x6f, 0x6f, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await.unwrap();
+        let path = recorder.close().await.unwrap();
+
+        // Read the recorded file and count "moov" occurrences
+        let contents = tokio::fs::read(&path).await.unwrap();
+        let moov_count = contents.windows(4).filter(|w| w == b"moov").count();
+        assert_eq!(moov_count, 1, "Expected exactly 1 moov atom, found {}", moov_count);
+
+        // Also verify ftyp and moov appear once each
+        let ftyp_count = contents.windows(4).filter(|w| w == b"ftyp").count();
+        assert_eq!(ftyp_count, 1, "Expected exactly 1 ftyp atom, found {}", ftyp_count);
+
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 }

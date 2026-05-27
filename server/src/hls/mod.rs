@@ -1,11 +1,12 @@
 pub mod fmp4;
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
 pub struct HlsStreamState {
     stream_dir: PathBuf,
-    track_id: u32,
+    _track_id: u32,
     is_audio_only: bool,
     segment_duration: u32,
     current_segment_start: u64,
@@ -41,14 +42,6 @@ pub struct HlsStreamState {
     segment_start_offsets: Vec<u64>,
 }
 
-fn hash_bytes(data: &[u8]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    hasher.finish()
-}
-
 impl HlsStreamState {
     pub fn new(media_dir: &str, stream_key: &str, track_id: u32, is_audio_only: bool, segment_duration: u32, hls_segments_keep: u32) -> Self {
         let mut dir = PathBuf::from(media_dir).join("hls").join(stream_key);
@@ -57,7 +50,7 @@ impl HlsStreamState {
         }
         Self {
             stream_dir: dir,
-            track_id,
+            _track_id: track_id,
             is_audio_only,
             segment_duration,
             current_segment_start: 0,
@@ -132,6 +125,7 @@ impl HlsStreamState {
     }
 
     pub async fn write_video(&mut self, data: &[u8], timestamp: u32, is_keyframe: bool) -> anyhow::Result<()> {
+        use std::borrow::Cow;
         if self.is_audio_only {
             return Ok(());
         }
@@ -171,10 +165,10 @@ impl HlsStreamState {
             self.rotate_segment().await?;
         }
 
-        let sample_data = if self.fmp4_muxer.video_codec() == Some(fmp4::VideoCodec::AV1) {
-            fmp4::ensure_av1_obu_size_fields(data)
+        let sample_data: Cow<'_, [u8]> = if self.fmp4_muxer.video_codec() == Some(fmp4::VideoCodec::AV1) {
+            Cow::Owned(fmp4::ensure_av1_obu_size_fields(data))
         } else {
-            data.to_vec()
+            Cow::Borrowed(data)
         };
         self.fmp4_muxer.add_video_sample(sample_data, pts, pts, is_keyframe);
         self.last_video_pts = pts;
@@ -207,7 +201,7 @@ impl HlsStreamState {
         }
         let base_ts = self.first_audio_ts.unwrap_or(0);
         let pts = (timestamp - base_ts) as u64 + self.timestamp_offset;
-        self.fmp4_muxer.add_audio_sample(data.to_vec(), pts);
+        self.fmp4_muxer.add_audio_sample(Cow::Borrowed(data), pts);
         self.last_audio_pts = pts;
 
         // Audio-only segment rotation (no keyframe concept)
@@ -235,7 +229,7 @@ impl HlsStreamState {
             return Ok(());
         }
         let init = self.fmp4_muxer.init_segment();
-        let new_hash = hash_bytes(&init);
+        let new_hash = crate::util::hash_bytes(&init);
 
         if self.last_init_hash == Some(new_hash) {
             self.init_written = true;
@@ -345,11 +339,6 @@ impl HlsStreamState {
 
     pub fn drain_segment_data(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.segment_data)
-    }
-
-    /// Deprecated: use drain_init_data + drain_segment_data incrementally
-    pub fn take_recording_data(&mut self) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
-        (self.init_data.take(), std::mem::take(&mut self.segment_data))
     }
 
     async fn update_playlist(&mut self) -> anyhow::Result<()> {

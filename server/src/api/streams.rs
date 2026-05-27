@@ -50,7 +50,7 @@ pub async fn list(
     let media_dir = state.config.media_dir.clone();
     let interval = state.config.thumbnail_interval_seconds;
 
-    let streams: Vec<StreamResponse> = sm.publishers.values().map(|info| {
+    let streams: Vec<StreamResponse> = sm.publishers().values().map(|info| {
         // Fire-and-forget thumbnail generation so static files exist for nginx
         let key = info.stream_key.clone();
         let md = media_dir.clone();
@@ -70,7 +70,7 @@ pub async fn get(
     Path(key): Path<String>,
 ) -> impl IntoResponse {
     let sm = state.stream_manager.read().await;
-    match sm.publishers.get(&key) {
+    match sm.get_publisher(&key) {
         Some(info) => {
             // Fire-and-forget thumbnail generation
             let md = state.config.media_dir.clone();

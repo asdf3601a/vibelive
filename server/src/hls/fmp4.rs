@@ -1,6 +1,8 @@
 // Minimal fMP4 (CMAF) writer for HLS output
 // Supports H.264/H.265/AV1 video + AAC audio
 
+use std::borrow::Cow;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum VideoCodec {
     H264,
@@ -85,7 +87,7 @@ impl Fmp4Muxer {
         buf
     }
 
-    pub fn add_video_sample(&mut self, data: Vec<u8>, dts: u64, pts: u64, is_keyframe: bool) {
+    pub fn add_video_sample(&mut self, data: Cow<'_, [u8]>, dts: u64, pts: u64, is_keyframe: bool) {
         if self.video_samples.is_empty() {
             self.video_base_dts = dts;
         }
@@ -97,7 +99,7 @@ impl Fmp4Muxer {
         let cto = (pts as i64 - dts as i64) as i32;
         let size = data.len() as u32;
         self.video_samples.push(Sample {
-            data,
+            data: data.into_owned(),
             dts,
             size,
             duration: 0, // filled at flush time
@@ -106,13 +108,13 @@ impl Fmp4Muxer {
         });
     }
 
-    pub fn add_audio_sample(&mut self, data: Vec<u8>, pts: u64) {
+    pub fn add_audio_sample(&mut self, data: Cow<'_, [u8]>, pts: u64) {
         if self.audio_samples.is_empty() {
             self.audio_base_pts = pts;
         }
         let size = data.len() as u32;
         self.audio_samples.push(Sample {
-            data,
+            data: data.into_owned(),
             dts: pts,
             size,
             duration: 0,
@@ -285,51 +287,33 @@ impl Fmp4Muxer {
 
     fn write_video_trak(&self, w: &mut Vec<u8>) {
         let mut trak_data = Vec::new();
-        self.write_tkhd_video(&mut trak_data);
+        self.write_tkhd(&mut trak_data, 1, 0, (self.video_width as u32) << 16, (self.video_height as u32) << 16);
         self.write_mdia_video(&mut trak_data);
         write_box(w, b"trak", &trak_data);
     }
 
     fn write_audio_trak(&self, w: &mut Vec<u8>) {
         let mut trak_data = Vec::new();
-        self.write_tkhd_audio(&mut trak_data);
+        self.write_tkhd(&mut trak_data, 2, 0x0100, 0, 0);
         self.write_mdia_audio(&mut trak_data);
         write_box(w, b"trak", &trak_data);
     }
 
-    fn write_tkhd_video(&self, w: &mut Vec<u8>) {
-        let mut data = Vec::new();
-        data.extend_from_slice(&0u32.to_be_bytes()); // creation_time
-        data.extend_from_slice(&0u32.to_be_bytes()); // modification_time
-        data.extend_from_slice(&1u32.to_be_bytes()); // track_id
-        data.extend_from_slice(&0u32.to_be_bytes()); // reserved
-        data.extend_from_slice(&0u32.to_be_bytes()); // duration
-        data.extend_from_slice(&[0u8; 8]); // reserved
-        data.extend_from_slice(&0u16.to_be_bytes()); // layer
-        data.extend_from_slice(&0u16.to_be_bytes()); // alternate_group
-        data.extend_from_slice(&0u16.to_be_bytes()); // volume (for video)
-        data.extend_from_slice(&0u16.to_be_bytes()); // reserved
-        data.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]); // matrix
-        data.extend_from_slice(&((self.video_width as u32) << 16).to_be_bytes()); // width
-        data.extend_from_slice(&((self.video_height as u32) << 16).to_be_bytes()); // height
-        write_fullbox(w, b"tkhd", 0, 0x000003, &data);
-    }
-
-    fn write_tkhd_audio(&self, w: &mut Vec<u8>) {
+    fn write_tkhd(&self, w: &mut Vec<u8>, track_id: u32, volume: u16, width: u32, height: u32) {
         let mut data = Vec::new();
         data.extend_from_slice(&0u32.to_be_bytes());
         data.extend_from_slice(&0u32.to_be_bytes());
-        data.extend_from_slice(&2u32.to_be_bytes()); // track_id
+        data.extend_from_slice(&track_id.to_be_bytes());
         data.extend_from_slice(&0u32.to_be_bytes());
-        data.extend_from_slice(&0u32.to_be_bytes()); // duration
+        data.extend_from_slice(&0u32.to_be_bytes());
         data.extend_from_slice(&[0u8; 8]);
-        data.extend_from_slice(&0u16.to_be_bytes()); // layer
-        data.extend_from_slice(&0u16.to_be_bytes()); // alternate_group
-        data.extend_from_slice(&0x0100u16.to_be_bytes()); // volume
-        data.extend_from_slice(&0u16.to_be_bytes()); // reserved
-        data.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]); // matrix
-        data.extend_from_slice(&0u32.to_be_bytes()); // width
-        data.extend_from_slice(&0u32.to_be_bytes()); // height
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&volume.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(&width.to_be_bytes());
+        data.extend_from_slice(&height.to_be_bytes());
         write_fullbox(w, b"tkhd", 0, 0x000003, &data);
     }
 
@@ -627,7 +611,7 @@ impl Fmp4Muxer {
         data.extend_from_slice(&16u16.to_be_bytes()); // samplesize
         data.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
         data.extend_from_slice(&0u16.to_be_bytes()); // reserved
-        data.extend_from_slice(&((sample_rate as u32) << 16).to_be_bytes()); // samplerate in 16.16
+        data.extend_from_slice(&(sample_rate << 16).to_be_bytes()); // samplerate in 16.16
 
         // dfLa box (FullBox per FLAC-in-ISOBMFF spec)
         if let Some(ref config) = self.audio_config {
@@ -824,8 +808,8 @@ fn parse_av1_sequence_header(payload: &[u8]) -> Option<Av1SeqHeader> {
         return None;
     }
 
-    let mut h = Av1SeqHeader::default();
-    h.seq_profile = r.read_bits(3) as u8;
+    let seq_profile = r.read_bits(3) as u8;
+    let mut h = Av1SeqHeader { seq_profile, ..Default::default() };
     let _still_picture = r.read_bit();
     let reduced_still_picture_header = r.read_bit();
 
@@ -927,7 +911,7 @@ fn parse_av1_sequence_header(payload: &[u8]) -> Option<Av1SeqHeader> {
         let seq_force_screen_content_tools = if seq_choose_screen_content_tools == 1 {
             2 // SELECT_SCREEN_CONTENT_TOOLS
         } else {
-            r.read_bit() as u8
+            r.read_bit()
         };
         if seq_force_screen_content_tools > 0 {
             let seq_choose_integer_mv = r.read_bit();
@@ -1137,14 +1121,12 @@ pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
         }
         let obu_header = config[offset];
         offset += 1;
-        let obu_type = ((obu_header >> 3) & 0x0F) as u8;
+        let obu_type = (obu_header >> 3) & 0x0F;
         let obu_extension_flag = (obu_header >> 2) & 1;
         let obu_has_size_field = (obu_header >> 1) & 1;
 
-        if obu_extension_flag == 1 {
-            if offset < config.len() {
-                offset += 1; // skip temporal_id / spatial_id
-            }
+        if obu_extension_flag == 1 && offset < config.len() {
+            offset += 1; // skip temporal_id / spatial_id
         }
 
         let mut obu_size = 0usize;
@@ -1392,7 +1374,7 @@ mod tests {
         muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
         muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
 
-        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88], 0, 0, true);
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88].into(), 0, 0, true);
         muxer.set_video_durations(vec![33]);
 
         let frag = muxer.flush_video_fragment();
@@ -1410,8 +1392,8 @@ mod tests {
         muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
         muxer.set_audio_config(vec![0x12, 0x10]);
 
-        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65], 0, 0, true);
-        muxer.add_audio_sample(vec![0xAF, 0x01], 0);
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 0, 0, true);
+        muxer.add_audio_sample(vec![0xAF, 0x01].into(), 0);
         muxer.set_video_durations(vec![33]);
         muxer.set_audio_durations(vec![21]);
 

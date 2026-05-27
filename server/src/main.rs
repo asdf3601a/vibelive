@@ -4,6 +4,7 @@ mod hls;
 mod recording;
 mod rtmp;
 mod thumbnail;
+pub mod util;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
         loop {
             interval.tick().await;
             let sm = thumb_state.stream_manager.read().await;
-            let keys: Vec<String> = sm.publishers.keys().cloned().collect();
+            let keys: Vec<String> = sm.publishers().keys().cloned().collect();
             let media_dir = thumb_state.config.media_dir.clone();
             let sizes = thumb_state.config.thumbnail_sizes.clone();
             let iv = thumb_state.config.thumbnail_interval_seconds;

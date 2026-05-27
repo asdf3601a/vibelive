@@ -1,4 +1,4 @@
-pub mod enhanced;
+pub(crate) mod enhanced;
 pub mod server;
 pub mod session;
 
@@ -9,8 +9,8 @@ use crate::hls::HlsStreamState;
 use crate::recording::Fmp4Recorder;
 
 pub struct StreamManager {
-    pub publishers: HashMap<String, PublisherInfo>,
-    pub pending_streams: HashMap<String, PendingStream>,
+    publishers: HashMap<String, PublisherInfo>,
+    pending_streams: HashMap<String, PendingStream>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -91,5 +91,25 @@ impl StreamManager {
             info.disconnected_at = None;
         }
         pending
+    }
+
+    pub fn publishers(&self) -> &HashMap<String, PublisherInfo> {
+        &self.publishers
+    }
+
+    pub fn publishers_mut(&mut self) -> &mut HashMap<String, PublisherInfo> {
+        &mut self.publishers
+    }
+
+    pub fn pending_streams_mut(&mut self) -> &mut HashMap<String, PendingStream> {
+        &mut self.pending_streams
+    }
+
+    pub fn get_publisher(&self, key: &str) -> Option<&PublisherInfo> {
+        self.publishers.get(key)
+    }
+
+    pub fn remove_pending_stream(&mut self, key: &str) -> Option<PendingStream> {
+        self.pending_streams.remove(key)
     }
 }
