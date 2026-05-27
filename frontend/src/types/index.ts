@@ -13,6 +13,14 @@ export interface StreamMetadata {
   framerate?: number
 }
 
+/** Represents a single track within a stream. */
+export interface TrackInfo {
+  track_id: number
+  hls_url: string
+  video_codec: string | null
+  audio_codec: string | null
+}
+
 /** Represents a single live stream. */
 export interface Stream {
   stream_key: string
@@ -23,6 +31,7 @@ export interface Stream {
   player_url: string | null
   thumbnail_url: string
   thumbnails: Record<string, string>
+  tracks: TrackInfo[]
 }
 
 /** Represents a saved recording (fMP4 → MP4). */

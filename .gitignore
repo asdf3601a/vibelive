@@ -1,6 +1,7 @@
 /target
 *.log
 .env
+.kilo/
 frontend/node_modules
 frontend/dist
 data/

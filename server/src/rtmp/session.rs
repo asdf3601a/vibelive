@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
@@ -120,6 +120,14 @@ struct SessionContext {
     media_dir: Option<String>,
     hls_segment_duration: u32,
     hls_segments_keep: u32,
+    // Per-track codec caches
+    track_video_codecs: HashMap<u32, crate::hls::fmp4::VideoCodec>,
+    track_audio_codecs: HashMap<u32, crate::hls::fmp4::AudioCodec>,
+    // Tracks that have received SequenceEnd and should be ignored
+    closed_video_tracks: HashSet<u32>,
+    closed_audio_tracks: HashSet<u32>,
+    // Track IDs discovered for this stream (used to update PublisherInfo)
+    discovered_tracks: HashSet<u32>,
 }
 
 impl SessionContext {
@@ -136,6 +144,11 @@ impl SessionContext {
             media_dir: None,
             hls_segment_duration: 0,
             hls_segments_keep: 0,
+            track_video_codecs: HashMap::new(),
+            track_audio_codecs: HashMap::new(),
+            closed_video_tracks: HashSet::new(),
+            closed_audio_tracks: HashSet::new(),
+            discovered_tracks: HashSet::new(),
         }
     }
 
@@ -147,6 +160,38 @@ impl SessionContext {
         self.track_states.entry(track_id).or_insert_with(|| {
             HlsStreamState::new(&media_dir, &stream_key, track_id, is_audio_only, segment_duration, segments_keep)
         })
+    }
+}
+
+async fn notify_track_discovered(
+    app_state: &Arc<AppState>,
+    stream_key: &str,
+    track_id: u32,
+    video_codec: Option<crate::hls::fmp4::VideoCodec>,
+    audio_codec: Option<crate::hls::fmp4::AudioCodec>,
+) {
+    let mut sm = app_state.stream_manager.write().await;
+    if let Some(info) = sm.publishers_mut().get_mut(stream_key) {
+        if let Some(existing) = info.tracks.iter_mut().find(|t| t.track_id == track_id) {
+            if let Some(vc) = video_codec {
+                existing.video_codec = Some(format!("{:?}", vc));
+            }
+            if let Some(ac) = audio_codec {
+                existing.audio_codec = Some(format!("{:?}", ac));
+            }
+            return;
+        }
+        let hls_url = if track_id == 0 {
+            format!("/hls/{}/index.m3u8", stream_key)
+        } else {
+            format!("/hls/{}/track_{}/index.m3u8", stream_key, track_id)
+        };
+        info.tracks.push(crate::rtmp::TrackInfo {
+            track_id,
+            hls_url,
+            video_codec: video_codec.map(|c| format!("{:?}", c)),
+            audio_codec: audio_codec.map(|c| format!("{:?}", c)),
+        });
     }
 }
 
@@ -390,6 +435,7 @@ async fn handle_event(
                     app_name: ctx.current_app.clone().unwrap_or_default(),
                     started_at: chrono::Utc::now(),
                     metadata: None,
+                    tracks: Vec::new(),
                     disconnected_at: None,
                 });
                 drop(sm);
@@ -433,7 +479,7 @@ async fn handle_event(
                 && *key == stream_key
             {
                 let ts = timestamp.value;
-                handle_audio_data(&data, ts, ctx).await;
+                handle_audio_data(&data, ts, ctx, app_state, &stream_key).await;
             }
         }
 
@@ -472,30 +518,61 @@ async fn handle_event(
     Ok(())
 }
 
-async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_state: &Arc<AppState>, _stream_key: &str) {
+fn map_enhanced_video_codec(codec: crate::rtmp::enhanced::EnhancedVideoCodec) -> crate::hls::fmp4::VideoCodec {
+    match codec {
+        crate::rtmp::enhanced::EnhancedVideoCodec::Av1 => crate::hls::fmp4::VideoCodec::AV1,
+        crate::rtmp::enhanced::EnhancedVideoCodec::Avc => crate::hls::fmp4::VideoCodec::H264,
+        crate::rtmp::enhanced::EnhancedVideoCodec::Hevc => crate::hls::fmp4::VideoCodec::H265,
+        _ => crate::hls::fmp4::VideoCodec::H264,
+    }
+}
+
+fn map_enhanced_audio_codec(codec: crate::rtmp::enhanced::EnhancedAudioCodec) -> crate::hls::fmp4::AudioCodec {
+    match codec {
+        crate::rtmp::enhanced::EnhancedAudioCodec::Opus => crate::hls::fmp4::AudioCodec::Opus,
+        crate::rtmp::enhanced::EnhancedAudioCodec::Flac => crate::hls::fmp4::AudioCodec::Flac,
+        crate::rtmp::enhanced::EnhancedAudioCodec::Aac => crate::hls::fmp4::AudioCodec::Aac,
+        _ => crate::hls::fmp4::AudioCodec::Aac,
+    }
+}
+
+async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_state: &Arc<AppState>, stream_key: &str) {
     tracing::debug!("handle_video_data: ts={}, len={}, first_bytes={:02x?}", ts, data.len(), &data[..data.len().min(8)]);
     if crate::rtmp::enhanced::is_enhanced_video(data) {
         if let Ok((header, remainder)) = crate::rtmp::enhanced::parse_enhanced_video_header(data) {
             let is_keyframe = header.frame_type == crate::rtmp::enhanced::VideoFrameType::KeyFrame;
             match header.packet_type {
                 crate::rtmp::enhanced::VideoPacketType::Multitrack => {
-                    if let Ok((_multitrack_type, inner_pt, tracks)) = crate::rtmp::enhanced::parse_enhanced_video_multitrack(remainder) {
-                        for (i, track) in tracks.iter().enumerate() {
-                            let codec = match track.codec {
-                                crate::rtmp::enhanced::EnhancedVideoCodec::Av1 => crate::hls::fmp4::VideoCodec::AV1,
-                                crate::rtmp::enhanced::EnhancedVideoCodec::Avc => crate::hls::fmp4::VideoCodec::H264,
-                                crate::rtmp::enhanced::EnhancedVideoCodec::Hevc => crate::hls::fmp4::VideoCodec::H265,
-                                _ => crate::hls::fmp4::VideoCodec::H264,
-                            };
+                    match crate::rtmp::enhanced::parse_enhanced_video_multitrack(remainder) {
+                        Ok((_multitrack_type, inner_pt, tracks)) => {
+                            tracing::debug!("Parsed video multitrack: {} tracks, inner_pt={:?}", tracks.len(), inner_pt);
+                            for track in tracks.iter() {
+                                if ctx.closed_video_tracks.contains(&track.track_id) {
+                                    continue;
+                                }
+                            let codec = map_enhanced_video_codec(track.codec.clone());
+                            let old_video_codec = ctx.track_video_codecs.insert(track.track_id, codec);
+                            let is_new_video_codec = old_video_codec.is_none() || old_video_codec != Some(codec);
+                            let is_new_track = !ctx.discovered_tracks.contains(&track.track_id);
+                            if is_new_track || is_new_video_codec {
+                                if is_new_track {
+                                    ctx.discovered_tracks.insert(track.track_id);
+                                }
+                                let audio_codec = ctx.track_audio_codecs.get(&track.track_id).copied();
+                                notify_track_discovered(app_state, stream_key, track.track_id, Some(codec), audio_codec).await;
+                            }
                             let video_width = ctx.video_width;
                             let video_height = ctx.video_height;
-                            // Default hls_state gets only the first video track
-                            if i == 0
+                            // Default hls_state gets track_id == 0 as primary track
+                            if track.track_id == 0
                                 && let Some(ref mut hls) = ctx.hls_state
                             {
                                 match inner_pt {
                                     Some(crate::rtmp::enhanced::VideoPacketType::SequenceStart) => {
                                         let _ = hls.set_video_config(track.payload, codec, video_width, video_height).await;
+                                    }
+                                    Some(crate::rtmp::enhanced::VideoPacketType::SequenceEnd) => {
+                                        let _ = hls.finalize_segment().await;
                                     }
                                     _ => {
                                         let _ = hls.write_video(track.payload, ts, is_keyframe).await;
@@ -508,29 +585,56 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_
                                 Some(crate::rtmp::enhanced::VideoPacketType::SequenceStart) => {
                                     let _ = track_state.set_video_config(track.payload, codec, video_width, video_height).await;
                                 }
+                                Some(crate::rtmp::enhanced::VideoPacketType::SequenceEnd) => {
+                                    let _ = track_state.finalize_segment().await;
+                                    ctx.closed_video_tracks.insert(track.track_id);
+                                }
                                 _ => {
                                     let _ = track_state.write_video(track.payload, ts, is_keyframe).await;
                                 }
                             }
                         }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse video multitrack: {}", e);
+                        }
                     }
                 }
                 crate::rtmp::enhanced::VideoPacketType::SequenceStart => {
-                    let codec = match header.codec {
-                        crate::rtmp::enhanced::EnhancedVideoCodec::Av1 => crate::hls::fmp4::VideoCodec::AV1,
-                        crate::rtmp::enhanced::EnhancedVideoCodec::Avc => crate::hls::fmp4::VideoCodec::H264,
-                        crate::rtmp::enhanced::EnhancedVideoCodec::Hevc => crate::hls::fmp4::VideoCodec::H265,
-                        _ => crate::hls::fmp4::VideoCodec::H264,
-                    };
+                    let codec = map_enhanced_video_codec(header.codec);
+                    let old_video_codec = ctx.track_video_codecs.insert(0, codec);
+                    let is_new_video_codec = old_video_codec.is_none() || old_video_codec != Some(codec);
+                    let is_new_track = !ctx.discovered_tracks.contains(&0);
+                    if is_new_track || is_new_video_codec {
+                        if is_new_track {
+                            ctx.discovered_tracks.insert(0);
+                        }
+                        let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                        notify_track_discovered(app_state, stream_key, 0, Some(codec), audio_codec).await;
+                    }
                     if let Some(ref mut hls) = ctx.hls_state {
                         let _ = hls.set_video_config(remainder, codec, ctx.video_width, ctx.video_height).await;
                     }
                 }
                 crate::rtmp::enhanced::VideoPacketType::CodedFrames |
                 crate::rtmp::enhanced::VideoPacketType::CodedFramesX => {
+                    if !ctx.discovered_tracks.contains(&0) {
+                        ctx.discovered_tracks.insert(0);
+                        let video_codec = ctx.track_video_codecs.get(&0).copied();
+                        let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                        notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                    }
                     if let Some(ref mut hls) = ctx.hls_state {
                         let _ = hls.write_video(remainder, ts, is_keyframe).await;
                     }
+                }
+                crate::rtmp::enhanced::VideoPacketType::SequenceEnd => {
+                    if let Some(ref mut hls) = ctx.hls_state {
+                        let _ = hls.finalize_segment().await;
+                    }
+                }
+                crate::rtmp::enhanced::VideoPacketType::Metadata => {
+                    tracing::debug!("Received Enhanced RTMP video metadata (HDR); not yet processed");
                 }
                 _ => {}
             }
@@ -549,17 +653,40 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_
 
             if avc_packet_type == 0 {
                 // AVC sequence header -> avcC config
+                ctx.track_video_codecs.insert(0, crate::hls::fmp4::VideoCodec::H264);
+                if !ctx.discovered_tracks.contains(&0) {
+                    ctx.discovered_tracks.insert(0);
+                    let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                    notify_track_discovered(app_state, stream_key, 0, Some(crate::hls::fmp4::VideoCodec::H264), audio_codec).await;
+                }
                 if let Some(ref mut hls) = ctx.hls_state {
                     let _ = hls.set_video_config(remainder, crate::hls::fmp4::VideoCodec::H264, ctx.video_width, ctx.video_height).await;
                 }
             } else if avc_packet_type == 1 {
                 // AVC NALU -> raw AVCC sample data
+                if !ctx.discovered_tracks.contains(&0) {
+                    ctx.discovered_tracks.insert(0);
+                    let video_codec = ctx.track_video_codecs.get(&0).copied();
+                    let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                    notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                }
                 if let Some(ref mut hls) = ctx.hls_state {
                     let _ = hls.write_video(remainder, ts, is_keyframe).await;
+                }
+            } else if avc_packet_type == 2 {
+                // AVC end of sequence
+                if let Some(ref mut hls) = ctx.hls_state {
+                    let _ = hls.finalize_segment().await;
                 }
             }
         } else {
             // Non-AVC legacy video (Sorenson, VP6, etc.)
+            if !ctx.discovered_tracks.contains(&0) {
+                ctx.discovered_tracks.insert(0);
+                let video_codec = ctx.track_video_codecs.get(&0).copied();
+                let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+            }
             let remainder = &data[1..];
             if let Some(ref mut hls) = ctx.hls_state {
                 let _ = hls.write_video(remainder, ts, is_keyframe).await;
@@ -580,24 +707,39 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, _app_
 
 }
 
-async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
+async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_state: &Arc<AppState>, stream_key: &str) {
     if crate::rtmp::enhanced::is_enhanced_audio(data) {
         if let Ok((header, remainder)) = crate::rtmp::enhanced::parse_enhanced_audio_header(data) {
             match header.packet_type {
                 crate::rtmp::enhanced::AudioPacketType::Multitrack => {
-                    if let Ok((_multitrack_type, inner_pt, tracks)) = crate::rtmp::enhanced::parse_enhanced_audio_multitrack(remainder) {
-                        for (i, track) in tracks.iter().enumerate() {
-                            let codec = match track.codec {
-                                crate::rtmp::enhanced::EnhancedAudioCodec::Opus => crate::hls::fmp4::AudioCodec::Opus,
-                                _ => crate::hls::fmp4::AudioCodec::Aac,
-                            };
-                            // Default hls_state gets only the first audio track
-                            if i == 0
+                    match crate::rtmp::enhanced::parse_enhanced_audio_multitrack(remainder) {
+                        Ok((_multitrack_type, inner_pt, tracks)) => {
+                            tracing::debug!("Parsed audio multitrack: {} tracks, inner_pt={:?}", tracks.len(), inner_pt);
+                            for track in tracks.iter() {
+                                if ctx.closed_audio_tracks.contains(&track.track_id) {
+                                    continue;
+                                }
+                            let codec = map_enhanced_audio_codec(track.codec.clone());
+                            let old_audio_codec = ctx.track_audio_codecs.insert(track.track_id, codec);
+                            let is_new_audio_codec = old_audio_codec.is_none() || old_audio_codec != Some(codec);
+                            let is_new_track = !ctx.discovered_tracks.contains(&track.track_id);
+                            if is_new_track || is_new_audio_codec {
+                                if is_new_track {
+                                    ctx.discovered_tracks.insert(track.track_id);
+                                }
+                                let video_codec = ctx.track_video_codecs.get(&track.track_id).copied();
+                                notify_track_discovered(app_state, stream_key, track.track_id, video_codec, Some(codec)).await;
+                            }
+                            // Default hls_state gets track_id == 0 as primary track
+                            if track.track_id == 0
                                 && let Some(ref mut hls) = ctx.hls_state
                             {
                                 match inner_pt {
                                     Some(crate::rtmp::enhanced::AudioPacketType::SequenceStart) => {
                                         let _ = hls.set_audio_config(codec, track.payload).await;
+                                    }
+                                    Some(crate::rtmp::enhanced::AudioPacketType::SequenceEnd) => {
+                                        let _ = hls.finalize_segment().await;
                                     }
                                     _ => {
                                         let _ = hls.write_audio(track.payload, ts).await;
@@ -610,25 +752,51 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
                                 Some(crate::rtmp::enhanced::AudioPacketType::SequenceStart) => {
                                     let _ = track_state.set_audio_config(codec, track.payload).await;
                                 }
+                                Some(crate::rtmp::enhanced::AudioPacketType::SequenceEnd) => {
+                                    let _ = track_state.finalize_segment().await;
+                                    ctx.closed_audio_tracks.insert(track.track_id);
+                                }
                                 _ => {
                                     let _ = track_state.write_audio(track.payload, ts).await;
                                 }
                             }
                         }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse audio multitrack: {}", e);
+                        }
                     }
                 }
                 crate::rtmp::enhanced::AudioPacketType::SequenceStart => {
+                    let codec = map_enhanced_audio_codec(header.codec);
+                    let old_audio_codec = ctx.track_audio_codecs.insert(0, codec);
+                    let is_new_audio_codec = old_audio_codec.is_none() || old_audio_codec != Some(codec);
+                    let is_new_track = !ctx.discovered_tracks.contains(&0);
+                    if is_new_track || is_new_audio_codec {
+                        if is_new_track {
+                            ctx.discovered_tracks.insert(0);
+                        }
+                        let video_codec = ctx.track_video_codecs.get(&0).copied();
+                        notify_track_discovered(app_state, stream_key, 0, video_codec, Some(codec)).await;
+                    }
                     if let Some(ref mut hls) = ctx.hls_state {
-                        let codec = match header.codec {
-                            crate::rtmp::enhanced::EnhancedAudioCodec::Opus => crate::hls::fmp4::AudioCodec::Opus,
-                            _ => crate::hls::fmp4::AudioCodec::Aac,
-                        };
                         let _ = hls.set_audio_config(codec, remainder).await;
                     }
                 }
                 crate::rtmp::enhanced::AudioPacketType::CodedFrames => {
+                    if !ctx.discovered_tracks.contains(&0) {
+                        ctx.discovered_tracks.insert(0);
+                        let video_codec = ctx.track_video_codecs.get(&0).copied();
+                        let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                        notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                    }
                     if let Some(ref mut hls) = ctx.hls_state {
                         let _ = hls.write_audio(remainder, ts).await;
+                    }
+                }
+                crate::rtmp::enhanced::AudioPacketType::SequenceEnd => {
+                    if let Some(ref mut hls) = ctx.hls_state {
+                        let _ = hls.finalize_segment().await;
                     }
                 }
                 _ => {}
@@ -640,12 +808,24 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
             let aac_packet_type = data[1];
             let remainder = &data[2..];
             if aac_packet_type == 0 {
+                ctx.track_audio_codecs.insert(0, crate::hls::fmp4::AudioCodec::Aac);
+                if !ctx.discovered_tracks.contains(&0) {
+                    ctx.discovered_tracks.insert(0);
+                    let video_codec = ctx.track_video_codecs.get(&0).copied();
+                    notify_track_discovered(app_state, stream_key, 0, video_codec, Some(crate::hls::fmp4::AudioCodec::Aac)).await;
+                }
                 if let Some(ref mut hls) = ctx.hls_state {
                     let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Aac, remainder).await;
                 }
             } else if aac_packet_type == 1
                 && let Some(ref mut hls) = ctx.hls_state
             {
+                if !ctx.discovered_tracks.contains(&0) {
+                    ctx.discovered_tracks.insert(0);
+                    let video_codec = ctx.track_video_codecs.get(&0).copied();
+                    let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                    notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                }
                 let _ = hls.write_audio(remainder, ts).await;
             }
         } else if sound_format == 9 && data.len() > 5 {
@@ -654,10 +834,22 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
             if remainder.starts_with(b"Opus") {
                 let opus_data = &remainder[4..];
                 if opus_data.starts_with(b"OpusHead") {
+                    ctx.track_audio_codecs.insert(0, crate::hls::fmp4::AudioCodec::Opus);
+                    if !ctx.discovered_tracks.contains(&0) {
+                        ctx.discovered_tracks.insert(0);
+                        let video_codec = ctx.track_video_codecs.get(&0).copied();
+                        notify_track_discovered(app_state, stream_key, 0, video_codec, Some(crate::hls::fmp4::AudioCodec::Opus)).await;
+                    }
                     if let Some(ref mut hls) = ctx.hls_state {
                         let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Opus, opus_data).await;
                     }
                 } else {
+                    if !ctx.discovered_tracks.contains(&0) {
+                        ctx.discovered_tracks.insert(0);
+                        let video_codec = ctx.track_video_codecs.get(&0).copied();
+                        let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                        notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                    }
                     if let Some(ref mut hls) = ctx.hls_state {
                         let _ = hls.write_audio(opus_data, ts).await;
                     }
@@ -666,10 +858,22 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
                 if let Some(ref mut hls) = ctx.hls_state {
                     if hls.audio_codec() != Some(crate::hls::fmp4::AudioCodec::Flac) && remainder.len() >= 38 {
                         // First packet: store config (includes "fLaC" prefix)
+                        ctx.track_audio_codecs.insert(0, crate::hls::fmp4::AudioCodec::Flac);
+                        if !ctx.discovered_tracks.contains(&0) {
+                            ctx.discovered_tracks.insert(0);
+                            let video_codec = ctx.track_video_codecs.get(&0).copied();
+                            notify_track_discovered(app_state, stream_key, 0, video_codec, Some(crate::hls::fmp4::AudioCodec::Flac)).await;
+                        }
                         let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Flac, remainder).await;
                     } else if hls.audio_codec() == Some(crate::hls::fmp4::AudioCodec::Flac) && remainder.len() > 4 {
                         // Subsequent packets: strip "fLaC" prefix before writing as audio sample.
                         // FFmpeg prepends "fLaC" to every FLAC packet in FLV.
+                        if !ctx.discovered_tracks.contains(&0) {
+                            ctx.discovered_tracks.insert(0);
+                            let video_codec = ctx.track_video_codecs.get(&0).copied();
+                            let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                            notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                        }
                         let frame_data = &remainder[4..];
                         // Valid FLAC frames start with 0xFF (frame sync); skip non-frame packets.
                         if frame_data[0] == 0xFF {
@@ -678,11 +882,23 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
                     }
                 }
             } else {
+                if !ctx.discovered_tracks.contains(&0) {
+                    ctx.discovered_tracks.insert(0);
+                    let video_codec = ctx.track_video_codecs.get(&0).copied();
+                    let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                    notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                }
                 if let Some(ref mut hls) = ctx.hls_state {
                     let _ = hls.write_audio(remainder, ts).await;
                 }
             }
         } else {
+            if !ctx.discovered_tracks.contains(&0) {
+                ctx.discovered_tracks.insert(0);
+                let video_codec = ctx.track_video_codecs.get(&0).copied();
+                let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+            }
             let remainder = &data[1..];
             if let Some(ref mut hls) = ctx.hls_state {
                 let _ = hls.write_audio(remainder, ts).await;
@@ -700,5 +916,4 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext) {
         let _ = track_state.drain_init_data();
         let _ = track_state.drain_segment_data();
     }
-
-    }
+}

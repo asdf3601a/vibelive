@@ -15,6 +15,7 @@ pub struct StreamResponse {
     pub player_url: Option<String>,
     pub thumbnail_url: String,
     pub thumbnails: HashMap<String, String>,
+    pub tracks: Vec<crate::rtmp::TrackInfo>,
 }
 
 fn build_stream_response(info: &crate::rtmp::PublisherInfo, thumbnail_sizes: &[u32]) -> StreamResponse {
@@ -39,6 +40,7 @@ fn build_stream_response(info: &crate::rtmp::PublisherInfo, thumbnail_sizes: &[u
         player_url,
         thumbnail_url,
         thumbnails,
+        tracks: info.tracks.clone(),
     }
 }
 

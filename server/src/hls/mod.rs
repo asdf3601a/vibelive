@@ -263,6 +263,7 @@ impl HlsStreamState {
     }
 
     async fn rotate_segment(&mut self) -> anyhow::Result<()> {
+        tokio::fs::create_dir_all(&self.stream_dir).await?;
         self.write_init_segment().await?;
         let path = self.segment_path(self.segment_index);
         // Write to a temp file; finalize_segment will rename it atomically

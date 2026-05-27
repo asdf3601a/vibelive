@@ -14,11 +14,20 @@ pub struct StreamManager {
 }
 
 #[derive(Clone, serde::Serialize)]
+pub struct TrackInfo {
+    pub track_id: u32,
+    pub hls_url: String,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
 pub struct PublisherInfo {
     pub stream_key: String,
     pub app_name: String,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub metadata: Option<StreamMeta>,
+    pub tracks: Vec<TrackInfo>,
     #[serde(skip)]
     pub disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
 }

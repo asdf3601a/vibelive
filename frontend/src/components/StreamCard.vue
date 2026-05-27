@@ -25,6 +25,9 @@
         <BaseTag>
           {{ stream.metadata.video_codec }}
         </BaseTag>
+        <BaseTag v-if="stream.tracks && stream.tracks.length > 1">
+          {{ stream.tracks.length }} tracks
+        </BaseTag>
       </div>
 
       <div class="mt-3 flex items-center justify-between min-w-0">

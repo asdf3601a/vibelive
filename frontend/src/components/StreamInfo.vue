@@ -41,6 +41,28 @@
         </div>
       </template>
 
+      <!-- Tracks -->
+      <template v-if="stream.tracks && stream.tracks.length > 0">
+        <div class="pt-2 border-t border-border-default mt-2">
+          <dt class="text-text-muted shrink-0 mb-1">Tracks</dt>
+          <div class="space-y-1">
+            <div
+              v-for="track in stream.tracks"
+              :key="track.track_id"
+              class="flex items-center justify-between gap-2 text-xs"
+            >
+              <span class="text-text-primary font-medium">
+                {{ track.track_id === 0 ? 'Default' : `Track ${track.track_id}` }}
+              </span>
+              <span class="text-text-muted truncate">
+                {{ track.video_codec ?? '—' }}
+                <span v-if="track.audio_codec">+ {{ track.audio_codec }}</span>
+              </span>
+            </div>
+          </div>
+        </div>
+      </template>
+
       <!-- Share link -->
       <div v-if="shareUrl" class="pt-2 border-t border-border-default mt-2">
         <dt class="text-text-muted shrink-0 mb-1">Share</dt>
