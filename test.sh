@@ -54,13 +54,14 @@ Options:
   --aspect LIST   Comma-separated aspect ratios: 16:9,4:3,1:1,21:9,9:16,3:4
                   (default: 16:9)
   --tests LIST    Comma-separated test suites:
-                    codec     – video+audio codec matrix
-                    res       – resolution matrix (all resolutions × all aspects)
-                    color     – color-space / HDR compatibility
-                    graceful  – graceful stop & HLS cleanup
-                    reconnect – abnormal disconnect + reconnect
-                    hls       – live HLS segment verification
-                    all       – run every suite (default)
+                    codec      – video+audio codec matrix
+                    res        – resolution matrix (all resolutions × all aspects)
+                    color      – color-space / HDR compatibility
+                    graceful   – graceful stop & HLS cleanup
+                    reconnect  – abnormal disconnect + reconnect
+                    hls        – live HLS segment verification
+                    multitrack – Enhanced RTMP multitrack (2 video + 2 audio)
+                    all        – run every suite (default)
   --full          Run full Cartesian product for codec/res matrices.
                   Without this flag the suite runs in quick mode:
                     • codec matrix uses only 480p and 720p
@@ -736,6 +737,279 @@ run_hls_test() {
     run_stream_test "HLS E2E (H.264 + AAC @ 360p)" "$vargs" "$aargs" "$size" "$key" 1
 }
 
+# ── Multitrack test ────────────────────────────────────────────────
+run_multitrack_test() {
+    echo ""
+    echo "========== MULTITRACK ENHANCED RTMP TEST =========="
+
+    local key="multitrack_$(date +%s)"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Test: Multitrack stream (2 video + 2 audio)"
+    echo "Key:  $key"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    ffmpeg -y -re \
+        -f lavfi -i "testsrc=duration=15:size=1280x720:rate=30" \
+        -f lavfi -i "testsrc=duration=15:size=640x360:rate=30" \
+        -f lavfi -i "sine=frequency=440:duration=15" \
+        -f lavfi -i "sine=frequency=880:duration=15" \
+        -map 0:v -c:v:0 libsvtav1 -preset:v:0 12 -pix_fmt:v:0 yuv420p -b:v:0 1500k -g:v:0 60 -keyint_min:v:0 60 \
+        -map 1:v -c:v:1 libx264 -preset:v:1 ultrafast -pix_fmt:v:1 yuv420p -b:v:1 500k -g:v:1 60 -keyint_min:v:1 60 \
+        -map 2:a -c:a:0 libopus -ar:a:0 48000 -b:a:0 128k \
+        -map 3:a -c:a:1 aac -ar:a:1 44100 -b:a:1 128k \
+        -f flv "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+    local ffmpeg_pid=$!
+
+    sleep 1
+    if ! kill -0 "$ffmpeg_pid" 2>/dev/null; then
+        echo -e "${RED}  ✗ ffmpeg failed to start${NC}"
+        echo "multitrack|FAIL" >> "$RESULTS_FILE"
+        FAIL=$((FAIL+1))
+        return
+    fi
+
+    # Wait for segments while stream is live (HLS cleaned on finalize when recording=true)
+    sleep 8
+
+    local result="FAIL"
+    local result_color="$RED"
+    local hls_dir="$MEDIA_DIR/hls/$key"
+    local hls_ok=1
+
+    if [ -f "$hls_dir/index.m3u8" ]; then
+        echo -e "${GREEN}  ✓ index.m3u8 exists${NC}"
+    else
+        echo -e "${RED}  ✗ index.m3u8 not found${NC}"
+        hls_ok=0
+    fi
+
+    if [ -f "$hls_dir/track_1/index.m3u8" ]; then
+        echo -e "${GREEN}  ✓ track_1/index.m3u8 exists${NC}"
+    else
+        echo -e "${RED}  ✗ track_1/index.m3u8 not found${NC}"
+        hls_ok=0
+    fi
+
+    local default_segs track1_segs
+    default_segs=($(find "$hls_dir" -maxdepth 1 -name 'segment*.m4s' | sort))
+    track1_segs=($(find "$hls_dir/track_1" -maxdepth 1 -name 'segment*.m4s' | sort))
+
+    if [ ${#default_segs[@]} -ge 1 ]; then
+        echo -e "${GREEN}  ✓ default track has ${#default_segs[@]} segment(s)${NC}"
+    else
+        echo -e "${RED}  ✗ default track has no segments${NC}"
+        hls_ok=0
+    fi
+
+    if [ ${#track1_segs[@]} -ge 1 ]; then
+        echo -e "${GREEN}  ✓ track_1 has ${#track1_segs[@]} segment(s)${NC}"
+    else
+        echo -e "${RED}  ✗ track_1 has no segments${NC}"
+        hls_ok=0
+    fi
+
+    if [ -f "$hls_dir/init.mp4" ]; then
+        echo -e "${GREEN}  ✓ default init.mp4 exists${NC}"
+    else
+        echo -e "${RED}  ✗ default init.mp4 not found${NC}"
+        hls_ok=0
+    fi
+
+    if [ -f "$hls_dir/track_1/init.mp4" ]; then
+        echo -e "${GREEN}  ✓ track_1/init.mp4 exists${NC}"
+    else
+        echo -e "${RED}  ✗ track_1/init.mp4 not found${NC}"
+        hls_ok=0
+    fi
+
+    local tmp_combined
+    tmp_combined=$(mktemp)
+    local fmp4_ok=1
+
+    if [ ${#default_segs[@]} -gt 0 ]; then
+        cat "$hls_dir/init.mp4" "${default_segs[0]}" > "$tmp_combined"
+        if ffprobe -hide_banner -loglevel error -show_format -show_streams "$tmp_combined" >/dev/null 2>&1; then
+            echo -e "${GREEN}  ✓ default fMP4 valid${NC}"
+        else
+            echo -e "${RED}  ✗ default fMP4 invalid${NC}"
+            fmp4_ok=0
+        fi
+    else
+        echo -e "${RED}  ✗ default fMP4 skipped (no segments)${NC}"
+        fmp4_ok=0
+    fi
+
+    if [ ${#track1_segs[@]} -gt 0 ]; then
+        cat "$hls_dir/track_1/init.mp4" "${track1_segs[0]}" > "$tmp_combined"
+        if ffprobe -hide_banner -loglevel error -show_format -show_streams "$tmp_combined" >/dev/null 2>&1; then
+            echo -e "${GREEN}  ✓ track_1 fMP4 valid${NC}"
+        else
+            echo -e "${RED}  ✗ track_1 fMP4 invalid${NC}"
+            fmp4_ok=0
+        fi
+    else
+        echo -e "${RED}  ✗ track_1 fMP4 skipped (no segments)${NC}"
+        fmp4_ok=0
+    fi
+    rm -f "$tmp_combined"
+
+    # API checks (while live)
+    local streams_json
+    streams_json=$(api_call "/api/streams" 2>/dev/null || echo "")
+    if echo "$streams_json" | grep -q "$key"; then
+        echo -e "${GREEN}  ✓ Stream visible in /api/streams${NC}"
+    else
+        echo -e "${RED}  ✗ Stream not visible in /api/streams${NC}"
+        hls_ok=0
+    fi
+
+    local tracks_json track_count
+    tracks_json=$(echo "$streams_json" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for s in data:
+    if s['stream_key'] == '$key':
+        print(json.dumps(s.get('tracks', [])))
+        break
+else:
+    print('[]')
+" 2>/dev/null || echo "[]")
+
+    track_count=$(echo "$tracks_json" | python3 -c "import sys, json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+
+    if [ "$track_count" -ge 2 ]; then
+        echo -e "${GREEN}  ✓ API reports $track_count tracks${NC}"
+    else
+        echo -e "${RED}  ✗ Expected >=2 tracks in API, found $track_count${NC}"
+        hls_ok=0
+    fi
+
+    if echo "$tracks_json" | grep -q "track_1/index.m3u8"; then
+        echo -e "${GREEN}  ✓ API tracks include track_1 HLS URL${NC}"
+    else
+        echo -e "${RED}  ✗ API tracks missing track_1 HLS URL${NC}"
+        hls_ok=0
+    fi
+
+    local codec_ok=1
+    for tid in 0 1; do
+        local vc ac
+        vc=$(echo "$tracks_json" | python3 -c "
+import sys, json
+tracks = json.load(sys.stdin)
+for t in tracks:
+    if t['track_id'] == $tid:
+        print(t.get('video_codec') or '')
+        break
+" 2>/dev/null || echo "")
+        ac=$(echo "$tracks_json" | python3 -c "
+import sys, json
+tracks = json.load(sys.stdin)
+for t in tracks:
+    if t['track_id'] == $tid:
+        print(t.get('audio_codec') or '')
+        break
+" 2>/dev/null || echo "")
+        if [ -n "$vc" ]; then
+            echo -e "${GREEN}  ✓ track $tid video_codec='$vc'${NC}"
+        else
+            echo -e "${RED}  ✗ track $tid video_codec is null/empty${NC}"
+            codec_ok=0
+        fi
+        if [ -n "$ac" ]; then
+            echo -e "${GREEN}  ✓ track $tid audio_codec='$ac'${NC}"
+        else
+            echo -e "${RED}  ✗ track $tid audio_codec is null/empty${NC}"
+            codec_ok=0
+        fi
+    done
+
+    # Stop ffmpeg and wait for finalize
+    if kill -0 "$ffmpeg_pid" 2>/dev/null; then
+        kill "$ffmpeg_pid" 2>/dev/null || true
+        wait "$ffmpeg_pid" 2>/dev/null || true
+    fi
+    sleep 3
+
+    # Recording checks
+    local rec_count rec_ok=1
+    rec_count=$(find "$MEDIA_DIR/recordings" -name "${key}_*.mp4" 2>/dev/null | wc -l) || rec_count=0
+
+    if [ "$rec_count" -eq 0 ]; then
+        echo -e "${RED}  ✗ No recording generated${NC}"
+        rec_ok=0
+    else
+        echo -e "${GREEN}  ✓ Recording generated ($rec_count file(s))${NC}"
+        if [ "$rec_count" -ne 1 ]; then
+            echo -e "${RED}  ✗ Expected exactly 1 recording file (default track only), found $rec_count${NC}"
+            rec_ok=0
+        else
+            echo -e "${GREEN}  ✓ Exactly 1 recording file (default track only)${NC}"
+        fi
+
+        for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do
+            if [ -f "$f" ]; then
+                local dur corrupt=0 too_short ffmpeg_err frame_count stream_count
+                dur=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$f" 2>&1) || corrupt=1
+                if [ "$corrupt" -eq 1 ] || [ -z "$dur" ] || [ "$dur" = "N/A" ]; then
+                    echo -e "${RED}  ✗ Recording ffprobe failed: $(basename "$f")${NC}"
+                    rec_ok=0
+                    continue
+                fi
+                too_short=$(awk "BEGIN { print ($dur < 0.5) ? 1 : 0 }")
+                if [ "$too_short" -eq 1 ]; then
+                    echo -e "${RED}  ✗ Recording too short (${dur}s): $(basename "$f")${NC}"
+                    rec_ok=0
+                    continue
+                fi
+                ffmpeg_err=$(ffmpeg -v error -i "$f" -c copy -f null - 2>&1) || true
+                if [ -n "$ffmpeg_err" ]; then
+                    echo -e "${RED}  ✗ Recording remux errors: $(basename "$f")${NC}"
+                    echo "$ffmpeg_err" | head -3 | sed 's/^/    /'
+                    rec_ok=0
+                    continue
+                fi
+                frame_count=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo 0)
+                if [ "$frame_count" -lt 10 ]; then
+                    echo -e "${RED}  ✗ Recording too few frames ($frame_count): $(basename "$f")${NC}"
+                    rec_ok=0
+                    continue
+                fi
+                echo -e "${GREEN}  ✓ Recording integrity OK (${dur}s, ${frame_count} frames)${NC}"
+
+                stream_count=$(ffprobe -v error -show_entries format=nb_streams -of default=noprint_wrappers=1:nokey=1 "$f" 2>/dev/null || echo 0)
+                if [ "$stream_count" -lt 2 ]; then
+                    echo -e "${RED}  ✗ Recording missing audio/video streams (found $stream_count): $(basename "$f")${NC}"
+                    rec_ok=0
+                    continue
+                fi
+                echo -e "${GREEN}  ✓ Recording contains $stream_count streams (video + audio)${NC}"
+            fi
+        done
+    fi
+
+    if [ -f "$MEDIA_DIR/recordings/index.json" ]; then
+        echo -e "${GREEN}  ✓ recordings/index.json exists${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ recordings/index.json not found${NC}"
+    fi
+
+    if [ "$hls_ok" -eq 1 ] && [ "$fmp4_ok" -eq 1 ] && [ "$codec_ok" -eq 1 ] && [ "$rec_ok" -eq 1 ]; then
+        result="PASS"
+        result_color="$GREEN"
+    fi
+
+    echo -e "${result_color}  ● Result: $result${NC}"
+    echo "multitrack|$result" >> "$RESULTS_FILE"
+
+    if [ "$result" = "PASS" ]; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+    fi
+}
+
 # ── JSON report ────────────────────────────────────────────────────
 generate_json_report() {
     local output_path="$1"
@@ -816,7 +1090,7 @@ api_call "/api/health" || { echo "Health check failed, is the server running?"; 
 
 # Expand "all" in TESTS
 if echo "$TESTS" | grep -qw "all"; then
-    TESTS="codec res color graceful reconnect hls"
+    TESTS="codec res color graceful reconnect hls multitrack"
 fi
 
 # Run selected test suites
@@ -839,6 +1113,9 @@ for t in $TESTS; do
             ;;
         hls)
             run_hls_test
+            ;;
+        multitrack)
+            run_multitrack_test
             ;;
         *)
             echo "Unknown test suite: $t"

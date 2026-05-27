@@ -364,17 +364,9 @@ Covers:
 
 The project includes a unified test script `./test.sh` that covers codec compatibility, resolution/aspect-ratio coverage, color-space validation, graceful-stop, reconnect, and HLS streaming tests.
 
-Additionally, `./test_multitrack.sh` validates **Enhanced RTMP multitrack** ingestion:
-- Verifies multiple video tracks are parsed and muxed into independent HLS playlists
-- Checks `master.m3u8` and per-track `track_N/index.m3u8`
-- Validates per-track `init.mp4` + segment fMP4 integrity via ffprobe
-- Confirms `/api/streams` returns a `tracks` array with `video_codec` and `audio_codec` for each track
-- Ensures recording produces exactly **one** MP4 file (default track only)
-- Supports mixed codec matrices (e.g. track 0 = AV1 + Opus, track 1 = H.264 + AAC)
-
 ```bash
 # Quick mode (recommended for CI): codec matrix at 480p/720p + all resolutions +
-# color space + graceful stop + reconnect + HLS
+# color space + graceful stop + reconnect + HLS + multitrack
 ./test.sh
 
 # Full Cartesian product: every video × audio × resolution combination
@@ -403,6 +395,7 @@ Additionally, `./test_multitrack.sh` validates **Enhanced RTMP multitrack** inge
 | `graceful` | Graceful stop & HLS cleanup verification |
 | `reconnect` | Abnormal disconnect + reconnect grace period |
 | `hls` | Live HLS segment verification |
+| `multitrack` | Enhanced RTMP multitrack (2 video + 2 audio, mixed codecs) |
 | `all` | Every suite (default) |
 
 **Available options:**
