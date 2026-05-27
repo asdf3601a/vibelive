@@ -27,7 +27,7 @@ trap 'rm -f "$RESULTS_FILE"' EXIT
 VIDEO_CODECS="h264 hevc av1"
 AUDIO_CODECS="aac opus flac"
 RESOLUTIONS="240p 480p 720p 1080p 2k 4k 8k"
-TESTS="codec res color graceful reconnect hls"
+TESTS="codec res color graceful reconnect hls multitrack"
 FULL_MATRIX=0
 DEFAULT_RES="480p 720p"
 DEFAULT_VCODEC="h264"
@@ -601,6 +601,14 @@ run_graceful_stop_test() {
     local hls_dir="$MEDIA_DIR/hls/$key"
     local mp4_count
     mp4_count=$(count_recordings "$key")
+
+    # HLS cleanup happens in a background task after thumbnail generation.
+    # Poll for up to 15 seconds to allow it to complete.
+    local hls_wait=0
+    while [ -d "$hls_dir" ] && [ "$hls_wait" -lt 15 ]; do
+        sleep 1
+        hls_wait=$((hls_wait + 1))
+    done
 
     local result="FAIL"
     local result_color="$RED"

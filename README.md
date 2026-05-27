@@ -686,3 +686,4 @@ GitHub Actions (`.github/workflows/ci.yml`):
 - [Enhanced RTMP (veovera)](https://github.com/veovera/enhanced-rtmp)
 - [RFC 9639 — Free Lossless Audio Codec (FLAC)](https://www.rfc-editor.org/rfc/rfc9639.txt)
 - [Obs Studio - Hybrid MP4](https://obsproject.com/blog/obs-studio-hybrid-mp4)
+- [OBS Studio](https://github.com/obsproject/obs-studio.git)

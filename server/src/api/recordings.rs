@@ -8,7 +8,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::process::Command;
 
 use crate::AppState;
 
@@ -76,7 +75,7 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
             let stream_key = crate::recording::parse_stream_key_from_filename(&name);
 
-            let duration = get_video_duration(&path).await.ok();
+            let duration = crate::recording::get_video_duration(&path).await.ok();
 
             let mut thumbnails = HashMap::new();
             for width in &state.config.thumbnail_sizes {
@@ -168,22 +167,4 @@ pub async fn thumbnail(
     }
 }
 
-async fn get_video_duration(path: &std::path::Path) -> anyhow::Result<u64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path.to_str().unwrap(),
-        ])
-        .output()
-        .await?;
 
-    if !output.status.success() {
-        return Err(anyhow::anyhow!("ffprobe failed"));
-    }
-
-    let duration_str = String::from_utf8_lossy(&output.stdout);
-    let duration_sec: f64 = duration_str.trim().parse()?;
-    Ok(duration_sec.ceil() as u64)
-}

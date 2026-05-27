@@ -109,6 +109,9 @@ impl Fmp4Muxer {
     }
 
     pub fn add_audio_sample(&mut self, data: Cow<'_, [u8]>, pts: u64) {
+        if data.is_empty() {
+            return;
+        }
         if self.audio_samples.is_empty() {
             self.audio_base_pts = pts;
         }
@@ -117,8 +120,8 @@ impl Fmp4Muxer {
             data: data.into_owned(),
             dts: pts,
             size,
-            duration: 0,
-            flags: 0x00000000,
+            duration: 0, // filled at flush time
+            flags: 0,
             composition_time_offset: 0,
         });
     }
@@ -1304,16 +1307,18 @@ fn write_descriptor_length(w: &mut Vec<u8>, mut len: usize) {
 }
 
 /// Parse FLAC STREAMINFO from config data.
-/// Config is expected to start with "fLaC" followed by 34-byte STREAMINFO.
+/// Config may be either:
+///   - 38 bytes: "fLaC" prefix + 34-byte STREAMINFO (standard FLV encapsulation)
+///   - 34 bytes: raw STREAMINFO (Enhanced RTMP encapsulation)
 /// Returns (sample_rate, channel_count).
 fn parse_flac_streaminfo(config: &[u8]) -> Option<(u32, u16)> {
-    if config.len() < 38 {
+    let si = if config.len() >= 38 && &config[..4] == b"fLaC" {
+        &config[4..38]
+    } else if config.len() >= 34 {
+        &config[..34]
+    } else {
         return None;
-    }
-    if &config[..4] != b"fLaC" {
-        return None;
-    }
-    let si = &config[4..38];
+    };
     // bytes 10-17 contain sample_rate(20), channels-1(3), bps-1(5), total_samples(36)
     let val = u64::from_be_bytes([
         si[10], si[11], si[12], si[13], si[14], si[15], si[16], si[17],
@@ -1324,19 +1329,27 @@ fn parse_flac_streaminfo(config: &[u8]) -> Option<(u32, u16)> {
 }
 
 /// Build dfLa box content from FLAC config.
-/// Config is expected to start with "fLaC" followed by 34-byte STREAMINFO.
+/// Config may be either:
+///   - 38 bytes: "fLaC" prefix + 34-byte STREAMINFO (standard FLV encapsulation)
+///   - 34 bytes: raw STREAMINFO (Enhanced RTMP encapsulation)
 /// Returns a sequence of FLACMetadataBlock structures (no FullBox header).
 fn build_dfla(config: &[u8]) -> Vec<u8> {
     let mut dfla = Vec::new();
 
-    if config.len() >= 38 && &config[..4] == b"fLaC" {
-        // STREAMINFO metadata block header: last=1, type=0, length=34
-        dfla.push(0x80); // last-metadata-block-flag=1, block-type=0 (STREAMINFO)
-        dfla.push(0x00);
-        dfla.push(0x00);
-        dfla.push(0x22); // block length = 34
-        dfla.extend_from_slice(&config[4..38]); // STREAMINFO data
-    }
+    let si = if config.len() >= 38 && &config[..4] == b"fLaC" {
+        &config[4..38]
+    } else if config.len() >= 34 {
+        &config[..34]
+    } else {
+        return dfla;
+    };
+
+    // STREAMINFO metadata block header: last=1, type=0, length=34
+    dfla.push(0x80); // last-metadata-block-flag=1, block-type=0 (STREAMINFO)
+    dfla.push(0x00);
+    dfla.push(0x00);
+    dfla.push(0x22); // block length = 34
+    dfla.extend_from_slice(si); // STREAMINFO data
 
     dfla
 }
