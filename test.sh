@@ -440,7 +440,9 @@ run_res_matrix() {
     local adisp
     adisp=$(get_acodec_display "$DEFAULT_ACODEC")
 
-    for r in $RESOLUTIONS; do
+    local res_list
+    res_list="$DEFAULT_RES"
+    for r in $res_list; do
         for aspect in $ASPECTS; do
             local size
             size=$(res_and_aspect_to_size "$r" "$aspect")

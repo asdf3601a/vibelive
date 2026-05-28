@@ -6,7 +6,6 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{ServerSession, ServerSessionConfig, ServerSessionResult, ServerSessionEvent};
-
 use crate::AppState;
 use crate::hls::HlsStreamState;
 use crate::recording::Fmp4Recorder;
@@ -491,11 +490,22 @@ async fn handle_event(
             if let Some(ref mut hls) = ctx.hls_state {
                 let _ = hls.update_video_resolution(width, height).await;
             }
+            // Use codec names discovered from packet data rather than raw codec IDs
+            let video_codec_name = ctx.track_video_codecs.get(&0).map(|c| match c {
+                crate::hls::fmp4::VideoCodec::H264 => "H264".to_string(),
+                crate::hls::fmp4::VideoCodec::H265 => "HEVC".to_string(),
+                crate::hls::fmp4::VideoCodec::AV1 => "AV1".to_string(),
+            }).unwrap_or_else(|| metadata.video_codec_id.map(|c| format!("{}", c)).unwrap_or_default());
+            let audio_codec_name = ctx.track_audio_codecs.get(&0).map(|c| match c {
+                crate::hls::fmp4::AudioCodec::Aac => "AAC".to_string(),
+                crate::hls::fmp4::AudioCodec::Opus => "Opus".to_string(),
+                crate::hls::fmp4::AudioCodec::Flac => "FLAC".to_string(),
+            }).unwrap_or_else(|| metadata.audio_codec_id.map(|c| format!("{}", c)).unwrap_or_default());
             let meta = crate::rtmp::StreamMeta {
                 width: metadata.video_width.unwrap_or(0),
                 height: metadata.video_height.unwrap_or(0),
-                video_codec: metadata.video_codec_id.map(|c| format!("{}", c)).unwrap_or_default(),
-                audio_codec: metadata.audio_codec_id.map(|c| format!("{}", c)).unwrap_or_default(),
+                video_codec: video_codec_name,
+                audio_codec: audio_codec_name,
                 video_bitrate: metadata.video_bitrate_kbps.unwrap_or(0),
                 audio_bitrate: metadata.audio_bitrate_kbps.unwrap_or(0),
                 framerate: metadata.video_frame_rate.unwrap_or(0.0) as f64,
@@ -537,7 +547,7 @@ fn map_enhanced_audio_codec(codec: crate::rtmp::enhanced::EnhancedAudioCodec) ->
 }
 
 async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_state: &Arc<AppState>, stream_key: &str) {
-    tracing::debug!("handle_video_data: ts={}, len={}, first_bytes={:02x?}", ts, data.len(), &data[..data.len().min(8)]);
+    tracing::debug!("handle_video_data: ts={}, len={}, first_bytes={:02x?}, hls_state={}", ts, data.len(), &data[..data.len().min(8)], ctx.hls_state.is_some());
     if crate::rtmp::enhanced::is_enhanced_video(data) {
         if let Ok((header, remainder)) = crate::rtmp::enhanced::parse_enhanced_video_header(data) {
             let is_keyframe = header.frame_type == crate::rtmp::enhanced::VideoFrameType::KeyFrame;
@@ -644,7 +654,7 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
         let frame_type = (data[0] & 0xF0) >> 4;
         let codec_id = data[0] & 0x0F;
         let is_keyframe = frame_type == 1;
-        tracing::debug!("legacy video: frame_type={}, codec_id={}, len={}", frame_type, codec_id, data.len());
+        tracing::debug!("legacy video: frame_type={}, codec_id={}, len={}, hls_state={}", frame_type, codec_id, data.len(), ctx.hls_state.is_some());
 
         if codec_id == 7 && data.len() >= 2 {
             let avc_packet_type = data[1];
@@ -659,8 +669,10 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     let audio_codec = ctx.track_audio_codecs.get(&0).copied();
                     notify_track_discovered(app_state, stream_key, 0, Some(crate::hls::fmp4::VideoCodec::H264), audio_codec).await;
                 }
-                if let Some(ref mut hls) = ctx.hls_state {
-                    let _ = hls.set_video_config(remainder, crate::hls::fmp4::VideoCodec::H264, ctx.video_width, ctx.video_height).await;
+                if let Some(ref mut hls) = ctx.hls_state
+                    && let Err(e) = hls.set_video_config(remainder, crate::hls::fmp4::VideoCodec::H264, ctx.video_width, ctx.video_height).await
+                {
+                    tracing::warn!("HLS set_video_config failed: {}", e);
                 }
             } else if avc_packet_type == 1 {
                 // AVC NALU -> raw AVCC sample data
@@ -670,13 +682,17 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     let audio_codec = ctx.track_audio_codecs.get(&0).copied();
                     notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
                 }
-                if let Some(ref mut hls) = ctx.hls_state {
-                    let _ = hls.write_video(remainder, ts, is_keyframe).await;
+                if let Some(ref mut hls) = ctx.hls_state
+                    && let Err(e) = hls.write_video(remainder, ts, is_keyframe).await
+                {
+                    tracing::warn!("HLS write_video failed: {}", e);
                 }
             } else if avc_packet_type == 2 {
                 // AVC end of sequence
-                if let Some(ref mut hls) = ctx.hls_state {
-                    let _ = hls.finalize_segment().await;
+                if let Some(ref mut hls) = ctx.hls_state
+                    && let Err(e) = hls.finalize_segment().await
+                {
+                    tracing::warn!("HLS finalize_segment failed: {}", e);
                 }
             }
         } else {
@@ -708,6 +724,7 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
 }
 
 async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_state: &Arc<AppState>, stream_key: &str) {
+    tracing::debug!("handle_audio_data: ts={}, len={}, first_bytes={:02x?}, hls_state={}", ts, data.len(), &data[..data.len().min(8)], ctx.hls_state.is_some());
     if crate::rtmp::enhanced::is_enhanced_audio(data) {
         if let Ok((header, remainder)) = crate::rtmp::enhanced::parse_enhanced_audio_header(data) {
             match header.packet_type {
@@ -804,6 +821,7 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
         }
     } else if !data.is_empty() {
         let sound_format = (data[0] & 0xF0) >> 4;
+            tracing::debug!("legacy audio: sound_format={}, len={}, hls_state={}", sound_format, data.len(), ctx.hls_state.is_some());
         if sound_format == 10 && data.len() >= 2 {
             let aac_packet_type = data[1];
             let remainder = &data[2..];
@@ -814,8 +832,10 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     let video_codec = ctx.track_video_codecs.get(&0).copied();
                     notify_track_discovered(app_state, stream_key, 0, video_codec, Some(crate::hls::fmp4::AudioCodec::Aac)).await;
                 }
-                if let Some(ref mut hls) = ctx.hls_state {
-                    let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Aac, remainder).await;
+                if let Some(ref mut hls) = ctx.hls_state
+                    && let Err(e) = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Aac, remainder).await
+                {
+                    tracing::warn!("HLS set_audio_config failed: {}", e);
                 }
             } else if aac_packet_type == 1
                 && let Some(ref mut hls) = ctx.hls_state
@@ -826,7 +846,9 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     let audio_codec = ctx.track_audio_codecs.get(&0).copied();
                     notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
                 }
-                let _ = hls.write_audio(remainder, ts).await;
+                if let Err(e) = hls.write_audio(remainder, ts).await {
+                    tracing::warn!("HLS write_audio failed: {}", e);
+                }
             }
         } else if sound_format == 9 && data.len() > 5 {
             // FFmpeg uses FLV audio format 9 for Opus ("Opus" prefix) and FLAC ("fLaC" prefix)

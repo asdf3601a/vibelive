@@ -40,9 +40,43 @@
       :on-retry="refetch"
     />
 
+    <!-- Stream setup info -->
+    <div v-if="config" class="mb-6 rounded-xl border border-border-default bg-bg-surface/60 p-4">
+      <div class="flex items-center justify-between cursor-pointer" @click="showSetup = !showSetup">
+        <div class="flex items-center gap-2">
+          <svg class="h-4 w-4 text-accent-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+          <span class="text-sm font-medium text-text-primary">Stream Setup</span>
+          <BaseTag v-if="config.multitrack_supported">Multitrack</BaseTag>
+        </div>
+        <svg class="h-4 w-4 text-text-muted transition" :class="showSetup ? 'rotate-180' : ''" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" />
+        </svg>
+      </div>
+      <div v-if="showSetup" class="mt-3 space-y-3 text-sm text-text-secondary">
+        <div>
+          <span class="font-medium">RTMP URL:</span>
+          <BaseCodeBlock :text="config.rtmp_url_template" />
+        </div>
+        <div>
+          <span class="font-medium">Supported codecs:</span>
+          <span class="ml-1">Video: {{ config.supported_video_codecs.join(', ') }} / Audio: {{ config.supported_audio_codecs.join(', ') }}</span>
+        </div>
+        <div>
+          <span class="font-medium">Single-track ffmpeg example:</span>
+          <BaseCodeBlock :text="config.example_ffmpeg_single" :multiline="true" />
+        </div>
+        <div v-if="config.multitrack_supported">
+          <span class="font-medium">Multitrack ffmpeg example:</span>
+          <BaseCodeBlock :text="config.example_ffmpeg_multitrack" :multiline="true" />
+        </div>
+      </div>
+    </div>
+
     <!-- Stream grid -->
     <TransitionGroup
-      v-else-if="displayedData?.length"
+      v-if="displayedData?.length"
       name="stream-list"
       tag="div"
       class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
@@ -58,7 +92,10 @@
         </svg>
       </template>
       <template #action>
-        <div class="flex items-center justify-center gap-2">
+        <div v-if="config" class="space-y-2">
+          <BaseCodeBlock :text="config.rtmp_url_template" />
+        </div>
+        <div v-else class="flex items-center justify-center gap-2">
           <BaseCodeBlock text="rtmp://localhost:1935/live/" />
           <span class="font-mono text-xs text-text-muted">{any-key}</span>
         </div>
@@ -68,15 +105,18 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, ref, watch, onMounted } from 'vue'
 import StreamCard from '@/components/StreamCard.vue'
 import BaseCard from '@/components/ui/BaseCard.vue'
 import BaseSkeleton from '@/components/ui/BaseSkeleton.vue'
 import BaseEmptyState from '@/components/ui/BaseEmptyState.vue'
 import BaseErrorState from '@/components/ui/BaseErrorState.vue'
 import BaseCodeBlock from '@/components/ui/BaseCodeBlock.vue'
+import BaseTag from '@/components/ui/BaseTag.vue'
 import { useStreamList } from '@/composables/useStreamList'
+import { getConfig } from '@/api/streams'
 import type { Stream } from '@/types'
+import type { ServerConfig } from '@/api/streams'
 
 const { data, error, loading, refetch } = useStreamList()
 
@@ -102,6 +142,17 @@ watch(
   },
   { immediate: true },
 )
+
+const config = ref<ServerConfig | null>(null)
+const showSetup = ref(false)
+
+onMounted(async () => {
+  try {
+    config.value = await getConfig()
+  } catch (e) {
+    // silently ignore config fetch errors
+  }
+})
 </script>
 
 <style>

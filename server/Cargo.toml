@@ -12,6 +12,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 rml_rtmp = "0.8"
+rml_amf0 = "0.3"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

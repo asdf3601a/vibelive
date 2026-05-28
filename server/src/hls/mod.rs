@@ -40,6 +40,8 @@ pub struct HlsStreamState {
     // Wall-clock time mapping
     stream_started_at: Option<chrono::DateTime<chrono::Utc>>,
     segment_start_offsets: Vec<u64>,
+    // RFC 6381 codec string cache
+    codec_string: Option<String>,
 }
 
 impl HlsStreamState {
@@ -80,6 +82,7 @@ impl HlsStreamState {
             last_init_hash: None,
             stream_started_at: None,
             segment_start_offsets: Vec::new(),
+            codec_string: None,
         }
     }
 
@@ -133,17 +136,28 @@ impl HlsStreamState {
             self.first_video_ts = Some(timestamp);
         }
         let base_ts = self.first_video_ts.unwrap_or(0);
-        let pts = (timestamp - base_ts) as u64 + self.timestamp_offset;
+        let pts = (timestamp.saturating_sub(base_ts)) as u64 + self.timestamp_offset;
 
         if !self.has_video {
+            if !is_keyframe {
+                // Discard frames before first keyframe to ensure segment starts with keyframe
+                tracing::debug!("write_video: discarding non-keyframe before stream start, ts={}", timestamp);
+                return Ok(());
+            }
+            tracing::debug!("write_video: first keyframe, ts={}, starting segment", timestamp);
             self.has_video = true;
             self.stream_started_at = Some(chrono::Utc::now());
             self.current_segment_start = pts;
             self.rotate_segment().await?;
+            tracing::debug!("write_video: rotate_segment done, current_file={}", self.current_file.is_some());
         }
 
         // Handle case where current_file was closed externally (e.g., explicit finalize_segment)
         if self.current_file.is_none() {
+            if !is_keyframe {
+                // Wait for keyframe before starting new segment
+                return Ok(());
+            }
             self.current_segment_start = pts;
             self.segment_index += 1;
             self.rotate_segment().await?;
@@ -165,13 +179,20 @@ impl HlsStreamState {
             self.rotate_segment().await?;
         }
 
-        let sample_data: Cow<'_, [u8]> = if self.fmp4_muxer.video_codec() == Some(fmp4::VideoCodec::AV1) {
-            Cow::Owned(fmp4::ensure_av1_obu_size_fields(data))
-        } else {
-            Cow::Borrowed(data)
+        let sample_data: Cow<'_, [u8]> = match self.fmp4_muxer.video_codec() {
+            Some(fmp4::VideoCodec::AV1) => {
+                Cow::Owned(fmp4::ensure_av1_obu_size_fields(data))
+            }
+            _ => Cow::Borrowed(data),
         };
         self.fmp4_muxer.add_video_sample(sample_data, pts, pts, is_keyframe);
         self.last_video_pts = pts;
+
+        // Update codec string cache when available
+        if self.codec_string.is_none() {
+            self.codec_string = self.fmp4_muxer.codec_string();
+        }
+
         Ok(())
     }
 
@@ -191,7 +212,7 @@ impl HlsStreamState {
             if self.is_audio_only {
                 // Audio-only track: create segment on first audio frame
                 let base_ts = self.first_audio_ts.unwrap_or(0);
-                let pts = (timestamp - base_ts) as u64 + self.timestamp_offset;
+                let pts = (timestamp.saturating_sub(base_ts)) as u64 + self.timestamp_offset;
                 self.stream_started_at = Some(chrono::Utc::now());
                 self.current_segment_start = pts;
                 self.rotate_segment().await?;
@@ -200,7 +221,7 @@ impl HlsStreamState {
             }
         }
         let base_ts = self.first_audio_ts.unwrap_or(0);
-        let pts = (timestamp - base_ts) as u64 + self.timestamp_offset;
+        let pts = (timestamp.saturating_sub(base_ts)) as u64 + self.timestamp_offset;
         self.fmp4_muxer.add_audio_sample(Cow::Borrowed(data), pts);
         self.last_audio_pts = pts;
 
@@ -266,15 +287,17 @@ impl HlsStreamState {
         tokio::fs::create_dir_all(&self.stream_dir).await?;
         self.write_init_segment().await?;
         let path = self.segment_path(self.segment_index);
-        // Write to a temp file; finalize_segment will rename it atomically
         let tmp_path = path.with_extension("m4s.tmp");
+        tracing::debug!("rotate_segment: creating tmp file at {:?}", tmp_path);
         let file = tokio::fs::File::create(&tmp_path).await?;
         self.current_file = Some(file);
         self.update_playlist().await?;
+        tracing::debug!("rotate_segment: done, segment_index={}", self.segment_index);
         Ok(())
     }
 
     pub async fn finalize_segment(&mut self) -> anyhow::Result<()> {
+        tracing::debug!("finalize_segment: current_file={}", self.current_file.is_some());
         if let Some(mut file) = self.current_file.take() {
             // Capture last sample duration before flush clears samples
             let last_sample_duration = if self.last_video_pts >= self.last_audio_pts {
@@ -282,7 +305,8 @@ impl HlsStreamState {
             } else {
                 self.fmp4_muxer.last_audio_sample_duration()
             };
-            let has_fragment = if let Some(fragment) = self.fmp4_muxer.flush_combined_fragment() {
+            let has_fragment =             if let Some(fragment) = self.fmp4_muxer.flush_combined_fragment() {
+                tracing::debug!("finalize_segment: writing fragment of {} bytes", fragment.len());
                 file.write_all(&fragment).await?;
                 self.segment_data.push(fragment);
 
@@ -378,6 +402,9 @@ impl HlsStreamState {
         let mut playlist = String::new();
         playlist.push_str("#EXTM3U\n");
         playlist.push_str("#EXT-X-VERSION:7\n");
+        if let Some(ref codecs) = self.codec_string {
+            playlist.push_str(&format!("#EXT-X-CODECS:{}\n", codecs));
+        }
         playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", self.segment_duration));
         playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", self.first_segment_index));
         playlist.push_str(&format!("#EXT-X-DISCONTINUITY-SEQUENCE:{}\n", self.discontinuity_sequence));
