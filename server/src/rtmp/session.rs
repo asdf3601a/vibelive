@@ -156,9 +156,15 @@ impl SessionContext {
         let stream_key = self.current_stream_key.as_ref().unwrap().clone();
         let segment_duration = self.hls_segment_duration;
         let segments_keep = self.hls_segments_keep;
-        self.track_states.entry(track_id).or_insert_with(|| {
+        let state = self.track_states.entry(track_id).or_insert_with(|| {
             HlsStreamState::new(&media_dir, &stream_key, track_id, is_audio_only, segment_duration, segments_keep)
-        })
+        });
+        // If video data arrives for a track previously created as audio-only,
+        // clear the flag so write_video doesn't drop video samples.
+        if !is_audio_only {
+            state.set_not_audio_only();
+        }
+        state
     }
 }
 

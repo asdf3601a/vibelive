@@ -742,11 +742,22 @@ impl Fmp4Muxer {
     }
 
     fn write_opus_sample_entry(&self, w: &mut Vec<u8>) {
+        // Extract actual channel count from OpusHead config so it matches dOps.
+        let channel_count: u8 = self.audio_config.as_ref()
+            .and_then(|c| {
+                let head = if c.len() > 8 && &c[..8] == b"OpusHead" { &c[8..] } else { c.as_slice() };
+                // Need at least 11 bytes for a valid OpusHead
+                if head.len() >= 11 { Some(head[1]) } else { None }
+            })
+            // Validate: channel count must be 1..=255 (Chrome MSE rejects 0)
+            .filter(|&cc| cc >= 1)
+            .unwrap_or(2);
+
         let mut data = Vec::new();
         data.extend_from_slice(&[0u8; 6]); // reserved
         data.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
         data.extend_from_slice(&[0u8; 8]); // reserved
-        data.extend_from_slice(&2u16.to_be_bytes()); // channelcount
+        data.extend_from_slice(&(channel_count as u16).to_be_bytes()); // channelcount
         data.extend_from_slice(&16u16.to_be_bytes()); // samplesize
         data.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
         data.extend_from_slice(&0u16.to_be_bytes()); // reserved
@@ -757,8 +768,10 @@ impl Fmp4Muxer {
             let dops = build_dops(config);
             write_box(&mut data, b"dOps", &dops);
         } else {
-            // Minimal dOps: version=0, channel_count=2, pre_skip=0, sample_rate=48000, gain=0, mapping_family=0
-            write_box(&mut data, b"dOps", &[0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xBB, 0x80, 0x00, 0x00, 0x00]);
+            // Minimal dOps with matching channel_count
+            write_box(&mut data, b"dOps", &[
+                0x00, channel_count, 0x00, 0x00, 0x00, 0x00, 0xBB, 0x80, 0x00, 0x00, 0x00,
+            ]);
         }
 
         write_box(w, b"Opus", &data);
@@ -1572,7 +1585,7 @@ fn build_dops(opus_head: &[u8]) -> Vec<u8> {
     }
 
     let version = 0u8;
-    let channel_count = head[1];
+    let channel_count = if head[1] >= 1 { head[1] } else { 2 };
     let pre_skip = u16::from_le_bytes([head[2], head[3]]);
     let sample_rate = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
     let gain = i16::from_le_bytes([head[8], head[9]]);

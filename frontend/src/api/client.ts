@@ -18,6 +18,7 @@ export class ApiError extends Error {
 export async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     headers: { Accept: 'application/json' },
+    cache: 'no-cache',
     ...opts,
   })
 

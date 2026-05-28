@@ -94,6 +94,11 @@ impl HlsStreamState {
         self.audio_codec
     }
 
+    /// Clear the audio-only flag when video data arrives for this track.
+    pub fn set_not_audio_only(&mut self) {
+        self.is_audio_only = false;
+    }
+
     fn segment_path(&self, index: u32) -> PathBuf {
         self.stream_dir.join(format!("segment{:05}.m4s", index))
     }
