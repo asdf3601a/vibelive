@@ -36,10 +36,10 @@
           </div>
 
           <div v-if="stream.metadata" class="mt-4 flex flex-wrap gap-2">
-            <BaseTag>{{ stream.metadata.width }}×{{ stream.metadata.height }}</BaseTag>
-            <BaseTag>{{ stream.metadata.video_codec }}</BaseTag>
-            <BaseTag v-if="stream.metadata.audio_codec">{{ stream.metadata.audio_codec }}</BaseTag>
-            <BaseTag v-if="stream.metadata.framerate">{{ stream.metadata.framerate }} fps</BaseTag>
+            <BaseTag>{{ activeTrackTags.width }}×{{ activeTrackTags.height }}</BaseTag>
+            <BaseTag>{{ activeTrackTags.video_codec }}</BaseTag>
+            <BaseTag v-if="activeTrackTags.audio_codec">{{ activeTrackTags.audio_codec }}</BaseTag>
+            <BaseTag v-if="activeTrackTags.framerate">{{ activeTrackTags.framerate }} fps</BaseTag>
           </div>
 
           <!-- Track switcher -->
@@ -70,7 +70,7 @@
 
       <!-- Sidebar -->
       <div class="space-y-4 min-w-0">
-        <StreamInfo :stream="stream" />
+        <StreamInfo :stream="stream" :active-track="activeTrack" />
 
         <div v-if="recordings.length" class="rounded-xl border border-border-default bg-bg-surface/60 p-4">
           <h3 class="text-sm font-semibold text-text-primary mb-3">Recordings</h3>
@@ -150,10 +150,25 @@ const hlsUrl = computed(() => stream.value?.hls_url ?? null)
 
 const activeTrackId = ref<number>(0)
 
+const activeTrack = computed(() =>
+  stream.value?.tracks?.find(t => t.track_id === activeTrackId.value) ?? null,
+)
+
+const activeTrackTags = computed(() => {
+  const meta = stream.value?.metadata
+  const track = activeTrack.value
+  return {
+    width: meta?.width ?? 0,
+    height: meta?.height ?? 0,
+    video_codec: track?.video_codec ?? meta?.video_codec ?? '—',
+    audio_codec: track?.audio_codec ?? meta?.audio_codec ?? null,
+    framerate: meta?.framerate ?? null,
+  }
+})
+
 const activeHlsUrl = computed(() => {
   if (!stream.value) return null
-  const track = stream.value.tracks?.find(t => t.track_id === activeTrackId.value)
-  return track?.hls_url ?? stream.value.hls_url ?? null
+  return activeTrack.value?.hls_url ?? stream.value.hls_url ?? null
 })
 
 // Reset to default track when stream changes

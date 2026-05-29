@@ -19,13 +19,13 @@
           <dt class="text-text-muted shrink-0">Resolution</dt>
           <dd class="text-text-primary">{{ stream.metadata.width }}×{{ stream.metadata.height }}</dd>
         </div>
-        <div v-if="stream.metadata.video_codec" class="flex justify-between gap-2">
+        <div class="flex justify-between gap-2">
           <dt class="text-text-muted shrink-0">Video</dt>
-          <dd class="text-text-primary truncate">{{ stream.metadata.video_codec }}</dd>
+          <dd class="text-text-primary truncate">{{ activeTrack?.video_codec ?? stream.metadata.video_codec }}</dd>
         </div>
-        <div v-if="stream.metadata.audio_codec" class="flex justify-between gap-2">
+        <div v-if="activeTrack?.audio_codec ?? stream.metadata.audio_codec" class="flex justify-between gap-2">
           <dt class="text-text-muted shrink-0">Audio</dt>
-          <dd class="text-text-primary truncate">{{ stream.metadata.audio_codec }}</dd>
+          <dd class="text-text-primary truncate">{{ activeTrack?.audio_codec ?? stream.metadata.audio_codec }}</dd>
         </div>
         <div v-if="stream.metadata.framerate" class="flex justify-between gap-2">
           <dt class="text-text-muted shrink-0">Framerate</dt>
@@ -92,11 +92,12 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import type { Stream } from '@/types'
+import type { Stream, TrackInfo } from '@/types'
 import { formatDateTime } from '@/utils/format'
 
 interface Props {
   stream: Stream
+  activeTrack?: TrackInfo | null
 }
 const props = defineProps<Props>()
 
