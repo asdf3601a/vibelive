@@ -509,6 +509,8 @@ async fn handle_event(
                 Some(0x68657631) => "HEVC".to_string(),  // "hev1" FourCC
                 Some(0x68766331) => "HEVC".to_string(),  // "hvc1" FourCC
                 Some(0x61763031) => "AV1".to_string(),   // "av01" FourCC
+                Some(0x76703039) => "VP9".to_string(),   // "vp09" FourCC
+                Some(0x76766331) => "VVC".to_string(),   // "vvc1" FourCC
                 Some(id) => format!("{}", id),
                 None => String::new(),
             });
@@ -521,6 +523,10 @@ async fn handle_event(
                 Some(2) => "MP3".to_string(),
                 Some(10) => "AAC".to_string(),
                 Some(11) => "Speex".to_string(),
+                Some(0x4F707573) => "Opus".to_string(),  // "Opus" FourCC
+                Some(0x664C6143) => "FLAC".to_string(),  // "fLaC" FourCC
+                Some(0x61632D33) => "AC-3".to_string(),  // "ac-3" FourCC
+                Some(0x65632D33) => "E-AC-3".to_string(),// "ec-3" FourCC
                 Some(id) => format!("{}", id),
                 None => String::new(),
             });
