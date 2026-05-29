@@ -8,7 +8,9 @@ export interface StreamMetadata {
   height: number
   video_codec: string
   audio_codec: string
+  /** Bitrate in kbps (kilobits per second) */
   video_bitrate?: number
+  /** Bitrate in kbps (kilobits per second) */
   audio_bitrate?: number
   framerate?: number
 }

@@ -115,9 +115,9 @@ function copyShareUrl() {
   })
 }
 
-function formatBitrate(bps: number): string {
-  if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} Mbps`
-  if (bps >= 1_000) return `${(bps / 1_000).toFixed(1)} Kbps`
-  return `${bps} bps`
+function formatBitrate(kbps: number): string {
+  if (kbps >= 1_000) return `${(kbps / 1_000).toFixed(1)} Mbps`
+  if (kbps >= 1) return `${kbps} Kbps`
+  return `${kbps * 1_000} bps`
 }
 </script>

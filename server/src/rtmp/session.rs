@@ -501,12 +501,29 @@ async fn handle_event(
                 crate::hls::fmp4::VideoCodec::H264 => "H264".to_string(),
                 crate::hls::fmp4::VideoCodec::H265 => "HEVC".to_string(),
                 crate::hls::fmp4::VideoCodec::AV1 => "AV1".to_string(),
-            }).unwrap_or_else(|| metadata.video_codec_id.map(|c| format!("{}", c)).unwrap_or_default());
+            }).unwrap_or_else(|| match metadata.video_codec_id {
+                Some(7) => "H264".to_string(),
+                Some(12) => "HEVC".to_string(),
+                Some(13) => "AV1".to_string(),
+                Some(0x61766331) => "H264".to_string(),  // "avc1" FourCC
+                Some(0x68657631) => "HEVC".to_string(),  // "hev1" FourCC
+                Some(0x68766331) => "HEVC".to_string(),  // "hvc1" FourCC
+                Some(0x61763031) => "AV1".to_string(),   // "av01" FourCC
+                Some(id) => format!("{}", id),
+                None => String::new(),
+            });
             let audio_codec_name = ctx.track_audio_codecs.get(&0).map(|c| match c {
                 crate::hls::fmp4::AudioCodec::Aac => "AAC".to_string(),
                 crate::hls::fmp4::AudioCodec::Opus => "Opus".to_string(),
                 crate::hls::fmp4::AudioCodec::Flac => "FLAC".to_string(),
-            }).unwrap_or_else(|| metadata.audio_codec_id.map(|c| format!("{}", c)).unwrap_or_default());
+            }).unwrap_or_else(|| match metadata.audio_codec_id {
+                Some(0) => "Linear PCM".to_string(),
+                Some(2) => "MP3".to_string(),
+                Some(10) => "AAC".to_string(),
+                Some(11) => "Speex".to_string(),
+                Some(id) => format!("{}", id),
+                None => String::new(),
+            });
             let meta = crate::rtmp::StreamMeta {
                 width: metadata.video_width.unwrap_or(0),
                 height: metadata.video_height.unwrap_or(0),

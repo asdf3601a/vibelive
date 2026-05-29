@@ -95,7 +95,12 @@ function setupPlayer() {
     internalState.value = 'waiting'
     return
   }
-  destroyPlayer()
+  if (hlsInstance) {
+    hlsInstance.destroy()
+    hlsInstance = null
+    videoRef.value.removeAttribute('src')
+    videoRef.value.load()
+  }
   internalState.value = 'loading'
 
   if (Hls.isSupported()) {
@@ -135,7 +140,8 @@ function retry() {
   setupPlayer()
 }
 
-watch(() => props.src, () => {
+watch(() => props.src, (newSrc, oldSrc) => {
+  if (newSrc === oldSrc) return
   if (props.src) {
     setupPlayer()
   } else {
