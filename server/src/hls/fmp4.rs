@@ -974,6 +974,20 @@ impl Fmp4Muxer {
         Some(format!("{},{}", v, a))
     }
 
+    #[cfg(test)]
+    pub fn codec_string_video_only(&self) -> Option<String> {
+        self.video_codec_string()
+    }
+
+    fn reverse_bits_32(x: u32) -> u32 {
+        let mut v = x;
+        v = ((v & 0x55555555) << 1) | ((v >> 1) & 0x55555555);
+        v = ((v & 0x33333333) << 2) | ((v >> 2) & 0x33333333);
+        v = ((v & 0x0F0F0F0F) << 4) | ((v >> 4) & 0x0F0F0F0F);
+        v = ((v & 0x00FF00FF) << 8) | ((v >> 8) & 0x00FF00FF);
+        (v << 16) | (v >> 16)
+    }
+
     fn video_codec_string(&self) -> Option<String> {
         let codec = self.video_codec?;
         match codec {
@@ -993,27 +1007,36 @@ impl Fmp4Muxer {
                     return None;
                 }
                 let byte1 = config[1];
-                let profile_space = (byte1 >> 6) & 0x03;
                 let tier_flag = (byte1 >> 5) & 0x01;
                 let profile_idc = byte1 & 0x1F;
-                let profile_compatibility = u32::from_be_bytes([config[2], config[3], config[4], config[5]]);
+                let profile_compatibility_raw = u32::from_be_bytes([config[2], config[3], config[4], config[5]]);
+                let profile_compatibility = Self::reverse_bits_32(profile_compatibility_raw);
                 let constraints = &config[6..12];
                 let level_idc = config[12];
                 let tier = if tier_flag == 1 { 'H' } else { 'L' };
-                let constraints_hex = constraints.iter().map(|b| format!("{:02X}", b)).collect::<String>();
-                Some(format!(
-                    "hvc1.{}.{}.{:08X}.{}.{}{}",
-                    profile_space,
-                    profile_idc,
-                    profile_compatibility,
-                    tier,
-                    level_idc,
-                    if constraints_hex.chars().all(|c| c == '0') {
-                        String::new()
-                    } else {
-                        format!(".{}", constraints_hex.trim_start_matches('0'))
-                    }
-                ))
+
+                let pc_str = if profile_compatibility != 0 {
+                    format!("{:x}", profile_compatibility)
+                } else {
+                    "0".to_string()
+                };
+
+                let constraints_str = constraints.iter()
+                    .rev()
+                    .skip_while(|&&b| b == 0)
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .rev()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(".");
+
+                let base = format!("hvc1.{}.{}.{}{}", profile_idc, pc_str, tier, level_idc);
+                if constraints_str.is_empty() {
+                    Some(base)
+                } else {
+                    Some(format!("{}.{}", base, constraints_str))
+                }
             }
             VideoCodec::AV1 => {
                 let config = self.video_config.as_ref()?;
@@ -2092,5 +2115,61 @@ mod tests {
         assert_eq!(av1c[3], 0x00);
         // configOBUs appended
         assert_eq!(&av1c[4..], &obu[..]);
+    }
+
+    #[test]
+    fn test_hevc_codec_string() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H265, 1920, 1080);
+        // hvcC config: profile=Main(1), tier=Main(0), level=5.1(120=0x78)
+        // profile_compatibility_flags = 0x60000000 → reversed = 0x00000006
+        // constraint_indicator_flags = all zeros → omitted
+        muxer.set_video_config(vec![
+            0x01,       // configurationVersion
+            0x01,       // profile_space=0, tier_flag=0, profile_idc=1 (Main)
+            0x60, 0x00, 0x00, 0x00,  // profile_compatibility_flags
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // constraint_indicator_flags
+            0x78,       // level_idc = 120
+            0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00,
+            0x0F, 0x03, 0x20, 0x00, 0x00, 0x03, 0x00, 0x80,
+            0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78,
+            0xAC, 0x09,
+        ]);
+        // Codec string should follow RFC 6381 with bit-reversed profile_compatibility
+        let cs = muxer.codec_string_video_only();
+        assert_eq!(cs, Some("hvc1.1.6.L120".to_string()));
+        let combined = muxer.codec_string_video_only();
+        assert_eq!(combined, Some("hvc1.1.6.L120".to_string()));
+    }
+
+    #[test]
+    fn test_hevc_codec_string_with_constraints() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H265, 1920, 1080);
+        // profile=Main(1), tier=Main(0), level=5.1(120)
+        // profile_compatibility_flags = 0x80000000 → reversed = 0x00000001
+        // constraint_indicator_flags = [0x12, 0x34, 0x00, 0x00, 0x00, 0x00]
+        muxer.set_video_config(vec![
+            0x01,       // configurationVersion
+            0x01,       // profile_space=0, tier_flag=0, profile_idc=1 (Main)
+            0x80, 0x00, 0x00, 0x00,  // profile_compatibility_flags
+            0x12, 0x34, 0x00, 0x00, 0x00, 0x00,  // constraint_indicator_flags (non-zero)
+            0x78,       // level_idc = 120
+            0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00,
+            0x0F, 0x03, 0x20, 0x00, 0x00, 0x03, 0x00, 0x80,
+            0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78,
+            0xAC, 0x09,
+        ]);
+        let cs = muxer.codec_string_video_only();
+        assert_eq!(cs, Some("hvc1.1.1.L120.12.34".to_string()));
+    }
+
+    #[test]
+    fn test_reverse_bits_32() {
+        assert_eq!(Fmp4Muxer::reverse_bits_32(0x00000001), 0x80000000);
+        assert_eq!(Fmp4Muxer::reverse_bits_32(0x80000000), 0x00000001);
+        assert_eq!(Fmp4Muxer::reverse_bits_32(0x60000000), 0x00000006);
+        assert_eq!(Fmp4Muxer::reverse_bits_32(0xFFFFFFFF), 0xFFFFFFFF);
+        assert_eq!(Fmp4Muxer::reverse_bits_32(0x00000000), 0x00000000);
     }
 }
