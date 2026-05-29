@@ -377,8 +377,20 @@ pub fn parse_enhanced_video_multitrack(data: &[u8]) -> Result<(MultitrackType, O
         if data.len() < offset + size {
             return Err("data too short for track payload");
         }
-        let payload = &data[offset..offset + size];
+        let mut payload = &data[offset..offset + size];
         offset += size;
+
+        // Per FFmpeg flvenc.c:1414-1415:
+        // AVC/HEVC CodedFrames in multitrack have 3 leading CTS bytes
+        // that must be stripped before the actual NAL data.
+        if inner_packet_type == Some(VideoPacketType::CodedFrames)
+            && (codec == EnhancedVideoCodec::Avc || codec == EnhancedVideoCodec::Hevc)
+        {
+            if payload.len() < 3 {
+                return Err("data too short for avc/hevc composition time");
+            }
+            payload = &payload[3..];
+        }
 
         tracks.push(EnhancedVideoTrack { track_id, codec, payload });
 
@@ -678,5 +690,156 @@ mod tests {
         assert_eq!(inner_pt, Some(VideoPacketType::SequenceStart));
         assert_eq!(tracks[0].track_id, 1);
         assert_eq!(tracks[0].codec, EnhancedVideoCodec::Av1);
+    }
+
+    #[test]
+    fn test_parse_avc_multitrack_strips_cts() {
+        // FFmpeg flvenc.c:1414-1415 writes 3-byte CTS after track_id for AVC/HEVC CodedFrames.
+        // Data: [exVideo] [OneTrack|CodedFrames] ["avc1"] [track=1] [CTS=0x001234] [NAL data]
+        let nal_data = vec![0x00, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x00, 0x01];
+        let mut data: Vec<u8> = vec![
+            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
+            0x01,             // OneTrack | CodedFrames(1)
+            b'a', b'v', b'c', b'1', // "avc1"
+            0x00,             // track_id = 0
+            0x00, 0x12, 0x34, // CTS = 0x1234 (4660)
+        ];
+        data.extend_from_slice(&nal_data);
+
+        let (header, remainder) = parse_enhanced_video_header(&data).unwrap();
+        assert_eq!(header.packet_type, VideoPacketType::Multitrack);
+        let (mt, inner_pt, tracks) = parse_enhanced_video_multitrack(remainder).unwrap();
+        assert_eq!(mt, MultitrackType::OneTrack);
+        assert_eq!(inner_pt, Some(VideoPacketType::CodedFrames));
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].codec, EnhancedVideoCodec::Avc);
+        // CTS bytes (0x00, 0x12, 0x34) must be stripped from payload
+        assert_eq!(tracks[0].payload, nal_data.as_slice());
+    }
+
+    #[test]
+    fn test_parse_avc_multitrack_codedframesx_no_cts() {
+        // CodedFramesX (DTS==PTS optimization) has NO CTS bytes.
+        let nal_data = vec![0x00, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x00, 0x01];
+        let mut data: Vec<u8> = vec![
+            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
+            0x03,             // OneTrack | CodedFramesX(3)
+            b'a', b'v', b'c', b'1', // "avc1"
+            0x00,             // track_id = 0
+        ];
+        data.extend_from_slice(&nal_data);
+
+        let (_header, remainder) = parse_enhanced_video_header(&data).unwrap();
+        let (_mt, inner_pt, tracks) = parse_enhanced_video_multitrack(remainder).unwrap();
+        assert_eq!(inner_pt, Some(VideoPacketType::CodedFramesX));
+        // CodedFramesX: NO CTS stripping, payload is raw NAL data
+        assert_eq!(tracks[0].payload, nal_data.as_slice());
+    }
+
+    #[test]
+    fn test_parse_hevc_multitrack_strips_cts() {
+        let nal_data = vec![0x00, 0x00, 0x00, 0x06, 0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF];
+        let mut data: Vec<u8> = vec![
+            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
+            0x01,             // OneTrack | CodedFrames(1)
+            b'h', b'v', b'c', b'1', // "hvc1"
+            0x00,             // track_id = 0
+            0xFF, 0xFE, 0x00, // CTS = -512 (sign-extended from 0xFFFE00)
+        ];
+        data.extend_from_slice(&nal_data);
+
+        let (_header, remainder) = parse_enhanced_video_header(&data).unwrap();
+        let (_mt, _inner_pt, tracks) = parse_enhanced_video_multitrack(remainder).unwrap();
+        assert_eq!(tracks[0].codec, EnhancedVideoCodec::Hevc);
+        assert_eq!(tracks[0].payload, nal_data.as_slice());
+    }
+
+    #[test]
+    fn test_parse_avc_multitrack_legacy_strips_cts() {
+        // Legacy 0xCC format: [0xCC] [Multitrack|frameType] [multitrack_type] ["avc1"] [track_id] [CTS] [NAL]
+        let nal_data = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88];
+        let mut data: Vec<u8> = vec![
+            0xCC,             // legacy ExVideo marker
+            0x06,             // packet_type = Multitrack(6), frame_type=InterFrame
+            0x01,             // multitrack_type: OneTrack | CodedFrames
+            b'a', b'v', b'c', b'1', // "avc1"
+            0x00,             // track_id = 0
+            0x00, 0x00, 0x00, // CTS = 0
+        ];
+        data.extend_from_slice(&nal_data);
+
+        let (header, remainder) = parse_enhanced_video_header(&data).unwrap();
+        assert_eq!(header.packet_type, VideoPacketType::Multitrack);
+        let (_mt, _inner_pt, tracks) = parse_enhanced_video_multitrack(remainder).unwrap();
+        assert_eq!(tracks[0].codec, EnhancedVideoCodec::Avc);
+        assert_eq!(tracks[0].payload, nal_data.as_slice());
+    }
+
+    #[test]
+    fn test_parse_avc_multitrack_sequence_start_no_cts() {
+        // SequenceStart has NO CTS, only raw AVCC config.
+        let config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
+        let mut data: Vec<u8> = vec![
+            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
+            0x00,             // OneTrack | SequenceStart(0)
+            b'a', b'v', b'c', b'1', // "avc1"
+            0x00,             // track_id = 0
+        ];
+        data.extend_from_slice(&config);
+
+        let (_header, remainder) = parse_enhanced_video_header(&data).unwrap();
+        let (_mt, inner_pt, tracks) = parse_enhanced_video_multitrack(remainder).unwrap();
+        assert_eq!(inner_pt, Some(VideoPacketType::SequenceStart));
+        assert_eq!(tracks[0].payload, config.as_slice());
+    }
+
+    #[test]
+    fn test_parse_av1_multitrack_codedframes_no_cts_stripping() {
+        // AV1 has no CTS - payload should pass through unchanged
+        let obu_data = vec![0x0A, 0x04, 0x00, 0x00, 0x00, 0x40];
+        let mut data: Vec<u8> = vec![
+            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
+            0x01,             // OneTrack | CodedFrames(1)
+            b'a', b'v', b'0', b'1', // "av01"
+            0x00,             // track_id = 0
+        ];
+        data.extend_from_slice(&obu_data);
+
+        let (_header, remainder) = parse_enhanced_video_header(&data).unwrap();
+        let (_mt, _inner_pt, tracks) = parse_enhanced_video_multitrack(remainder).unwrap();
+        assert_eq!(tracks[0].codec, EnhancedVideoCodec::Av1);
+        assert_eq!(tracks[0].payload, obu_data.as_slice());
+    }
+
+    #[test]
+    fn test_parse_avc_multitrack_manytracks_strips_cts() {
+        // ManyTracks with 2 AVC tracks, each with CTS
+        let nal1 = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88];
+        let nal2 = vec![0x00, 0x00, 0x00, 0x04, 0x41, 0x88];
+        let track0_size = 3 + nal1.len(); // CTS 3 + NAL
+        let track1_size = 3 + nal2.len();
+        let mut data: Vec<u8> = vec![
+            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
+            0x11,             // ManyTracks(1) | CodedFrames(1)
+            b'a', b'v', b'c', b'1', // "avc1"
+            0x00,             // track 0 id
+            (track0_size >> 16) as u8, (track0_size >> 8) as u8, track0_size as u8, // size
+            0x00, 0x00, 0x01, // CTS = 1
+        ];
+        data.extend_from_slice(&nal1);
+        data.extend_from_slice(&[
+            0x01,             // track 1 id
+            (track1_size >> 16) as u8, (track1_size >> 8) as u8, track1_size as u8, // size
+            0x00, 0x00, 0x02, // CTS = 2
+        ]);
+        data.extend_from_slice(&nal2);
+
+        let (_header, remainder) = parse_enhanced_video_header(&data).unwrap();
+        let (_mt, _inner_pt, tracks) = parse_enhanced_video_multitrack(remainder).unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].codec, EnhancedVideoCodec::Avc);
+        assert_eq!(tracks[1].codec, EnhancedVideoCodec::Avc);
+        assert_eq!(tracks[0].payload, nal1.as_slice());
+        assert_eq!(tracks[1].payload, nal2.as_slice());
     }
 }

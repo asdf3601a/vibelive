@@ -3,7 +3,8 @@
     <div class="w-full relative" :style="{ paddingBottom: aspectRatioPadding }">
       <img
         v-if="src && !error"
-        :src="srcWithRetry"
+        :key="retryKey"
+        :src="src"
         alt="Stream thumbnail"
         class="absolute inset-0 h-full w-full object-cover transition group-hover:scale-105"
         loading="lazy"
@@ -50,15 +51,8 @@ const props = withDefaults(defineProps<Props>(), {
 const loading = ref(true)
 const error = ref(false)
 const retryCount = ref(0)
-const retryTick = ref(0)
+const retryKey = ref(0)
 let retryTimer: ReturnType<typeof setInterval> | null = null
-
-const srcWithRetry = computed(() => {
-  if (!props.src) return ''
-  // Append a cache-busting retry tick so the browser re-fetches on retry
-  const separator = props.src.includes('?') ? '&' : '?'
-  return `${props.src}${separator}_retry=${retryTick.value}`
-})
 
 const displayText = computed(() => {
   if (loading.value && props.src) return 'Generating preview...'
@@ -81,7 +75,7 @@ function startRetry() {
   if (retryTimer) return
   retryTimer = setInterval(() => {
     retryCount.value++
-    retryTick.value++
+    retryKey.value++
     loading.value = true
     error.value = false
     if (retryCount.value >= props.maxRetries) {
@@ -104,7 +98,7 @@ watch(() => props.src, (newSrc, oldSrc) => {
     loading.value = true
     error.value = false
     retryCount.value = 0
-    retryTick.value = 0
+    retryKey.value = 0
     stopRetry()
   }
 })
