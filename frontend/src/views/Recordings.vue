@@ -136,7 +136,10 @@
     <RecordingPlayer
       v-if="activeRecording"
       :recording="activeRecording"
-      @close="activeRecording = null"
+      :initial-loop-a="activeRecordingLoopA"
+      :initial-loop-b="activeRecordingLoopB"
+      :initial-loop-enabled="activeRecordingLoopEnabled"
+      @close="onPlayerClose"
     />
 
     <!-- Refresh toast -->
@@ -161,7 +164,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import RecordingsList from '@/components/RecordingsList.vue'
 import RecordingPlayer from '@/components/RecordingPlayer.vue'
 import BaseSkeleton from '@/components/ui/BaseSkeleton.vue'
@@ -172,6 +176,9 @@ import { usePolling } from '@/composables/usePolling'
 import { deepEqual } from '@/utils/deepEqual'
 import type { Recording } from '@/types'
 
+const route = useRoute()
+const router = useRouter()
+
 const { data, error, loading, refetch } = usePolling(() => listRecordings(), {
   interval: 5000,
   immediate: true,
@@ -180,6 +187,9 @@ const { data, error, loading, refetch } = usePolling(() => listRecordings(), {
 const displayedData = ref<Recording[]>([])
 const showRefreshToast = ref(false)
 const activeRecording = ref<Recording | null>(null)
+const activeRecordingLoopA = ref<number | null>(null)
+const activeRecordingLoopB = ref<number | null>(null)
+const activeRecordingLoopEnabled = ref(false)
 const selectedStreamKey = ref('')
 const startDate = ref('')
 const endDate = ref('')
@@ -206,6 +216,46 @@ function applyUpdate() {
     displayedData.value = data.value
   }
   showRefreshToast.value = false
+}
+
+function parseLoopParams() {
+  const rawA = route.query.loopA as string | undefined
+  const rawB = route.query.loopB as string | undefined
+  const rawLoop = route.query.loop as string | undefined
+  if (rawA) activeRecordingLoopA.value = parseFloat(rawA)
+  if (rawB) activeRecordingLoopB.value = parseFloat(rawB)
+  activeRecordingLoopEnabled.value = rawLoop === 'true'
+}
+
+onMounted(() => {
+  parseLoopParams()
+  const playFilename = route.query.play as string | undefined
+  if (playFilename && data.value) {
+    const found = data.value.find(r => r.filename === playFilename)
+    if (found) {
+      activeRecording.value = found
+    }
+  }
+})
+
+watch(data, (newData) => {
+  if (!newData) return
+  const playFilename = route.query.play as string | undefined
+  if (playFilename && !activeRecording.value) {
+    const found = newData.find(r => r.filename === playFilename)
+    if (found) {
+      parseLoopParams()
+      activeRecording.value = found
+    }
+  }
+})
+
+function onPlayerClose() {
+  activeRecording.value = null
+  activeRecordingLoopA.value = null
+  activeRecordingLoopB.value = null
+  activeRecordingLoopEnabled.value = false
+  router.replace({ query: {} })
 }
 
 function clearDateRange() {

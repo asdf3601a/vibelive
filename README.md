@@ -310,14 +310,23 @@ Environment variables (all in `.env`):
 | Route | View | Purpose |
 |-------|------|---------|
 | `/` | `Home.vue` | Active stream grid with polling |
-| `/live/:key` | `LiveWatch.vue` | HLS player + stream metadata sidebar + **track switcher** for multitrack streams |
-| `/recordings` | `Recordings.vue` | Recordings library with filters (stream key, date range) |
+| `/live/:key` | `LiveWatch.vue` | HLS player + stream metadata sidebar |
+| `/recordings` | `Recordings.vue` | Recordings library with filters (stream key, date range), shareable `?play=filename&loopA=&loopB=&loop=` URLs |
 
 ### 4.3 Key Patterns
 
 - **Polling**: `usePolling()` composable fetches data every 3s, pauses when tab is hidden, and only updates reactive state when data actually changes (deep equality check).
 - **Two-stage updates**: The Recordings page shows a "有新的錄影可查看 / Refresh" toast instead of abruptly re-rendering the list.
-- **Player**: `Player.vue` uses hls.js with `enableWorker` and `lowLatencyMode`. Falls back to native HLS on Safari. Supports dynamic `src` switching for multitrack track selection.
+- **Player**: `Player.vue` uses a custom overlay player powered by `usePlayer()` composable:
+  - **Playback**: Play/pause, seek via progress bar with drag preview, keyboard shortcuts (`Space`/`K`/`J`/`L`/arrows/`F`/`M`), touch gestures (double-tap left/right edges to seek). Supports both HLS (via hls.js) and direct MP4 playback.
+  - **Volume**: 6-stage icon (mute → 1–25% → 25–50% → 50–75% → 75–100% → 100–150% boost), inline horizontal slider, mouse-wheel control, capsule container.
+  - **Speed**: Discrete slider (0.25x–16x) with wheel control, pitch preservation, speed badge in control bar.
+  - **A-B Loop** (recordings only): Set point A / point B, then choose loop on/off. When enabled and A is set, playback seeks to A on play; when B is set, it stops/loops at B. Shareable via URL (`&loopA=&loopB=&loop=true`).
+  - **Quality**: Multitrack track selector (right side, only visible when multiple tracks are available).
+  - **Debug overlay**: Toggleable horizontal stats bar showing time, resolution, volume, speed, dropped frames, HLS bandwidth estimate, buffer length, live latency, and active track.
+  - **Live indicator**: Red pulsing dot when at live edge → grey when behind → click to catch up. Configurable threshold in settings.
+  - **Seek indicator**: Floating `+N`/`−N` badge on seek via keyboard/touch.
+  - **Settings menu**: Speed, A-B loop, live lag threshold, volume boost toggle, debug toggle — unified row layout.
 - **Thumbnail loading**: `ThumbnailImg.vue` handles the fact that thumbnails are generated asynchronously by ffmpeg:
   - Displays a loading spinner placeholder (gray background + animated spinner) while the image is not yet available.
   - If the image fails to load, auto-retries every 5 seconds up to 12 retries.
@@ -606,7 +615,33 @@ ffmpeg -re \
   -f flv rtmp://localhost:1935/live/testkey
 ```
 
-Then open `http://localhost:8080/live/testkey` in a browser. For multitrack streams, the player page shows a **Video Tracks** switcher below the player to toggle between Default and Track 1.
+Then open `http://localhost:8080/live/testkey` in a browser. Multitrack streams show a quality selector button (gear icon) in the player control bar to switch between Default and Track 1.
+
+### 9.4 Continuous Multitrack Generator
+
+The `generate_multitrack.sh` script launches a new multitrack test stream at regular intervals:
+
+```bash
+# Default: stream every 65s, each running for 60s
+./generate_multitrack.sh
+
+# Custom RTMP endpoint and stream key
+RTMP_URL=rtmp://localhost:1935/live STREAM_PREFIX=mytest ./generate_multitrack.sh
+```
+
+**What it does:**
+- Generates a 2-video + 2-audio multitrack stream using ffmpeg test sources
+- **Track 0**: AV1 video (854×480, 800kbps) + Opus audio (48kHz, 64kbps)
+- **Track 1**: H.264 video (640×360, 300kbps) + AAC audio (44.1kHz, 64kbps)
+- Each stream runs for 60 seconds, with a new one starting every 65 seconds
+- Press `Ctrl+C` to stop; cleanly kills all background ffmpeg processes
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RTMP_URL` | `rtmp://5.home.oktw.one:1935/live` | RTMP ingestion endpoint |
+| `STREAM_PREFIX` | `aislop_generator` | Stream key prefix |
 
 ## 10. Development Guidelines
 
@@ -647,12 +682,16 @@ vibe-livestream/
 │   └── thumbnail.rs         # ffmpeg thumbnail generation
 ├── frontend/src/
 │   ├── views/               # Page-level components
-│   ├── components/          # Reusable UI components
+│   ├── components/
+│   │   ├── player/          # Player sub-components (ProgressBar, VolumeControl, SettingsMenu, TrackSelector, DebugOverlay)
+│   │   └── ...              # Other reusable UI components
 │   ├── api/                 # Typed fetch wrappers
-│   ├── composables/         # Vue composables (polling, streams)
+│   ├── composables/         # Vue composables (usePlayer, usePolling, useStream, useClipboard)
 │   ├── stores/              # Pinia stores
 │   ├── router/              # Vue Router config
+│   ├── utils/               # Utility functions (format, clipboard, deepEqual)
 │   └── types/               # TypeScript interfaces
+├── generate_multitrack.sh   # Continuous multitrack test stream generator
 ├── nginx.local.conf         # nginx reverse proxy config (local dev)
 ├── nginx.docker.conf        # nginx config for Docker Compose
 ├── Dockerfile.backend       # Rust backend image (CI + Docker Compose)

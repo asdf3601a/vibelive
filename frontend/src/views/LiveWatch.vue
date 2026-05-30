@@ -11,18 +11,36 @@
     </router-link>
 
     <!-- Error state -->
-    <BaseErrorState
-      v-if="error"
-      title="Failed to load stream"
-      description="Could not fetch stream details. The stream may have ended or the server may be unreachable."
-      :on-retry="refetch"
-    />
+    <div v-if="error" class="space-y-4">
+      <BaseErrorState
+        title="Failed to load stream"
+        description="Could not fetch stream details. The stream may have ended or the server may be unreachable."
+        :on-retry="refetch"
+      />
+      <div class="flex justify-center">
+        <router-link
+          to="/"
+          class="inline-flex items-center gap-1.5 rounded-lg bg-accent-primary px-4 py-2 text-sm font-medium text-white hover:bg-accent-primary/90 transition"
+        >
+          <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+          </svg>
+          Go Home
+        </router-link>
+      </div>
+    </div>
 
     <!-- Main layout -->
     <div v-else-if="stream" class="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <!-- Video + details -->
       <div class="lg:col-span-2 space-y-4 min-w-0">
-        <Player :src="activeHlsUrl" />
+        <Player
+          :src="activeHlsUrl"
+          :tracks="stream.tracks ?? []"
+          :is-live="true"
+          :muted="true"
+          @track-change="activeTrackId = $event"
+        />
 
         <div class="rounded-xl border border-border-default bg-bg-surface/60 p-4">
           <div class="flex items-start justify-between gap-4">
@@ -40,30 +58,6 @@
             <BaseTag>{{ activeTrackTags.video_codec }}</BaseTag>
             <BaseTag v-if="activeTrackTags.audio_codec">{{ activeTrackTags.audio_codec }}</BaseTag>
             <BaseTag v-if="activeTrackTags.framerate">{{ activeTrackTags.framerate }} fps</BaseTag>
-          </div>
-
-          <!-- Track switcher -->
-          <div v-if="stream.tracks && stream.tracks.length > 1" class="mt-4 pt-4 border-t border-border-default">
-            <div class="text-sm text-text-muted mb-2">Video Tracks</div>
-            <div class="flex flex-wrap gap-2">
-              <button
-                v-for="track in stream.tracks"
-                :key="track.track_id"
-                class="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium border transition"
-                :class="activeTrackId === track.track_id
-                  ? 'bg-accent-primary/10 border-accent-primary text-accent-primary'
-                  : 'bg-bg-elevated border-border-default text-text-secondary hover:bg-bg-overlay hover:text-text-primary'"
-                @click="selectTrack(track.track_id)"
-              >
-                <svg v-if="activeTrackId === track.track_id" class="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/>
-                </svg>
-                <span>
-                  {{ track.track_id === 0 ? 'Default' : `Track ${track.track_id}` }}
-                  <span v-if="track.video_codec" class="text-xs opacity-70">({{ track.video_codec }})</span>
-                </span>
-              </button>
-            </div>
           </div>
         </div>
       </div>
@@ -146,7 +140,6 @@ const key = computed(() => route.params.key as string)
 
 const { data, error, loading, refetch } = useStream(key.value)
 const stream = computed(() => data.value ?? null)
-const hlsUrl = computed(() => stream.value?.hls_url ?? null)
 
 const activeTrackId = ref<number>(0)
 
@@ -180,10 +173,6 @@ watch(
   },
   { immediate: true },
 )
-
-function selectTrack(trackId: number) {
-  activeTrackId.value = trackId
-}
 
 const recordings = ref<Recording[]>([])
 const activeRecording = ref<Recording | null>(null)

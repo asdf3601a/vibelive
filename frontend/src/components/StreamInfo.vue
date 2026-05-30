@@ -94,6 +94,7 @@
 import { computed, ref } from 'vue'
 import type { Stream, TrackInfo } from '@/types'
 import { formatDateTime } from '@/utils/format'
+import { copyToClipboard } from '@/utils/clipboard'
 
 interface Props {
   stream: Stream
@@ -108,12 +109,13 @@ const shareUrl = computed(() => {
 
 const copied = ref(false)
 
-function copyShareUrl() {
+async function copyShareUrl() {
   if (!shareUrl.value) return
-  navigator.clipboard.writeText(shareUrl.value).then(() => {
+  const ok = await copyToClipboard(shareUrl.value)
+  if (ok) {
     copied.value = true
     setTimeout(() => { copied.value = false }, 2000)
-  })
+  }
 }
 
 function formatBitrate(kbps: number): string {

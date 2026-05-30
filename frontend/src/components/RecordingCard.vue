@@ -49,6 +49,21 @@
         </svg>
         Play
       </button>
+      <button
+        class="inline-flex items-center gap-1 rounded-lg bg-bg-elevated px-2.5 py-1.5 text-xs font-medium border border-border-default transition shrink-0"
+        :class="shareCopied
+          ? 'text-accent-success border-accent-success/30 bg-accent-success/10'
+          : 'text-text-secondary hover:bg-bg-overlay hover:text-text-primary'"
+        @click="shareLink"
+      >
+        <svg v-if="shareCopied" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+        </svg>
+        <svg v-else class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+        </svg>
+        {{ shareCopied ? 'Copied' : 'Share' }}
+      </button>
       <a
         :href="recording.url"
         download
@@ -66,6 +81,7 @@
 import { computed, ref } from 'vue'
 import type { Recording } from '@/types'
 import { formatDateTime, formatDuration, formatFileSize } from '@/utils/format'
+import { copyToClipboard } from '@/utils/clipboard'
 
 interface Props {
   recording: Recording
@@ -77,13 +93,22 @@ defineEmits<{
 }>()
 
 const thumbnailError = ref(false)
+const shareCopied = ref(false)
 
 const thumbnailSrc = computed(() => {
   if (thumbnailError.value) return ''
-  // Prefer 480px, fallback to first available
   return props.recording.thumbnails['480']
     || props.recording.thumbnails['320']
     || props.recording.thumbnail_url
     || ''
 })
+
+async function shareLink() {
+  const url = `${window.location.origin}/recordings?play=${encodeURIComponent(props.recording.filename)}`
+  const ok = await copyToClipboard(url)
+  if (ok) {
+    shareCopied.value = true
+    setTimeout(() => { shareCopied.value = false }, 2000)
+  }
+}
 </script>
