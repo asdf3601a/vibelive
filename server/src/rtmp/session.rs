@@ -695,9 +695,9 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                 ctx.track_video_codecs.insert(0, crate::hls::fmp4::VideoCodec::H264);
                 if !ctx.discovered_tracks.contains(&0) {
                     ctx.discovered_tracks.insert(0);
-                    let audio_codec = ctx.track_audio_codecs.get(&0).copied();
-                    notify_track_discovered(app_state, stream_key, 0, Some(crate::hls::fmp4::VideoCodec::H264), audio_codec).await;
                 }
+                let audio_codec = ctx.track_audio_codecs.get(&0).copied();
+                notify_track_discovered(app_state, stream_key, 0, Some(crate::hls::fmp4::VideoCodec::H264), audio_codec).await;
                 if let Some(ref mut hls) = ctx.hls_state
                     && let Err(e) = hls.set_video_config(remainder, crate::hls::fmp4::VideoCodec::H264, ctx.video_width, ctx.video_height).await
                 {
