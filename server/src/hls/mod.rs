@@ -145,27 +145,41 @@ impl HlsStreamState {
 
         if !self.has_video {
             if !is_keyframe {
-                // Discard frames before first keyframe to ensure segment starts with keyframe
                 tracing::debug!("write_video: discarding non-keyframe before stream start, ts={}", timestamp);
                 return Ok(());
             }
             tracing::debug!("write_video: first keyframe, ts={}, starting segment", timestamp);
+            self.rotate_segment().await
+                .map_err(|e| {
+                    tracing::error!(
+                        "write_video: failed to create first segment, has_video=false, \
+                         first_video_ts={:?}, segment_index={}, error={}",
+                        self.first_video_ts, self.segment_index, e
+                    );
+                    e
+                })?;
             self.has_video = true;
             self.stream_started_at = Some(chrono::Utc::now());
             self.current_segment_start = pts;
-            self.rotate_segment().await?;
             tracing::debug!("write_video: rotate_segment done, current_file={}", self.current_file.is_some());
         }
 
         // Handle case where current_file was closed externally (e.g., explicit finalize_segment)
         if self.current_file.is_none() {
             if !is_keyframe {
-                // Wait for keyframe before starting new segment
                 return Ok(());
             }
-            self.current_segment_start = pts;
             self.segment_index += 1;
-            self.rotate_segment().await?;
+            self.current_segment_start = pts;
+            self.rotate_segment().await
+                .map_err(|e| {
+                    tracing::error!(
+                        "write_video: failed to recover segment, has_video={}, \
+                         segment_index={}, current_segment_start={}, error={}",
+                        self.has_video, self.segment_index, self.current_segment_start, e
+                    );
+                    e
+                })?;
         }
 
         let elapsed_since_start = pts.saturating_sub(self.current_segment_start);
@@ -215,12 +229,19 @@ impl HlsStreamState {
         }
         if self.current_file.is_none() {
             if self.is_audio_only {
-                // Audio-only track: create segment on first audio frame
                 let base_ts = self.first_audio_ts.unwrap_or(0);
                 let pts = (timestamp.saturating_sub(base_ts)) as u64 + self.timestamp_offset;
+                self.rotate_segment().await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "write_audio: failed to create first segment, has_audio={}, \
+                             segment_index={}, error={}",
+                            self.has_audio, self.segment_index, e
+                        );
+                        e
+                    })?;
                 self.stream_started_at = Some(chrono::Utc::now());
                 self.current_segment_start = pts;
-                self.rotate_segment().await?;
             } else {
                 return Ok(());
             }
