@@ -193,7 +193,7 @@ impl HlsStreamState {
         let elapsed_since_start = pts.saturating_sub(self.current_segment_start);
         let threshold = self.segment_duration as u64 * 1000;
 
-        if elapsed_since_start > threshold && self.current_file.is_some() && !self.pending_rotation {
+        if elapsed_since_start >= threshold && self.current_file.is_some() && !self.pending_rotation {
             self.pending_rotation = true;
             self.pending_rotation_pts = pts;
         }
@@ -263,7 +263,7 @@ impl HlsStreamState {
         if self.is_audio_only {
             let elapsed_since_start = pts.saturating_sub(self.current_segment_start);
             let threshold = self.segment_duration as u64 * 1000;
-            if elapsed_since_start > threshold && self.current_file.is_some() && !self.pending_rotation {
+            if elapsed_since_start >= threshold && self.current_file.is_some() && !self.pending_rotation {
                 self.pending_rotation = true;
                 self.pending_rotation_pts = pts;
             }
