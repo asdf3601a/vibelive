@@ -90,6 +90,14 @@ impl HlsStreamState {
         &self.stream_dir
     }
 
+    pub fn current_init_path(&self) -> PathBuf {
+        if self.init_version == 0 {
+            self.stream_dir.join("init.mp4")
+        } else {
+            self.stream_dir.join(format!("init_v{}.mp4", self.init_version))
+        }
+    }
+
     pub fn audio_codec(&self) -> Option<fmp4::AudioCodec> {
         self.audio_codec
     }
@@ -273,7 +281,15 @@ impl HlsStreamState {
 
     async fn write_init_segment(&mut self) -> anyhow::Result<()> {
         if self.init_written {
-            return Ok(());
+            // Verify the file actually exists on disk.
+            // Stale cleanup from a previous stream instance may have deleted it
+            // while we were between segment rotations.
+            let path = self.current_init_path();
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                return Ok(());
+            }
+            self.init_written = false;
+            self.last_init_hash = None;
         }
         let init = self.fmp4_muxer.init_segment();
         let new_hash = crate::util::hash_bytes(&init);
@@ -293,11 +309,7 @@ impl HlsStreamState {
         if self.last_init_hash.is_some() && !can_overwrite {
             self.init_version += 1;
         }
-        let path = if self.init_version == 0 {
-            self.stream_dir.join("init.mp4")
-        } else {
-            self.stream_dir.join(format!("init_v{}.mp4", self.init_version))
-        };
+        let path = self.current_init_path();
 
         // Atomic write: tmp + rename so clients never see a partially-written init
         let tmp_path = path.with_extension("mp4.tmp");

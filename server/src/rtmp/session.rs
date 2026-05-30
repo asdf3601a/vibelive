@@ -263,6 +263,7 @@ if let Some(ref mut r) = recorder {
             let sizes = app_state.config.thumbnail_sizes.clone();
             let base_url = app_state.config.recordings_base_url.clone();
             let key = stream_key.to_string();
+            let app_state = Arc::clone(app_state);
             tokio::spawn(async move {
                 let thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("recordings");
                 if let Err(e) = crate::thumbnail::generate_thumbnails_for_file(&mp4_path, &thumb_dir, &sizes).await {
@@ -271,12 +272,19 @@ if let Some(ref mut r) = recorder {
                 if let Err(e) = crate::recording::write_index_json(&media_dir, &base_url, &sizes).await {
                     tracing::warn!("write_index_json failed for {}: {}", key, e);
                 }
-                // Clean up HLS files and stream thumbnails after recording is saved
-                let hls_dir = PathBuf::from(&media_dir).join("hls").join(&key);
-                let _ = tokio::fs::remove_dir_all(&hls_dir).await;
-                let stream_thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("streams");
-                for &w in &sizes {
-                    let _ = tokio::fs::remove_file(stream_thumb_dir.join(format!("{}_w{}.webp", key, w))).await;
+                // Only clean up HLS files if no new publisher has taken over
+                let sm = app_state.stream_manager.read().await;
+                let still_in_use = sm.is_live_or_pending(&key);
+                drop(sm);
+                if still_in_use {
+                    tracing::debug!("Skipping HLS cleanup for {} — stream is still live or in grace period", key);
+                } else {
+                    let hls_dir = PathBuf::from(&media_dir).join("hls").join(&key);
+                    let _ = tokio::fs::remove_dir_all(&hls_dir).await;
+                    let stream_thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("streams");
+                    for &w in &sizes {
+                        let _ = tokio::fs::remove_file(stream_thumb_dir.join(format!("{}_w{}.webp", key, w))).await;
+                    }
                 }
             });
         }
