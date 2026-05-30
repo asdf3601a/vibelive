@@ -30,7 +30,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   const previousVolume = ref(1)
   const isMuted = ref(false)
   const displayVolume = ref(volume.value)
-  const volumeBoostEnabled = ref(localStorage.getItem('player_volume_boost') !== 'false')
+  const volumeBoostEnabled = ref(localStorage.getItem('player_volume_boost') === 'true')
   let audioCtx: AudioContext | null = null
   let gainNode: GainNode | null = null
   let audioBoostConnected = false
@@ -69,7 +69,10 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   const isBehind = computed(() => isLive.value && liveEdge.value > 0 && (liveEdge.value - currentTime.value) > liveThreshold.value)
 
   // Debug
-  const showDebug = ref(false)
+  const showDebug = ref(localStorage.getItem('player_show_debug') === 'true')
+  watch(showDebug, (val) => {
+    localStorage.setItem('player_show_debug', String(val))
+  })
 
   // Controls visibility
   const controlsVisible = ref(true)
