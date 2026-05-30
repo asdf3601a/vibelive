@@ -61,9 +61,9 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Writes `.m4s` segments (moof + mdat)
   - Maintains `index.m3u8` playlist
   - **Multitrack**: Each additional video track gets its own `track_N/` subdirectory with independent `init.mp4`, segments, and playlist. A `master.m3u8` references all available tracks.
-  - **init.mp4 timing**: `write_init_segment()` is called inside `rotate_segment()`, ensuring init.mp4 is written when the first segment is created (after both video and audio configs have typically arrived).
-  - **Resolution**: `set_video_config()` receives actual width/height from RTMP metadata (defaults 1920×1080). If metadata arrives later, `update_video_resolution()` rewrites init.mp4.
-- **`hls/fmp4.rs`** — Low-level fMP4 (CMAF) muxer:
+  - **init.mp4 timing**: `write_init_segment()` is called inside `rotate_segment()`, ensuring init.mp4 is written when the first segment is created (after both video and audio configs have typically arrived). Init is atomically written via `init.mp4.tmp` → `rename()`.
+  - **Resolution**: `set_video_config()` receives actual width/height from RTMP metadata (defaults 1920×1080). `update_video_resolution()` updates the muxer dimensions only; resolution-only changes do not trigger an init rewrite.
+- **`hls/fmp4/mod.rs`** — Low-level fMP4 (CMAF) muxer:
   - Supports H.264, H.265, AV1 video + AAC, Opus audio
   - Generates `init_segment()` (ftyp + moov), `flush_combined_fragment()` (moof + mdat)
   - Uses Sample tables with duration computation, composition time offsets, and proper `trex` defaults
@@ -287,7 +287,7 @@ Environment variables (all in `.env`):
 | `API_PORT` | 8080 | Internal API/HLS port (use 8081 in local dev when nginx listens on 8080) |
 | `MEDIA_DIR` | `./data` | Root for HLS, recordings, thumbnails |
 | `HLS_SEGMENT_DURATION` | 2 | Target segment duration in seconds |
-| `HLS_SEGMENTS_KEEP` | 10 | Unused (legacy) |
+| `HLS_SEGMENTS_KEEP` | 10 | Number of segments retained in the playlist (sliding window) |
 | `RECORDING_ENABLED` | true | Enable MP4 recording |
 | `THUMBNAIL_SIZES` | `320,480` | Comma-separated thumbnail widths |
 | `THUMBNAIL_INTERVAL_SECONDS` | 10 | Minimum interval between thumbnail regenerations |
@@ -349,7 +349,7 @@ Environment variables (all in `.env`):
 1. **Publish**: OBS/ffmpeg pushes RTMP to `:1935/live/{stream_key}`
 2. **Handshake**: `rtmp/server.rs` accepts TCP, `session.rs` performs RTMP handshake
 3. **Codec detection**: `enhanced.rs` parses video/audio headers → determines codec (H.264/AV1/Opus/AAC)
-4. **HLS muxing**: `HlsStreamState` receives video/audio frames → `fmp4.rs` builds init.mp4 + segments. For multitrack streams, additional `HlsStreamState` instances are created per track_id under `track_N/`.
+4. **HLS muxing**: `HlsStreamState` receives video/audio frames → `fmp4/mod.rs` builds init.mp4 + segments. For multitrack streams, additional `HlsStreamState` instances are created per track_id under `track_N/`.
 5. **Playlist update**: `update_playlist()` writes `index.m3u8` (default track) and `track_N/index.m3u8` (per-track). A `master.m3u8` aggregates all track playlists.
 6. **Playback**: Browser loads `/hls/{key}/index.m3u8` (default) or `/hls/{key}/track_1/index.m3u8` (track 1) via nginx → hls.js fetches init.mp4 + segments
 
@@ -380,7 +380,7 @@ Environment variables (all in `.env`):
 
 ```bash
 # Clone and enter project
-cd /home/kilo/vibe-livestream
+cd vibe-livestream
 
 # 1. Backend dependencies
 cargo check
@@ -447,7 +447,7 @@ MEDIA_DIR=/data
 RUST_LOG=info
 ```
 
-For a single-image build (legacy multi-stage), use the root `Dockerfile` instead.
+For a single-image build (legacy multi-stage), use `Dockerfile.backend` with the frontend served separately.
 
 ## 8. Maintenance
 
@@ -628,10 +628,10 @@ cargo test
 
 ### 10.3 Adding a New Codec
 
-1. Add variant to `hls/fmp4.rs` `VideoCodec` or `AudioCodec`
+1. Add variant to `hls/fmp4/mod.rs` `VideoCodec` or `AudioCodec`
 2. Update `write_stsd_video/audio` to emit the correct sample entry box
 3. Map RTMP codec ID → `VideoCodec`/`AudioCodec` in `rtmp/session.rs::handle_video/audio_data`
-4. Add test in `hls/fmp4.rs` tests
+4. Add test in `hls/fmp4/mod.rs` tests
 
 ### 10.4 File Organization
 
@@ -655,8 +655,7 @@ vibe-livestream/
 │   └── types/               # TypeScript interfaces
 ├── nginx.local.conf         # nginx reverse proxy config (local dev)
 ├── nginx.docker.conf        # nginx config for Docker Compose
-├── Dockerfile               # Legacy single-image multi-stage build
-├── Dockerfile.backend       # Rust backend image
+├── Dockerfile.backend       # Rust backend image (CI + Docker Compose)
 ├── Dockerfile.nginx         # Frontend + nginx image
 ├── docker-compose.yml       # Docker Compose setup (backend + nginx)
 └── test.sh                  # Unified integration test suite
