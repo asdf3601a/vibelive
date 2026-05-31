@@ -700,6 +700,21 @@ vibe-livestream/
 └── test.sh                  # Unified integration test suite
 ```
 
+### 10.5 Customizing the Site Icon
+
+The site icon (favicon + navbar logo) is `frontend/public/icon.svg` — a 512×512 SVG with a purple background and a white "On Air" symbol. Replace this file to customize the brand identity:
+
+```bash
+# Replace with your own SVG
+cp /path/to/your-icon.svg frontend/public/icon.svg
+```
+
+The SVG is referenced in two places; both use the root-relative `/icon.svg` path so no code changes are needed after replacing the file:
+- `frontend/index.html` — `<link rel="icon">` (browser tab icon)
+- `frontend/src/layouts/DefaultLayout.vue` — `<img src="/icon.svg">` (navbar logo)
+
+Keep the same filename (`icon.svg`) for a seamless swap. The file is served as a static asset by both Vite (dev server) and nginx (production).
+
 ## 11. Security Notes
 
 - **No authentication** is currently implemented. Anyone who can reach `:1935` can publish, and anyone who can reach `:8080` can watch/list.
