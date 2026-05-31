@@ -800,25 +800,14 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       } else if (x > rect.width - third) {
         dynamicSeek('forward')
         touchHandled = true
-      } else {
-        togglePlay()
-        touchHandled = true
       }
       touchCount = 0
     }
   }
 
-  function handleTouchEnd(e: TouchEvent) {
-    if (touchHandled) return
-    if ((e.target as HTMLElement).closest('button, a, input, [role="button"]')) return
-    const rect = containerRef.value?.getBoundingClientRect()
-    if (!rect) return
-    const dx = Math.abs(e.changedTouches[0].clientX - touchStartX)
-    const dy = Math.abs(e.changedTouches[0].clientY - touchStartY)
-    if (dx < 10 && dy < 10 && touchCount < 2) {
-      togglePlay()
-      touchHandled = true
-    }
+  function handleTouchEnd(_e: TouchEvent) {
+    // Single tap on the video area only shows controls (already done in touchstart).
+    // Play/pause is handled exclusively by the explicit buttons.
   }
 
   return {
