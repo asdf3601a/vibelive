@@ -6,7 +6,7 @@
     >
       <div class="w-full max-w-5xl rounded-xl border border-border-default bg-bg-surface overflow-hidden shadow-2xl">
         <!-- Header -->
-        <div class="flex items-center justify-between px-4 py-3 border-b border-border-default">
+        <div class="flex items-center justify-between px-4 py-3">
           <div class="flex items-center gap-2 min-w-0">
             <router-link
               to="/"
@@ -43,7 +43,7 @@
         />
 
         <!-- Footer -->
-        <div class="px-4 py-3 border-t border-border-default flex items-center gap-3 text-xs text-text-secondary flex-wrap">
+        <div class="px-4 py-3 flex items-center gap-3 text-xs text-text-secondary flex-wrap">
           <button
             class="inline-flex items-center gap-1 rounded-lg px-3 py-1.5 font-medium border shrink-0 transition"
             :class="copiedStatus
@@ -77,7 +77,7 @@
         <!-- Share options -->
         <div
           v-if="showShareOptions"
-          class="px-4 py-2 border-t border-border-default bg-bg-elevated/50 flex items-center gap-3 text-xs text-text-secondary"
+          class="px-4 py-2 bg-bg-elevated/50 flex items-center gap-3 text-xs text-text-secondary"
         >
           <label class="flex items-center gap-2 cursor-pointer select-none">
             <input
