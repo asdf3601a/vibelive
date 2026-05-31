@@ -120,17 +120,27 @@ import type { ServerConfig } from '@/api/streams'
 
 const { data, error, loading, refetch } = useStreamList()
 
-// Two-stage data: only update displayed list when polled data actually changes
+// Only re-render TransitionGroup when the stream set structurally changes
+// (new stream added / existing stream removed), not on field-level metadata changes
 const displayedData = ref<Stream[]>([])
 
 watch(
   data,
   (newData) => {
-    if (newData) {
+    if (!newData) return
+    const oldKeys = new Set(displayedData.value.map(s => s.stream_key))
+    const newKeys = new Set(newData.map(s => s.stream_key))
+    if (oldKeys.size !== newKeys.size || [...oldKeys].some(k => !newKeys.has(k))) {
       displayedData.value = newData
+    } else {
+      // Update fields in-place without replacing the array reference
+      for (const stream of newData) {
+        const idx = displayedData.value.findIndex(s => s.stream_key === stream.stream_key)
+        if (idx >= 0) displayedData.value[idx] = stream
+      }
     }
   },
-  { immediate: true },
+  { immediate: true, deep: true },
 )
 
 const liveCount = computed(() => displayedData.value?.length ?? 0)

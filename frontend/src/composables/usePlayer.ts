@@ -770,10 +770,16 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   let touchCount = 0
   let lastTapTime = 0
 
+  let touchHandled = false
+
   function handleTouchStart(e: TouchEvent) {
+    touchHandled = false
+    if ((e.target as HTMLElement).closest('button, a, input, [role="button"]')) return
     if (e.touches.length !== 1) return
     touchStartX = e.touches[0].clientX
     touchStartY = e.touches[0].clientY
+
+    showControls()
 
     const now = Date.now()
     if (now - lastTapTime < 300) {
@@ -790,22 +796,28 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       const third = rect.width / 3
       if (x < third) {
         dynamicSeek('backward')
+        touchHandled = true
       } else if (x > rect.width - third) {
         dynamicSeek('forward')
+        touchHandled = true
       } else {
         togglePlay()
+        touchHandled = true
       }
       touchCount = 0
     }
   }
 
   function handleTouchEnd(e: TouchEvent) {
+    if (touchHandled) return
+    if ((e.target as HTMLElement).closest('button, a, input, [role="button"]')) return
     const rect = containerRef.value?.getBoundingClientRect()
     if (!rect) return
     const dx = Math.abs(e.changedTouches[0].clientX - touchStartX)
     const dy = Math.abs(e.changedTouches[0].clientY - touchStartY)
     if (dx < 10 && dy < 10 && touchCount < 2) {
       togglePlay()
+      touchHandled = true
     }
   }
 

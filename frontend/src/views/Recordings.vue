@@ -173,7 +173,6 @@ import BaseErrorState from '@/components/ui/BaseErrorState.vue'
 import BaseEmptyState from '@/components/ui/BaseEmptyState.vue'
 import { listRecordings } from '@/api/streams'
 import { usePolling } from '@/composables/usePolling'
-import { deepEqual } from '@/utils/deepEqual'
 import type { Recording } from '@/types'
 
 const route = useRoute()
@@ -195,7 +194,8 @@ const startDate = ref('')
 const endDate = ref('')
 const viewMode = ref<'grid' | 'list'>('grid')
 
-// On first load, immediately display data. On subsequent changes, show toast.
+// Only show refresh toast when recordings are actually added or removed.
+// Field-level changes (timestamps, thumbnails) should not trigger the toast.
 let isFirstLoad = true
 watch(
   data,
@@ -204,8 +204,14 @@ watch(
     if (isFirstLoad) {
       displayedData.value = newData
       isFirstLoad = false
-    } else if (!deepEqual(displayedData.value, newData)) {
-      showRefreshToast.value = true
+    } else {
+      const oldFilenames = new Set(displayedData.value.map(r => r.filename))
+      const newFilenames = new Set(newData.map(r => r.filename))
+      const changed = oldFilenames.size !== newFilenames.size ||
+        [...oldFilenames].some(f => !newFilenames.has(f))
+      if (changed) {
+        showRefreshToast.value = true
+      }
     }
   },
   { immediate: true },

@@ -77,6 +77,7 @@
           v-if="!isPlaying && state !== 'loading' && state !== 'buffering' && state !== 'ended' && state !== 'error'"
           class="absolute inset-0 flex items-center justify-center cursor-pointer"
           @click="togglePlay"
+          @touchend.stop
         >
           <div class="h-16 w-16 rounded-full bg-accent-primary/90 flex items-center justify-center hover:bg-accent-primary transition shadow-xl hover:scale-105 active:scale-95">
             <svg class="h-7 w-7 text-white ml-1" fill="currentColor" viewBox="0 0 24 24">

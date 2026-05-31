@@ -36,9 +36,11 @@ export function usePolling<T>(
   let timer: ReturnType<typeof setInterval> | null = null
   let aborted = false
 
+  let isInitial = true
+
   async function tick() {
     if (!pollWhenHidden && document.hidden) return
-    loading.value = true
+    if (isInitial) loading.value = true
     try {
       const result = await fetchFn()
       if (!aborted) {
@@ -46,6 +48,7 @@ export function usePolling<T>(
         if (!deepEqual(data.value, result)) {
           data.value = result
         }
+        if (isInitial) isInitial = false
         error.value = null
       }
     } catch (e) {
