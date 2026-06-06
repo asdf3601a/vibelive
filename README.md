@@ -8,6 +8,12 @@ LiveStream Platform is a self-hosted live streaming server that ingests RTMP str
 - **Vue 3 frontend** — Stream dashboard, live player, recordings library
 - **nginx** — Reverse proxy, static file serving, HLS caching
 
+### Preview
+
+| Dashboard (live streams) | Player (multitrack stream) |
+|---|---|
+| ![Dashboard](preview-dashboard.png) | ![Player](preview-player.png) |
+
 ## 2. System Architecture
 
 ```
@@ -277,22 +283,22 @@ Return a recording thumbnail image. If the pre-generated thumbnail does not exis
 
 ### 3.5 Configuration (`config/`)
 
-Environment variables (all in `.env`):
+Environment variables (all in `.env`). Below are the code defaults and the `.env.example` template values:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RTMP_HOST` | `0.0.0.0` | RTMP listen address |
-| `RTMP_PORT` | 1935 | RTMP ingestion port |
-| `API_HOST` | `0.0.0.0` | API/HLS listen address |
-| `API_PORT` | 8080 | Internal API/HLS port (use 8081 in local dev when nginx listens on 8080) |
-| `MEDIA_DIR` | `./data` | Root for HLS, recordings, thumbnails |
-| `HLS_SEGMENT_DURATION` | 2 | Target segment duration in seconds |
-| `HLS_SEGMENTS_KEEP` | 10 | Number of segments retained in the playlist (sliding window) |
-| `RECORDING_ENABLED` | true | Enable MP4 recording |
-| `THUMBNAIL_SIZES` | `320,480` | Comma-separated thumbnail widths |
-| `THUMBNAIL_INTERVAL_SECONDS` | 10 | Minimum interval between thumbnail regenerations |
-| `RECORDINGS_BASE_URL` | `/recordings` | Base URL for recording links |
-| `STREAM_GRACE_PERIOD_SECONDS` | 30 | Reconnection grace period |
+| Variable | Code Default | `.env.example` | Description |
+|----------|-------------|----------------|-------------|
+| `RTMP_HOST` | `0.0.0.0` | `0.0.0.0` | RTMP listen address |
+| `RTMP_PORT` | 1935 | 1935 | RTMP ingestion port |
+| `API_HOST` | `0.0.0.0` | `0.0.0.0` | API/HLS listen address |
+| `API_PORT` | 8080 | 8081 | API/HLS port. `.env.example` uses 8081 for local dev (nginx occupies 8080). Docker Compose overrides to 8080. |
+| `MEDIA_DIR` | `./data` | `./data` | Root for HLS, recordings, thumbnails |
+| `HLS_SEGMENT_DURATION` | 2 | 4 | Target segment duration in seconds |
+| `HLS_SEGMENTS_KEEP` | 10 | 10 | Number of segments retained in the playlist (sliding window) |
+| `RECORDING_ENABLED` | true | true | Enable MP4 recording |
+| `THUMBNAIL_SIZES` | `320,480` | `320,480` | Comma-separated thumbnail widths |
+| `THUMBNAIL_INTERVAL_SECONDS` | 10 | 10 | Minimum interval between thumbnail regenerations |
+| `RECORDINGS_BASE_URL` | `/recordings` | `/recordings` | Base URL for recording links |
+| `STREAM_GRACE_PERIOD_SECONDS` | 30 | 30 | Reconnection grace period |
 
 ## 4. Frontend Architecture (`frontend/`)
 
@@ -419,10 +425,81 @@ cd frontend && npm run dev   # port 3000, proxies to localhost:8080
 
 ### 7.3 Docker Setup
 
-The project provides a split-container deployment via Docker Compose:
+The project provides a two-container deployment via Docker Compose, with nginx as a reverse proxy in front of the Rust server:
 
-- **`livestream-backend`** — Rust server (RTMP 1935 + API/HLS 8080)
-- **`livestream-nginx`** — nginx serving the Vue frontend and proxying `/api/`, `/hls/` to the backend
+```
+                        ┌──────────────────────────────────────┐
+                        │         Docker Network               │
+                        │                                      │
+                        │  ┌──────────────┐  ┌──────────────┐  │
+                        │  │  nginx:80    │  │  backend:8080 │  │
+Host:8080 ───HTTP──────▶│  │  /api/  ─────┼──▶│  Rust Server  │  │
+                        │  │  /hls/   ────┼──▶│  RTMP:1935    │  │
+Host:1935 ───RTMP──────▶│  │              │  │  HLS/API:8080 │  │
+                        │  │  /recordings/│  │              │  │
+                        │  │  /thumbnails/│  │  Volume:     │  │
+                        │  │  (static)    │  │  /data       │  │
+                        │  └──────┬───────┘  └──────┬───────┘  │
+                        │         │                  │          │
+                        │         └──────┐  ┌────────┘          │
+                        │           ./data volume mount          │
+                        └──────────────────────────────────────┘
+```
+
+- **`livestream-backend`** — Rust server (RTMP 1935 + API/HLS 8080). Built from `Dockerfile.backend` (multi-stage: `rust:1.95-slim` builder → `debian:bookworm-slim` runtime with ffmpeg).
+- **`livestream-nginx`** — nginx:alpine serving the Vue SPA from `/srv/frontend` and proxying `/api/`, `/hls/` to `http://backend:8080`. Built from `Dockerfile.nginx` (Node 22 build stage + `nginx:alpine`).
+
+**Container networking:**
+- No `expose` or `ports` are needed in Compose for inter-container communication — Docker Compose's default bridge network resolves service names (`backend`, `nginx`) automatically.
+- `backend` exposes port 1935 (RTMP) to the host, and port 8080 (API) is only exposed internally (accessible to `nginx` via hostname `backend:8080`).
+- `nginx` maps container port 80 to host port 8080.
+
+**nginx routing inside Docker:**
+
+| nginx location | Upstream / alias | Purpose |
+|----------------|------------------|---------|
+| `/`            | `/srv/frontend` (static) | Vue SPA with `try_files` fallback |
+| `/api/`        | `http://backend:8080` | REST API proxy |
+| `/hls/`        | `http://backend:8080` | HLS segment proxy (no-cache) |
+| `/recordings/` | `/data/recordings/` (static alias) | MP4 recordings |
+| `/thumbnails/` | `/data/thumbnails/` (static alias) | WebP thumbnails |
+
+**Port mapping (Docker):**
+
+| Host | Container | Service |
+|------|-----------|---------|
+| `1935` | `backend:1935` | RTMP ingestion |
+| `8080` | `nginx:80` | HTTP (SPA + API proxy + HLS + recordings + thumbnails) |
+
+Note: The backend's API port (8080) is **not** exposed to the host in Docker Compose. All HTTP access goes through nginx on port 8080.
+
+**Persistent data** (`./data` on host ↔ `/data` in containers):
+
+```
+./data/
+├── hls/           # HLS segments & playlists (auto-cleaned)
+├── recordings/    # MP4 files + index.json
+└── thumbnails/
+    ├── recordings/  # Recording WebP thumbnails
+    └── streams/     # Live stream WebP thumbnails
+```
+
+Both `backend` and `nginx` mount the same `./data` volume — `backend` writes to it (read-write), `nginx` reads from it (read-only).
+
+**Environment variables (Docker Compose):**
+
+Set in `docker-compose.yml` or via `.env`:
+
+```yaml
+RTMP_HOST=0.0.0.0
+RTMP_PORT=1935
+API_HOST=0.0.0.0
+API_PORT=8080    # 8080 is used inside Docker (nginx → backend:8080)
+MEDIA_DIR=/data
+RUST_LOG=info
+```
+
+Unlike local dev, Docker Compose uses `API_PORT=8080` because nginx is also containerized — there is no port conflict.
 
 ```bash
 # Build images and start containers
@@ -435,28 +512,6 @@ docker compose ps
 docker compose logs -f backend
 docker compose logs -f nginx
 ```
-
-**Port mapping (Docker):**
-
-| Host | Container | Service |
-|------|-----------|---------|
-| `1935` | `backend:1935` | RTMP ingestion |
-| `8080` | `nginx:80` | HTTP (SPA + API proxy + HLS proxy + recordings + thumbnails) |
-
-**Environment variables (Docker Compose):**
-
-Set in `docker-compose.yml` or via `.env`:
-
-```yaml
-RTMP_HOST=0.0.0.0
-RTMP_PORT=1935
-API_HOST=0.0.0.0
-API_PORT=8080
-MEDIA_DIR=/data
-RUST_LOG=info
-```
-
-For a single-image build (legacy multi-stage), use `Dockerfile.backend` with the frontend served separately.
 
 ## 8. Maintenance
 
