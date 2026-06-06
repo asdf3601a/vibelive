@@ -32,7 +32,7 @@ jobs:
         with:
           toolchain: stable
       - run: cargo build
-      - run: cargo test --lib -- --nocapture
+      - run: cargo test -- --nocapture
 
   frontend:
     name: Frontend Build
