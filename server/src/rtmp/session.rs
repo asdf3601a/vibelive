@@ -622,7 +622,7 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                                         let _ = hls.finalize_segment().await;
                                     }
                                     _ => {
-                                        let _ = hls.write_video(track.payload, ts, is_keyframe).await;
+                                        let _ = hls.write_video(track.payload, ts, is_keyframe, track.composition_time_offset).await;
                                     }
                                 }
                             }
@@ -637,7 +637,7 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                                     ctx.closed_video_tracks.insert(track.track_id);
                                 }
                                 _ => {
-                                    let _ = track_state.write_video(track.payload, ts, is_keyframe).await;
+                                    let _ = track_state.write_video(track.payload, ts, is_keyframe, track.composition_time_offset).await;
                                 }
                             }
                         }
@@ -672,7 +672,7 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                         notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
                     }
                     if let Some(ref mut hls) = ctx.hls_state {
-                        let _ = hls.write_video(remainder, ts, is_keyframe).await;
+                        let _ = hls.write_video(remainder, ts, is_keyframe, header.composition_time_offset).await;
                     }
                 }
                 crate::rtmp::enhanced::VideoPacketType::SequenceEnd => {
@@ -713,6 +713,15 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                 }
             } else if avc_packet_type == 1 {
                 // AVC NALU -> raw AVCC sample data
+                let composition_time_offset = if data.len() >= 5 {
+                    let ct_bytes: [u8; 3] = [data[2], data[3], data[4]];
+                    i32::from_be_bytes([
+                        if ct_bytes[0] & 0x80 != 0 { 0xFF } else { 0x00 },
+                        ct_bytes[0], ct_bytes[1], ct_bytes[2],
+                    ])
+                } else {
+                    0
+                };
                 if !ctx.discovered_tracks.contains(&0) {
                     ctx.discovered_tracks.insert(0);
                     let video_codec = ctx.track_video_codecs.get(&0).copied();
@@ -720,7 +729,7 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
                 }
                 if let Some(ref mut hls) = ctx.hls_state
-                    && let Err(e) = hls.write_video(remainder, ts, is_keyframe).await
+                    && let Err(e) = hls.write_video(remainder, ts, is_keyframe, composition_time_offset).await
                 {
                     tracing::warn!("HLS write_video failed: {}", e);
                 }
@@ -742,7 +751,7 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
             }
             let remainder = &data[1..];
             if let Some(ref mut hls) = ctx.hls_state {
-                let _ = hls.write_video(remainder, ts, is_keyframe).await;
+                let _ = hls.write_video(remainder, ts, is_keyframe, 0).await;
             }
         }
     }

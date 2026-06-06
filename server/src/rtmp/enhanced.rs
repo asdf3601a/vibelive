@@ -43,6 +43,7 @@ pub struct EnhancedVideoTrack<'a> {
     pub track_id: u32,
     pub codec: EnhancedVideoCodec,
     pub payload: &'a [u8],
+    pub composition_time_offset: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,7 @@ pub struct EnhancedVideoHeader {
     pub packet_type: VideoPacketType,
     pub frame_type: VideoFrameType,
     pub codec: EnhancedVideoCodec,
+    pub composition_time_offset: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,6 +184,7 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
                 packet_type,
                 frame_type,
                 codec: EnhancedVideoCodec::Unknown(0),
+                composition_time_offset: 0,
             }, &data[2..]));
         }
 
@@ -189,12 +192,16 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
         let fourcc = u32::from_be_bytes(fourcc_bytes);
         let codec = EnhancedVideoCodec::from_fourcc(fourcc);
 
+        let mut composition_time_offset = 0i32;
         let mut consumed = 6;
         if codec == EnhancedVideoCodec::Avc || codec == EnhancedVideoCodec::Hevc {
-            if data.len() < 9 {
-                return Err("data too short for avc/hevc header");
+            if packet_type == VideoPacketType::CodedFrames {
+                if data.len() < 9 {
+                    return Err("data too short for avc/hevc header");
+                }
+                composition_time_offset = read_composition_time(data, 6)?;
+                consumed = 9;
             }
-            consumed = 9;
         }
 
         let frame_type = if packet_type == VideoPacketType::SequenceStart {
@@ -207,6 +214,7 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
             packet_type,
             frame_type,
             codec,
+            composition_time_offset,
         }, &data[consumed..]));
     }
 
@@ -228,6 +236,7 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
             packet_type,
             frame_type,
             codec: EnhancedVideoCodec::Unknown(0),
+            composition_time_offset: 0,
         }, &data[1..]));
     }
 
@@ -235,11 +244,12 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
     let fourcc = u32::from_be_bytes(fourcc_bytes);
     let codec = EnhancedVideoCodec::from_fourcc(fourcc);
 
+    let mut composition_time_offset = 0i32;
     let mut consumed = 5;
     if packet_type == VideoPacketType::CodedFrames
         && (codec == EnhancedVideoCodec::Avc || codec == EnhancedVideoCodec::Hevc)
     {
-        read_composition_time(data, 5)?;
+        composition_time_offset = read_composition_time(data, 5)?;
         consumed = 8;
     }
 
@@ -247,6 +257,7 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
         packet_type,
         frame_type,
         codec,
+        composition_time_offset,
     }, &data[consumed..]))
 }
 
@@ -383,16 +394,18 @@ pub fn parse_enhanced_video_multitrack(data: &[u8]) -> Result<(MultitrackType, O
         // Per FFmpeg flvenc.c:1414-1415:
         // AVC/HEVC CodedFrames in multitrack have 3 leading CTS bytes
         // that must be stripped before the actual NAL data.
+        let mut track_cto = 0i32;
         if inner_packet_type == Some(VideoPacketType::CodedFrames)
             && (codec == EnhancedVideoCodec::Avc || codec == EnhancedVideoCodec::Hevc)
         {
             if payload.len() < 3 {
                 return Err("data too short for avc/hevc composition time");
             }
+            track_cto = read_composition_time(payload, 0)?;
             payload = &payload[3..];
         }
 
-        tracks.push(EnhancedVideoTrack { track_id, codec, payload });
+        tracks.push(EnhancedVideoTrack { track_id, codec, payload, composition_time_offset: track_cto });
 
         if multitrack_type == MultitrackType::OneTrack {
             break;
@@ -587,6 +600,7 @@ mod tests {
         let (header, remainder) = parse_enhanced_video_header(&data).unwrap();
         assert_eq!(header.packet_type, VideoPacketType::CodedFrames);
         assert_eq!(header.codec, EnhancedVideoCodec::Avc);
+        assert_eq!(header.composition_time_offset, 33);
         assert_eq!(remainder, &[0x67, 0x42, 0xC0]);
     }
 
@@ -713,6 +727,7 @@ mod tests {
         assert_eq!(inner_pt, Some(VideoPacketType::CodedFrames));
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].codec, EnhancedVideoCodec::Avc);
+        assert_eq!(tracks[0].composition_time_offset, 0x1234);
         // CTS bytes (0x00, 0x12, 0x34) must be stripped from payload
         assert_eq!(tracks[0].payload, nal_data.as_slice());
     }
@@ -751,6 +766,7 @@ mod tests {
         let (_header, remainder) = parse_enhanced_video_header(&data).unwrap();
         let (_mt, _inner_pt, tracks) = parse_enhanced_video_multitrack(remainder).unwrap();
         assert_eq!(tracks[0].codec, EnhancedVideoCodec::Hevc);
+        assert_eq!(tracks[0].composition_time_offset, -512);
         assert_eq!(tracks[0].payload, nal_data.as_slice());
     }
 
@@ -772,6 +788,7 @@ mod tests {
         assert_eq!(header.packet_type, VideoPacketType::Multitrack);
         let (_mt, _inner_pt, tracks) = parse_enhanced_video_multitrack(remainder).unwrap();
         assert_eq!(tracks[0].codec, EnhancedVideoCodec::Avc);
+        assert_eq!(tracks[0].composition_time_offset, 0);
         assert_eq!(tracks[0].payload, nal_data.as_slice());
     }
 
@@ -839,6 +856,8 @@ mod tests {
         assert_eq!(tracks.len(), 2);
         assert_eq!(tracks[0].codec, EnhancedVideoCodec::Avc);
         assert_eq!(tracks[1].codec, EnhancedVideoCodec::Avc);
+        assert_eq!(tracks[0].composition_time_offset, 1);
+        assert_eq!(tracks[1].composition_time_offset, 2);
         assert_eq!(tracks[0].payload, nal1.as_slice());
         assert_eq!(tracks[1].payload, nal2.as_slice());
     }

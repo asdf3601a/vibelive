@@ -140,7 +140,7 @@ impl HlsStreamState {
         Ok(())
     }
 
-    pub async fn write_video(&mut self, data: &[u8], timestamp: u32, is_keyframe: bool) -> anyhow::Result<()> {
+    pub async fn write_video(&mut self, data: &[u8], timestamp: u32, is_keyframe: bool, composition_time_offset: i32) -> anyhow::Result<()> {
         use std::borrow::Cow;
         if self.is_audio_only {
             return Ok(());
@@ -149,7 +149,7 @@ impl HlsStreamState {
             self.first_video_ts = Some(timestamp);
         }
         let base_ts = self.first_video_ts.unwrap_or(0);
-        let pts = (timestamp.saturating_sub(base_ts)) as u64 + self.timestamp_offset;
+        let dts = (timestamp.saturating_sub(base_ts)) as u64 + self.timestamp_offset;
 
         if !self.has_video {
             if !is_keyframe {
@@ -168,7 +168,7 @@ impl HlsStreamState {
                 })?;
             self.has_video = true;
             self.stream_started_at = Some(chrono::Utc::now());
-            self.current_segment_start = pts;
+            self.current_segment_start = dts;
             tracing::debug!("write_video: rotate_segment done, current_file={}", self.current_file.is_some());
         }
 
@@ -178,7 +178,7 @@ impl HlsStreamState {
                 return Ok(());
             }
             self.segment_index += 1;
-            self.current_segment_start = pts;
+            self.current_segment_start = dts;
             self.rotate_segment().await
                 .map_err(|e| {
                     tracing::error!(
@@ -190,17 +190,17 @@ impl HlsStreamState {
                 })?;
         }
 
-        let elapsed_since_start = pts.saturating_sub(self.current_segment_start);
+        let elapsed_since_start = dts.saturating_sub(self.current_segment_start);
         let threshold = self.segment_duration as u64 * 1000;
 
         if elapsed_since_start >= threshold && self.current_file.is_some() && !self.pending_rotation {
             self.pending_rotation = true;
-            self.pending_rotation_pts = pts;
+            self.pending_rotation_pts = dts;
         }
 
         if self.pending_rotation && is_keyframe {
             self.finalize_segment().await?;
-            self.current_segment_start = pts;
+            self.current_segment_start = dts;
             self.segment_index += 1;
             self.pending_rotation = false;
             self.rotate_segment().await?;
@@ -212,8 +212,9 @@ impl HlsStreamState {
             }
             _ => Cow::Borrowed(data),
         };
-        self.fmp4_muxer.add_video_sample(sample_data, pts, pts, is_keyframe);
-        self.last_video_pts = pts;
+        let pts = (dts as i64 + composition_time_offset as i64) as u64;
+        self.fmp4_muxer.add_video_sample(sample_data, dts, pts, is_keyframe);
+        self.last_video_pts = dts;
 
         // Update codec string cache when available
         if self.codec_string.is_none() {
@@ -531,7 +532,7 @@ mod tests {
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-        state.write_video(&nal, 0, true).await.unwrap();
+        state.write_video(&nal, 0, true, 0).await.unwrap();
 
         assert!(state.has_video);
         assert!(state.current_file.is_some());
@@ -553,7 +554,7 @@ mod tests {
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-        state.write_video(&nal, 0, true).await.unwrap();
+        state.write_video(&nal, 0, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
 
         let playlist = tokio::fs::read_to_string(state.playlist_path()).await.unwrap();
@@ -597,11 +598,11 @@ mod tests {
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
         // First frame at ts=0
-        state.write_video(&nal, 0, true).await.unwrap();
+        state.write_video(&nal, 0, true, 0).await.unwrap();
         assert_eq!(state.segment_index, 0);
 
         // Frame at ts=2500 (> 2s duration) triggers finalize + new segment
-        state.write_video(&nal, 2500, true).await.unwrap();
+        state.write_video(&nal, 2500, true, 0).await.unwrap();
         assert_eq!(state.segment_index, 1);
         assert!(tokio::fs::try_exists(state.segment_path(0)).await.unwrap_or(false));
         // New segment is still a temp file until it gets finalized
@@ -627,16 +628,16 @@ mod tests {
         let nal_key = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
         let nal_nonkey = vec![0x00, 0x00, 0x00, 0x04, 0x41, 0x88, 0x84, 0x00];
 
-        state.write_video(&nal_key, 0, true).await.unwrap();
+        state.write_video(&nal_key, 0, true, 0).await.unwrap();
         assert_eq!(state.segment_index, 0);
 
         // Time threshold exceeded but non-keyframe should NOT rotate yet
-        state.write_video(&nal_nonkey, 2500, false).await.unwrap();
+        state.write_video(&nal_nonkey, 2500, false, 0).await.unwrap();
         assert_eq!(state.segment_index, 0);
         assert!(state.pending_rotation);
 
         // Keyframe should trigger rotation
-        state.write_video(&nal_key, 2600, true).await.unwrap();
+        state.write_video(&nal_key, 2600, true, 0).await.unwrap();
         assert_eq!(state.segment_index, 1);
 
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
@@ -655,12 +656,12 @@ mod tests {
         let nal_key = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
         let nal_nonkey = vec![0x00, 0x00, 0x00, 0x04, 0x41, 0x88, 0x84, 0x00];
 
-        state.write_video(&nal_key, 0, true).await.unwrap();
+        state.write_video(&nal_key, 0, true, 0).await.unwrap();
         assert_eq!(state.segment_index, 0);
 
         // Write many non-keyframes well beyond target duration + max_extra
         for i in 1..=10 {
-            state.write_video(&nal_nonkey, i * 1000, false).await.unwrap();
+            state.write_video(&nal_nonkey, i * 1000, false, 0).await.unwrap();
         }
 
         // Segment should still not have rotated
@@ -685,7 +686,7 @@ mod tests {
         // Create 5 segments
         for i in 0..5 {
             let ts = i * 2500;
-            state.write_video(&nal, ts, true).await.unwrap();
+            state.write_video(&nal, ts, true, 0).await.unwrap();
         }
         state.finalize_segment().await.unwrap();
 
@@ -719,7 +720,7 @@ mod tests {
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-        state.write_video(&nal, 0, true).await.unwrap();
+        state.write_video(&nal, 0, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
 
         // .lock file should not exist after rename
@@ -743,7 +744,7 @@ mod tests {
         state.set_video_config(&avcc_config1, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-        state.write_video(&nal, 0, true).await.unwrap();
+        state.write_video(&nal, 0, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
 
         // init.mp4 should exist
@@ -752,7 +753,7 @@ mod tests {
         // Change video config
         let avcc_config2 = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x01];
         state.set_video_config(&avcc_config2, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
-        state.write_video(&nal, 2500, true).await.unwrap();
+        state.write_video(&nal, 2500, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
 
         // init_v1.mp4 should exist
@@ -775,13 +776,13 @@ mod tests {
         state.set_video_config(&avcc_config1, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-        state.write_video(&nal, 0, true).await.unwrap();
+        state.write_video(&nal, 0, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
 
         // Change video config to trigger discontinuity
         let avcc_config2 = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x01];
         state.set_video_config(&avcc_config2, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
-        state.write_video(&nal, 2500, true).await.unwrap();
+        state.write_video(&nal, 2500, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
 
         let playlist = tokio::fs::read_to_string(state.playlist_path()).await.unwrap();
@@ -801,7 +802,7 @@ mod tests {
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-        state.write_video(&nal, 0, true).await.unwrap();
+        state.write_video(&nal, 0, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
 
         let old_offset = state.timestamp_offset;
@@ -824,7 +825,7 @@ mod tests {
         state.set_video_config(&avcc_config, fmp4::VideoCodec::H264, 1920, 1080).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-        state.write_video(&nal, 0, true).await.unwrap();
+        state.write_video(&nal, 0, true, 0).await.unwrap();
         state.close().await.unwrap();
 
         let playlist = tokio::fs::read_to_string(state.playlist_path()).await.unwrap();
@@ -846,7 +847,7 @@ mod tests {
         state.set_audio_config(fmp4::AudioCodec::Aac, &aac_config).await.unwrap();
 
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
-        state.write_video(&nal, 0, true).await.unwrap();
+        state.write_video(&nal, 0, true, 0).await.unwrap();
         let aac = vec![0xAF, 0x01];
         state.write_audio(&aac, 0).await.unwrap();
         state.finalize_segment().await.unwrap();

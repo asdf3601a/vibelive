@@ -299,7 +299,8 @@ impl Fmp4Muxer {
         data.extend_from_slice(&[0u8; 10]);
         data.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]);
         data.extend_from_slice(&[0u8; 24]);
-        data.extend_from_slice(&2u32.to_be_bytes());
+        let max_track_id = if self.audio_codec.is_some() { 2 } else if self.video_codec.is_some() { 1 } else { 1 };
+        data.extend_from_slice(&(max_track_id + 1u32).to_be_bytes());
         write_fullbox(w, b"mvhd", 0, 0, &data);
     }
 
@@ -751,6 +752,7 @@ impl Fmp4Muxer {
     fn write_trun(&self, w: &mut Vec<u8>, track_id: u32, samples: &[Sample], data_offset: u32) {
         let is_video = track_id == 1;
         let has_cto = samples.iter().any(|s| s.composition_time_offset != 0);
+        let version: u8 = if has_cto { 1 } else { 0 };
 
         let mut flags: u32 = 0x000001;
         if is_video {
@@ -777,7 +779,7 @@ impl Fmp4Muxer {
             }
         }
 
-        write_fullbox(w, b"trun", 0, flags, &data);
+        write_fullbox(w, b"trun", version, flags, &data);
     }
 }
 
@@ -826,6 +828,56 @@ mod tests {
         assert!(init.windows(4).any(|w| w == b"mvhd"));
         assert!(init.windows(4).any(|w| w == b"trak"));
         assert!(init.windows(4).any(|w| w == b"mvex"));
+    }
+
+    fn read_mvhd_next_track_id(data: &[u8]) -> u32 {
+        // Walk top-level boxes, find moov, then walk moov children to find mvhd
+        let mut off = 0;
+        while off + 8 <= data.len() {
+            let box_size = u32::from_be_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
+            if off + box_size > data.len() { break; }
+            if &data[off+4..off+8] == b"moov" {
+                let moov_end = off + box_size;
+                let mut inner = off + 8;
+                while inner + 8 <= moov_end {
+                    let child_size = u32::from_be_bytes([data[inner], data[inner+1], data[inner+2], data[inner+3]]) as usize;
+                    if inner + child_size > moov_end { break; }
+                    if &data[inner+4..inner+8] == b"mvhd" {
+                        // next_track_ID is at offset 92 from FullBox data start
+                        let data_off = inner + 12; // skip size(4)+type(4)+version(1)+flags(3)
+                        return u32::from_be_bytes([data[data_off+92], data[data_off+93], data[data_off+94], data[data_off+95]]);
+                    }
+                    inner += child_size;
+                }
+            }
+            off += box_size;
+        }
+        panic!("mvhd not found");
+    }
+
+    #[test]
+    fn test_mvhd_next_track_id_video_audio() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H264, 1280, 720);
+        muxer.set_audio_codec(AudioCodec::Aac);
+        let init = muxer.init_segment();
+        assert_eq!(read_mvhd_next_track_id(&init), 3);
+    }
+
+    #[test]
+    fn test_mvhd_next_track_id_video_only() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H264, 1280, 720);
+        let init = muxer.init_segment();
+        assert_eq!(read_mvhd_next_track_id(&init), 2);
+    }
+
+    #[test]
+    fn test_mvhd_next_track_id_audio_only() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Aac);
+        let init = muxer.init_segment();
+        assert_eq!(read_mvhd_next_track_id(&init), 3);
     }
 
     #[test]
@@ -1108,6 +1160,49 @@ mod tests {
         let init = muxer.init_segment();
         assert!(init.windows(4).any(|w| w == b"hvc1"));
         assert!(init.windows(4).any(|w| w == b"hvcC"));
+    }
+
+    #[test]
+    fn test_trun_version_1_with_composition_offset() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
+        muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
+
+        // Sample with DTS=0, PTS=33  →  composition_time_offset=33
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 0, 33, true);
+
+        let frag = muxer.flush_combined_fragment().unwrap();
+
+        // Find trun version inside moof/traf
+        let (_type, moof_size, moof_data, _) = parse_box(&frag, 0).unwrap();
+        assert_eq!(_type, b"moof");
+        let mut off = moof_data;
+        while off < moof_size {
+            let (btype, bsize, bdata, _) = parse_box(&frag, off).unwrap();
+            if btype == b"traf" {
+                let traf_end = off + bsize;
+                let mut inner = bdata;
+                while inner < traf_end {
+                    let (it, _isize, idata, _) = parse_box(&frag, inner).unwrap();
+                    if it == b"trun" {
+                        let version = frag[idata];
+                        assert_eq!(version, 1, "trun version should be 1 when composition_time_offset is non-zero");
+                        // Check CTO flag is set (0x000800)
+                        let flags = u32::from_be_bytes([0, frag[idata+1], frag[idata+2], frag[idata+3]]);
+                        assert!(flags & 0x000800 != 0, "trun should have sample_composition_time_offset flag");
+                        // trun data: version(1)+flags(3)+sample_count(4)+data_offset(4)+first_flags(4)+entries
+                        // Each entry: sample_size(4)+composition_time_offset(4)
+                        // CTO is at data_offset+20 for video
+                        let cto = i32::from_be_bytes([frag[idata+20], frag[idata+21], frag[idata+22], frag[idata+23]]);
+                        assert_eq!(cto, 33);
+                        return;
+                    }
+                    inner += _isize;
+                }
+            }
+            off += bsize;
+        }
+        panic!("trun not found in moof");
     }
 
     #[test]
