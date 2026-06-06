@@ -379,10 +379,6 @@ pub fn ensure_av1_obu_size_fields(data: &[u8]) -> Vec<u8> {
             }
             scan = new_scan;
         } else {
-            let payload_start = scan + header_size;
-            if payload_start < data.len() {
-                return data.to_vec();
-            }
             needs_rewrite = true;
             break;
         }
@@ -586,8 +582,8 @@ pub fn build_dops(opus_head: &[u8]) -> Vec<u8> {
     dops.extend_from_slice(&gain.to_be_bytes());
     dops.push(family);
 
-    if family != 0 && head.len() > 10 {
-        dops.extend_from_slice(&head[10..]);
+    if family != 0 && head.len() > 11 {
+        dops.extend_from_slice(&head[11..]);
     }
 
     dops
@@ -659,6 +655,30 @@ mod tests {
         assert_eq!(av1c[2], 0x0C);
         assert_eq!(av1c[3], 0x00);
         assert_eq!(&av1c[4..], &obu[..]);
+    }
+
+    #[test]
+    fn test_ensure_av1_sizeless_sequence_header_obu() {
+        // Sequence Header OBU (obu_type=1) without size field: header 0x08
+        let obu = vec![
+            0x08,       // obu_type=1, obu_extension_flag=0, obu_has_size_field=0
+            0x00, 0x00, // arbitrary payload
+        ];
+        let result = ensure_av1_obu_size_fields(&obu);
+        assert!(result[0] & 0x02 != 0, "obu_has_size_field must be set after rewrite");
+        assert_ne!(result.len(), obu.len(), "result should differ from input (size field added)");
+        // Parse LEB128 size
+        let mut size = 0usize;
+        let mut shift = 0;
+        let mut pos = 1;
+        loop {
+            let byte = result[pos];
+            size |= ((byte & 0x7F) as usize) << shift;
+            pos += 1;
+            if byte & 0x80 == 0 { break; }
+            shift += 7;
+        }
+        assert_eq!(size, obu.len() - 1, "LEB128 size should equal original payload length");
     }
 
     #[test]

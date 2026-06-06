@@ -565,21 +565,21 @@ async fn handle_event(
     Ok(())
 }
 
-fn map_enhanced_video_codec(codec: crate::rtmp::enhanced::EnhancedVideoCodec) -> crate::hls::fmp4::VideoCodec {
+fn map_enhanced_video_codec(codec: crate::rtmp::enhanced::EnhancedVideoCodec) -> Option<crate::hls::fmp4::VideoCodec> {
     match codec {
-        crate::rtmp::enhanced::EnhancedVideoCodec::Av1 => crate::hls::fmp4::VideoCodec::AV1,
-        crate::rtmp::enhanced::EnhancedVideoCodec::Avc => crate::hls::fmp4::VideoCodec::H264,
-        crate::rtmp::enhanced::EnhancedVideoCodec::Hevc => crate::hls::fmp4::VideoCodec::H265,
-        _ => crate::hls::fmp4::VideoCodec::H264,
+        crate::rtmp::enhanced::EnhancedVideoCodec::Av1 => Some(crate::hls::fmp4::VideoCodec::AV1),
+        crate::rtmp::enhanced::EnhancedVideoCodec::Avc => Some(crate::hls::fmp4::VideoCodec::H264),
+        crate::rtmp::enhanced::EnhancedVideoCodec::Hevc => Some(crate::hls::fmp4::VideoCodec::H265),
+        _ => None,
     }
 }
 
-fn map_enhanced_audio_codec(codec: crate::rtmp::enhanced::EnhancedAudioCodec) -> crate::hls::fmp4::AudioCodec {
+fn map_enhanced_audio_codec(codec: crate::rtmp::enhanced::EnhancedAudioCodec) -> Option<crate::hls::fmp4::AudioCodec> {
     match codec {
-        crate::rtmp::enhanced::EnhancedAudioCodec::Opus => crate::hls::fmp4::AudioCodec::Opus,
-        crate::rtmp::enhanced::EnhancedAudioCodec::Flac => crate::hls::fmp4::AudioCodec::Flac,
-        crate::rtmp::enhanced::EnhancedAudioCodec::Aac => crate::hls::fmp4::AudioCodec::Aac,
-        _ => crate::hls::fmp4::AudioCodec::Aac,
+        crate::rtmp::enhanced::EnhancedAudioCodec::Opus => Some(crate::hls::fmp4::AudioCodec::Opus),
+        crate::rtmp::enhanced::EnhancedAudioCodec::Flac => Some(crate::hls::fmp4::AudioCodec::Flac),
+        crate::rtmp::enhanced::EnhancedAudioCodec::Aac => Some(crate::hls::fmp4::AudioCodec::Aac),
+        _ => None,
     }
 }
 
@@ -597,7 +597,10 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                                 if ctx.closed_video_tracks.contains(&track.track_id) {
                                     continue;
                                 }
-                            let codec = map_enhanced_video_codec(track.codec.clone());
+                            let Some(codec) = map_enhanced_video_codec(track.codec.clone()) else {
+                                tracing::warn!("Unsupported video codec {:?}, skipping track {}", track.codec, track.track_id);
+                                continue;
+                            };
                             let old_video_codec = ctx.track_video_codecs.insert(track.track_id, codec);
                             let is_new_video_codec = old_video_codec.is_none() || old_video_codec != Some(codec);
                             let is_new_track = !ctx.discovered_tracks.contains(&track.track_id);
@@ -648,7 +651,10 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     }
                 }
                 crate::rtmp::enhanced::VideoPacketType::SequenceStart => {
-                    let codec = map_enhanced_video_codec(header.codec);
+                    let Some(codec) = map_enhanced_video_codec(header.codec.clone()) else {
+                        tracing::warn!("Unsupported video codec {:?}, dropping SequenceStart", header.codec);
+                        return;
+                    };
                     let old_video_codec = ctx.track_video_codecs.insert(0, codec);
                     let is_new_video_codec = old_video_codec.is_none() || old_video_codec != Some(codec);
                     let is_new_track = !ctx.discovered_tracks.contains(&0);
@@ -782,7 +788,10 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                                 if ctx.closed_audio_tracks.contains(&track.track_id) {
                                     continue;
                                 }
-                            let codec = map_enhanced_audio_codec(track.codec.clone());
+                            let Some(codec) = map_enhanced_audio_codec(track.codec.clone()) else {
+                                tracing::warn!("Unsupported audio codec {:?}, skipping track {}", track.codec, track.track_id);
+                                continue;
+                            };
                             let old_audio_codec = ctx.track_audio_codecs.insert(track.track_id, codec);
                             let is_new_audio_codec = old_audio_codec.is_none() || old_audio_codec != Some(codec);
                             let is_new_track = !ctx.discovered_tracks.contains(&track.track_id);
@@ -831,7 +840,10 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     }
                 }
                 crate::rtmp::enhanced::AudioPacketType::SequenceStart => {
-                    let codec = map_enhanced_audio_codec(header.codec);
+                    let Some(codec) = map_enhanced_audio_codec(header.codec.clone()) else {
+                        tracing::warn!("Unsupported audio codec {:?}, dropping SequenceStart", header.codec);
+                        return;
+                    };
                     let old_audio_codec = ctx.track_audio_codecs.insert(0, codec);
                     let is_new_audio_codec = old_audio_codec.is_none() || old_audio_codec != Some(codec);
                     let is_new_track = !ctx.discovered_tracks.contains(&0);

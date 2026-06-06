@@ -451,11 +451,35 @@ impl Fmp4Muxer {
     fn write_stbl_audio(&self, w: &mut Vec<u8>) {
         let mut data = Vec::new();
         self.write_stsd_audio(&mut data);
+        if self.audio_codec == Some(AudioCodec::Opus) {
+            self.write_sgpd_opus(&mut data);
+        }
         self.write_empty_stbl_box(&mut data, b"stts");
         self.write_empty_stbl_box(&mut data, b"stsc");
         self.write_stsz(&mut data);
         self.write_empty_stbl_box(&mut data, b"stco");
         write_box(w, b"stbl", &data);
+    }
+
+    fn write_sgpd_opus(&self, w: &mut Vec<u8>) {
+        let roll_dist = self.opus_roll_distance();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"roll");
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&(roll_dist as u16).to_be_bytes());
+        write_fullbox(w, b"sgpd", 0, 0, &data);
+    }
+
+    fn opus_roll_distance(&self) -> i16 {
+        let Some(ref config) = self.audio_config else { return -1 };
+        let head = if config.len() > 8 && &config[..8] == b"OpusHead" {
+            &config[8..]
+        } else {
+            config.as_slice()
+        };
+        if head.len() < 12 { return -1; }
+        let pre_skip = u16::from_le_bytes([head[2], head[3]]);
+        -(pre_skip as i16)
     }
 
     fn write_empty_stbl_box(&self, w: &mut Vec<u8>, box_type: &[u8; 4]) {
@@ -561,30 +585,8 @@ impl Fmp4Muxer {
         data.extend_from_slice(&(self.audio_sample_rate << 16).to_be_bytes());
 
         if let Some(ref config) = self.audio_config {
-            if self.audio_codec != Some(AudioCodec::Aac) {
-                let esds_data = build_esds(config);
-                write_fullbox(&mut data, b"esds", 0, 0, &esds_data);
-            } else {
-                let mut esds_data = Vec::new();
-                esds_data.push(0x03);
-                esds_data.extend_from_slice(&[0x80, 0x80, 0x80, 0x25]);
-                esds_data.extend_from_slice(&1u16.to_be_bytes());
-                esds_data.push(0x00);
-                esds_data.push(0x04);
-                esds_data.extend_from_slice(&[0x80, 0x80, 0x80, 0x17]);
-                esds_data.push(0x40);
-                esds_data.push(0x15);
-                esds_data.extend_from_slice(&[0u8; 3]);
-                esds_data.extend_from_slice(&128000u32.to_be_bytes());
-                esds_data.extend_from_slice(&128000u32.to_be_bytes());
-                esds_data.push(0x05);
-                esds_data.extend_from_slice(&[0x80, 0x80, 0x80, 0x05]);
-                esds_data.extend_from_slice(config);
-                esds_data.push(0x06);
-                esds_data.extend_from_slice(&[0x80, 0x80, 0x80, 0x01]);
-                esds_data.push(0x02);
-                write_fullbox(&mut data, b"esds", 0, 0, &esds_data);
-            }
+            let esds_data = build_esds(config);
+            write_fullbox(&mut data, b"esds", 0, 0, &esds_data);
         } else {
             write_fullbox(&mut data, b"esds", 0, 0, &[]);
         }
@@ -694,6 +696,7 @@ impl Fmp4Muxer {
     fn compute_traf_size(&self, track_id: u32, samples: &[Sample]) -> usize {
         let is_video = track_id == 1;
         let has_cto = samples.iter().any(|s| s.composition_time_offset != 0);
+        let is_opus_audio = !is_video && self.audio_codec == Some(AudioCodec::Opus);
 
         let tfhd_size = 28;
         let mut trun_header = 12 + 4 + 4;
@@ -707,7 +710,8 @@ impl Fmp4Muxer {
         }
 
         let trun_size = trun_header + samples.len() * entry_size;
-        8 + tfhd_size + 20 + trun_size
+        let sbgp_size = if is_opus_audio { 28 } else { 0 };
+        8 + tfhd_size + 20 + sbgp_size + trun_size
     }
 
     fn write_mfhd(&self, w: &mut Vec<u8>, sequence_number: u32) {
@@ -717,6 +721,7 @@ impl Fmp4Muxer {
 
     fn write_traf(&self, w: &mut Vec<u8>, track_id: u32, base_dts: u64, samples: &[Sample], data_offset: u32) {
         let is_video = track_id == 1;
+        let is_opus_audio = !is_video && self.audio_codec == Some(AudioCodec::Opus);
         let (duration_scale, ts_scale) = if is_video {
             (self.video_timescale as u64, 1000u64)
         } else {
@@ -730,8 +735,20 @@ impl Fmp4Muxer {
         let mut traf_data = Vec::new();
         self.write_tfhd(&mut traf_data, track_id, scaled_duration, default_size, default_flags);
         self.write_tfdt(&mut traf_data, scaled_base_dts);
+        if is_opus_audio {
+            self.write_sbgp_opus(&mut traf_data, samples.len() as u32);
+        }
         self.write_trun(&mut traf_data, track_id, samples, data_offset);
         write_box(w, b"traf", &traf_data);
+    }
+
+    fn write_sbgp_opus(&self, w: &mut Vec<u8>, sample_count: u32) {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"roll");
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&sample_count.to_be_bytes());
+        data.extend_from_slice(&1u32.to_be_bytes());
+        write_fullbox(w, b"sbgp", 0, 0, &data);
     }
 
     fn write_tfhd(&self, w: &mut Vec<u8>, track_id: u32, default_duration: u32, default_size: u32, default_flags: u32) {

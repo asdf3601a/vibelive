@@ -40,8 +40,10 @@ pub struct HlsStreamState {
     // Wall-clock time mapping
     stream_started_at: Option<chrono::DateTime<chrono::Utc>>,
     segment_start_offsets: Vec<u64>,
-    // RFC 6381 codec string cache
+// RFC 6381 codec string cache
     codec_string: Option<String>,
+    // Actual max segment duration observed (ms), used for EXT-X-TARGETDURATION
+    max_segment_duration_ms: u64,
 }
 
 impl HlsStreamState {
@@ -83,6 +85,7 @@ impl HlsStreamState {
             stream_started_at: None,
             segment_start_offsets: Vec::new(),
             codec_string: None,
+            max_segment_duration_ms: 0,
         }
     }
 
@@ -229,11 +232,11 @@ impl HlsStreamState {
             self.first_audio_ts = Some(timestamp);
         }
         if !self.has_audio {
-            self.has_audio = true;
             if let Some(codec) = self.audio_codec {
                 self.fmp4_muxer.set_audio_codec(codec);
+                self.has_audio = true;
             } else {
-                self.fmp4_muxer.set_audio_codec(fmp4::AudioCodec::Aac);
+                return Ok(());
             }
         }
         if self.current_file.is_none() {
@@ -350,7 +353,9 @@ impl HlsStreamState {
                 self.segment_data.push(fragment);
 
                 let last_pts = self.last_video_pts.max(self.last_audio_pts);
-                let duration = ((last_pts + last_sample_duration).saturating_sub(self.current_segment_start)) as f64 / 1000.0;
+                let duration_ms = (last_pts + last_sample_duration).saturating_sub(self.current_segment_start);
+                self.max_segment_duration_ms = self.max_segment_duration_ms.max(duration_ms);
+                let duration = duration_ms as f64 / 1000.0;
                 self.segment_durations.push(duration.max(0.001));
                 self.segment_start_offsets.push(self.current_segment_start);
                 let prev_init = self.segment_init_versions.last().copied();
@@ -444,7 +449,8 @@ impl HlsStreamState {
         if let Some(ref codecs) = self.codec_string {
             playlist.push_str(&format!("#EXT-X-CODECS:{}\n", codecs));
         }
-        playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", self.segment_duration));
+        let target_duration = self.segment_duration.max(((self.max_segment_duration_ms + 999) / 1000) as u32);
+        playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration));
         playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", self.first_segment_index));
         playlist.push_str(&format!("#EXT-X-DISCONTINUITY-SEQUENCE:{}\n", self.discontinuity_sequence));
 
