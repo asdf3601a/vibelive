@@ -2,7 +2,7 @@ pub mod fmp4;
 
 use std::borrow::Cow;
 use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 
 pub struct HlsStreamState {
     stream_dir: PathBuf,
@@ -11,7 +11,7 @@ pub struct HlsStreamState {
     segment_duration: u32,
     current_segment_start: u64,
     segment_index: u32,
-    current_file: Option<tokio::fs::File>,
+    current_file: Option<BufWriter<tokio::fs::File>>,
     fmp4_muxer: fmp4::Fmp4Muxer,
     has_video: bool,
     has_audio: bool,
@@ -332,7 +332,7 @@ impl HlsStreamState {
         let tmp_path = path.with_extension("m4s.tmp");
         tracing::debug!("rotate_segment: creating tmp file at {:?}", tmp_path);
         let file = tokio::fs::File::create(&tmp_path).await?;
-        self.current_file = Some(file);
+        self.current_file = Some(BufWriter::with_capacity(64 * 1024, file));
         self.update_playlist().await?;
         tracing::debug!("rotate_segment: done, segment_index={}", self.segment_index);
         Ok(())
@@ -340,7 +340,7 @@ impl HlsStreamState {
 
     pub async fn finalize_segment(&mut self) -> anyhow::Result<()> {
         tracing::debug!("finalize_segment: current_file={}", self.current_file.is_some());
-        if let Some(mut file) = self.current_file.take() {
+        if let Some(mut writer) = self.current_file.take() {
             // Capture last sample duration before flush clears samples
             let last_sample_duration = if self.last_video_pts >= self.last_audio_pts {
                 self.fmp4_muxer.last_video_sample_duration()
@@ -349,7 +349,7 @@ impl HlsStreamState {
             };
             let has_fragment =             if let Some(fragment) = self.fmp4_muxer.flush_combined_fragment() {
                 tracing::debug!("finalize_segment: writing fragment of {} bytes", fragment.len());
-                file.write_all(&fragment).await?;
+                writer.write_all(&fragment).await?;
                 self.segment_data.push(fragment);
 
                 let last_pts = self.last_video_pts.max(self.last_audio_pts);
@@ -366,9 +366,9 @@ impl HlsStreamState {
             } else {
                 false
             };
-            file.flush().await?;
-            file.sync_all().await?;
-            drop(file);
+            writer.flush().await?;
+            writer.get_ref().sync_all().await?;
+            drop(writer);
 
             // Atomic rename: tmp -> final segment file
             let path = self.segment_path(self.segment_index);

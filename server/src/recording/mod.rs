@@ -57,7 +57,6 @@ pub struct Fmp4Recorder {
     init_written: bool,
     recording_time_offset: u64,
     last_tfdt: Option<u64>,
-    remuxed: bool,
 }
 
 impl Fmp4Recorder {
@@ -73,7 +72,6 @@ impl Fmp4Recorder {
             init_written: false,
             recording_time_offset: 0,
             last_tfdt: None,
-            remuxed: false,
         }
     }
 
@@ -85,7 +83,6 @@ impl Fmp4Recorder {
             // Init changed while file is open: close current and start new recording
             let _ = self.close().await;
             self.closed = false;
-            self.remuxed = false;
         }
 
         if self.init_written && self.file.is_some() {
@@ -101,8 +98,6 @@ impl Fmp4Recorder {
             ));
             let mut file = tokio::fs::File::create(&path).await?;
             file.write_all(init).await?;
-            file.flush().await?;
-            file.sync_all().await?;
             self.saved_path = Some(path);
             self.file = Some(file);
             self.last_tfdt = None;
@@ -134,8 +129,6 @@ impl Fmp4Recorder {
             }
 
             file.write_all(&segment).await?;
-            file.flush().await?;
-            file.sync_all().await?;
         }
         Ok(())
     }
@@ -150,19 +143,8 @@ impl Fmp4Recorder {
         self.last_init_hash = None;
         self.init_written = false;
 
-        if let Some(mut file) = self.file.take() {
-            file.flush().await?;
+        if let Some(file) = self.file.take() {
             file.sync_all().await?;
-        }
-
-        // Attempt to remux fMP4 into a regular MP4 so duration is visible in all players.
-        // This mirrors OBS's Hybrid MP4 "soft remux" concept.
-        if let Some(ref path) = self.saved_path && !self.remuxed {
-            if let Err(e) = remux_fmp4_to_mp4(path).await {
-                tracing::warn!("fMP4 remux failed for {}: {}", path.display(), e);
-            } else {
-                self.remuxed = true;
-            }
         }
 
         self.saved_path.clone().ok_or_else(|| {
@@ -201,49 +183,6 @@ pub struct RecordingEntry {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RecordingsIndex {
     pub recordings: Vec<RecordingEntry>,
-}
-
-/// Remux a fragmented MP4 into a regular MP4 with faststart so that the
-/// file duration is visible in standard players and file explorers.
-/// This follows the OBS Hybrid MP4 "soft remux" approach.
-async fn remux_fmp4_to_mp4(path: &std::path::Path) -> anyhow::Result<()> {
-    let tmp_path = path.with_extension("mp4.tmp");
-
-    let output = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            path.to_str().unwrap(),
-            "-c",
-            "copy",
-            "-strict",
-            "-2",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-            tmp_path.to_str().unwrap(),
-        ])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(anyhow::anyhow!("ffmpeg remux failed: {}", stderr));
-    }
-
-    let meta = tokio::fs::metadata(&tmp_path).await?;
-    if meta.len() == 0 {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(anyhow::anyhow!("ffmpeg produced empty output"));
-    }
-
-    tokio::fs::rename(&tmp_path, path).await?;
-    Ok(())
 }
 
 /// Probe video duration using ffprobe.
