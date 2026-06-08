@@ -23,6 +23,13 @@ RTMP_BASE="rtmp://localhost:1935/live"
 RESULTS_FILE=$(mktemp)
 trap 'rm -f "$RESULTS_FILE"' EXIT
 
+# ── Environment ────────────────────────────────────────────────────
+if [ -f .env ]; then
+    set -a
+    source .env
+    set +a
+fi
+
 # ── Defaults ───────────────────────────────────────────────────────
 VIDEO_CODECS="h264 hevc av1"
 AUDIO_CODECS="aac opus flac"
@@ -34,15 +41,16 @@ DEFAULT_VCODEC="h264"
 DEFAULT_ACODEC="aac"
 STREAM_DURATION=6
 ASPECTS="16:9"
+GRACE_WAIT=""
 
 # ── Help ───────────────────────────────────────────────────────────
 show_help() {
     cat <<'EOF'
-Usage: ./test_merged.sh [OPTIONS]
+Usage: ./test.sh [OPTIONS]
 
-Merged end-to-end test suite for livestream server.  Combines codec
+End-to-end test suite for livestream server.  Covers codec
 compatibility, resolution/aspect-ratio coverage, color-space validation,
-graceful-stop, reconnect, and HLS streaming tests.
+graceful-stop, reconnect, HLS streaming, and multitrack tests.
 
 Options:
   --video LIST    Comma-separated video codecs: h264,hevc,av1
@@ -55,7 +63,7 @@ Options:
                   (default: 16:9)
   --tests LIST    Comma-separated test suites:
                     codec      – video+audio codec matrix
-                    res        – resolution matrix (all resolutions × all aspects)
+                    res        – resolution matrix (full list with --full, else DEFAULT_RES × all aspects)
                     color      – color-space / HDR compatibility
                     graceful   – graceful stop & HLS cleanup
                     reconnect  – abnormal disconnect + reconnect
@@ -67,26 +75,28 @@ Options:
                     • codec matrix uses only 480p and 720p
                     • res matrix skips if codec already covers it
   --duration N    Stream duration in seconds for each test (default: 6)
+  --grace-wait N  Max seconds to wait for HLS cleanup in graceful-stop test
+                  (default: STREAM_GRACE_PERIOD_SECONDS from .env + 5, fallback 35)
   -h, --help      Show this help message
 
 Quick-start Examples:
   # Run everything in quick mode (recommended for CI)
-  ./test_merged.sh
+  ./test.sh
 
   # Full matrix: every codec × every audio × every resolution
-  ./test_merged.sh --full
+  ./test.sh --full
 
   # Test only AV1 and H.264 with AAC and Opus
-  ./test_merged.sh --video h264,av1 --audio aac,opus
+  ./test.sh --video h264,av1 --audio aac,opus
 
   # Validate non-16:9 aspect ratios across all resolutions
-  ./test_merged.sh --aspect 16:9,4:3,9:16 --tests res
+  ./test.sh --aspect 16:9,4:3,9:16 --tests res
 
   # Run only the color-space suite with 4-second streams
-  ./test_merged.sh --tests color --duration 4
+  ./test.sh --tests color --duration 4
 
   # Quick codec check for HEVC at 720p only
-  ./test_merged.sh --video hevc --res 720p --tests codec --duration 3
+  ./test.sh --video hevc --res 720p --tests codec --duration 3
 EOF
 }
 
@@ -125,6 +135,11 @@ while [[ $# -gt 0 ]]; do
         --duration)
             shift
             STREAM_DURATION="$1"
+            shift
+            ;;
+        --grace-wait)
+            shift
+            GRACE_WAIT="$1"
             shift
             ;;
         -h|--help)
@@ -604,10 +619,12 @@ run_graceful_stop_test() {
     local mp4_count
     mp4_count=$(count_recordings "$key")
 
-    # HLS cleanup happens in a background task after thumbnail generation.
-    # Poll for up to 15 seconds to allow it to complete.
+    # HLS cleanup happens after STREAM_GRACE_PERIOD_SECONDS in a background task.
+    # Poll up to GRACE_WAIT seconds to allow it to complete.
+    local grace_wait="${GRACE_WAIT:-$(( ${STREAM_GRACE_PERIOD_SECONDS:-30} + 5 ))}"
+    echo "  Grace period: ${STREAM_GRACE_PERIOD_SECONDS:-30}s, polling up to ${grace_wait}s"
     local hls_wait=0
-    while [ -d "$hls_dir" ] && [ "$hls_wait" -lt 15 ]; do
+    while [ -d "$hls_dir" ] && [ "$hls_wait" -lt "$grace_wait" ]; do
         sleep 1
         hls_wait=$((hls_wait + 1))
     done
@@ -1080,12 +1097,16 @@ PYEOF
 }
 
 # ── Main ───────────────────────────────────────────────────────────
-echo "=== Livestream Merged Test Suite ==="
+echo "=== Livestream Test Suite ==="
 echo "API:      $API_BASE"
 echo "RTMP:     $RTMP_BASE"
 echo "Video:    $VIDEO_CODECS"
 echo "Audio:    $AUDIO_CODECS"
-echo "Res:      $RESOLUTIONS"
+if [ "$FULL_MATRIX" -eq 1 ]; then
+    echo "Res:      $RESOLUTIONS"
+else
+    echo "Res:      $DEFAULT_RES (quick mode; full: $RESOLUTIONS)"
+fi
 echo "Aspect:   $ASPECTS"
 echo "Tests:    $TESTS"
 echo "Duration: ${STREAM_DURATION}s"

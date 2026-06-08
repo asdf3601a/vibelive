@@ -56,10 +56,10 @@ impl Config {
                 .unwrap_or_else(|_| "30".into())
                 .parse()?,
             recording_remux_enabled: env::var("RECORDING_REMUX_ENABLED")
-                .unwrap_or_else(|_| "false".into())
+                .unwrap_or_else(|_| "true".into())
                 .parse()?,
             recording_remux_concurrency: env::var("RECORDING_REMUX_CONCURRENCY")
-                .unwrap_or_else(|_| "2".into())
+                .unwrap_or_else(|_| "4".into())
                 .parse()?,
         })
     }
