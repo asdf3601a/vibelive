@@ -55,7 +55,7 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Session event loop (`ServerSession::handle_input`)
   - Event dispatch: `ConnectionRequested`, `PublishStreamRequested`, `VideoDataReceived`, `AudioDataReceived`, `StreamMetadataChanged`, `PublishStreamFinished`
   - **Grace period**: On disconnect, the stream enters a grace period (default 30s). If the publisher reconnects within the grace period, the existing `HlsStreamState` and `Fmp4Recorder` are resumed. Otherwise, the stream is finalized.
-- **`rtmp/enhanced.rs`** — Parses Enhanced RTMP headers (ExVideo/ExAudio, FFmpeg veovera format) to detect AV1, H.264, H.265, Opus, AAC, FLAC codecs. Supports **multitrack** streams (OBS/FFmpeg veovera v2 spec) with per-track codec detection and OneTrack / ManyTracks / ManyTracksManyCodecs layouts.
+- **`rtmp/enhanced.rs`** — Parses Enhanced RTMP headers (ExVideo/ExAudio, FFmpeg veovera format) to detect AV1, H.264, H.265 (HEVC), Opus, AAC, FLAC codecs. Supports **multitrack** streams (OBS/FFmpeg veovera v2 spec) with per-track codec detection and OneTrack / ManyTracks / ManyTracksManyCodecs layouts.
 - **`rtmp/mod.rs`** — `StreamManager` holds two `HashMap`s:
   - `publishers`: active publishers with metadata and a `tracks` array (track_id, hls_url, video_codec, audio_codec)
   - `pending_streams`: disconnected but grace-period-active streams
@@ -70,7 +70,7 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - **init.mp4 timing**: `write_init_segment()` is called inside `rotate_segment()`, ensuring init.mp4 is written when the first segment is created (after both video and audio configs have typically arrived). Init is atomically written via `init.mp4.tmp` → `rename()`.
   - **Resolution**: `set_video_config()` receives actual width/height from RTMP metadata (defaults 1920×1080). `update_video_resolution()` updates the muxer dimensions only; resolution-only changes do not trigger an init rewrite.
 - **`hls/fmp4/mod.rs`** — Low-level fMP4 (CMAF) muxer:
-  - Supports H.264, H.265, AV1 video + AAC, Opus audio
+  - Supports H.264, H.265 (HEVC), AV1 video + AAC, Opus, FLAC audio
   - Generates `init_segment()` (ftyp + moov), `flush_combined_fragment()` (moof + mdat)
   - Uses Sample tables with duration computation, composition time offsets, and proper `trex` defaults
 
@@ -80,6 +80,12 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Collects init segment + all flushed segments
   - On `close()`, concatenates into a single `.mp4` file (`{stream_key}_{YYYYMMDD}_{HHMMSS}.mp4`)
   - `write_index_json()` scans the recordings directory and writes `recordings/index.json` with metadata and thumbnail URLs
+- **`RemuxQueue`** — Optional background FFmpeg remux after recording finalization:
+  - Runs asynchronously after `recorder.close()` so stream shutdown is never blocked
+  - Uses `-movflags +faststart` to relocate moov to the front for maximum player compatibility
+  - Adds `-strict -2` for FLAC-in-MP4 compatibility (Debian Bookworm's FFmpeg)
+  - Concurrency controlled via `tokio::sync::Semaphore` (`RECORDING_REMUX_CONCURRENCY`, default 4)
+  - Configurable via `RECORDING_REMUX_ENABLED` (default true) — no remux performed when disabled (file is already a valid fragmented MP4 with moov at front)
 - **`thumbnail.rs`** — Thumbnail generation using ffmpeg:
   - **Live thumbnails**: Concatenates `init.mp4` + latest `segment*.m4s` into a temp MP4, then runs ffmpeg
   - **Recording thumbnails**: Directly from the finalized MP4
@@ -299,6 +305,8 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
 | `THUMBNAIL_INTERVAL_SECONDS` | 10 | 10 | Minimum interval between thumbnail regenerations |
 | `RECORDINGS_BASE_URL` | `/recordings` | `/recordings` | Base URL for recording links |
 | `STREAM_GRACE_PERIOD_SECONDS` | 30 | 30 | Reconnection grace period |
+| `RECORDING_REMUX_ENABLED` | true | true | Background FFmpeg remux (faststart) on finalized recordings |
+| `RECORDING_REMUX_CONCURRENCY` | 4 | 4 | Max concurrent remux tasks |
 
 ## 4. Frontend Architecture (`frontend/`)
 
@@ -363,7 +371,7 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
 
 1. **Publish**: OBS/ffmpeg pushes RTMP to `:1935/live/{stream_key}`
 2. **Handshake**: `rtmp/server.rs` accepts TCP, `session.rs` performs RTMP handshake
-3. **Codec detection**: `enhanced.rs` parses video/audio headers → determines codec (H.264/AV1/Opus/AAC)
+3. **Codec detection**: `enhanced.rs` parses video/audio headers → determines codec (H.264/HEVC/AV1 for video, AAC/Opus/FLAC for audio)
 4. **HLS muxing**: `HlsStreamState` receives video/audio frames → `fmp4/mod.rs` builds init.mp4 + segments. For multitrack streams, additional `HlsStreamState` instances are created per track_id under `track_N/`.
 5. **Playlist update**: `update_playlist()` writes `index.m3u8` (default track) and `track_N/index.m3u8` (per-track). A `master.m3u8` aggregates all track playlists.
 6. **Playback**: Browser loads `/hls/{key}/index.m3u8` (default) or `/hls/{key}/track_1/index.m3u8` (track 1) via nginx → hls.js fetches init.mp4 + segments
@@ -645,6 +653,7 @@ The project includes a unified test script `./test.sh` that covers codec compati
 - `--aspect LIST` — `16:9`, `4:3`, `1:1`, `21:9`, `9:16`, `3:4`
 - `--full` — Full Cartesian product for codec/res matrices
 - `--duration N` — Stream duration per test in seconds (default: 6)
+- `--grace-wait N` — Max seconds to wait for HLS cleanup in graceful-stop test (default: `STREAM_GRACE_PERIOD_SECONDS` from `.env` + 5, fallback 35)
 - `-h, --help` — Show usage and examples
 
 ### 9.3 Manual Testing with ffmpeg
