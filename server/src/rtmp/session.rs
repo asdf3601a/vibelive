@@ -264,6 +264,7 @@ if let Some(ref mut r) = recorder {
             let base_url = app_state.config.recordings_base_url.clone();
             let key = stream_key.to_string();
             let app_state = Arc::clone(app_state);
+            let remux_path = mp4_path.clone();
             tokio::spawn(async move {
                 let thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("recordings");
                 if let Err(e) = crate::thumbnail::generate_thumbnails_for_file(&mp4_path, &thumb_dir, &sizes).await {
@@ -272,6 +273,8 @@ if let Some(ref mut r) = recorder {
                 if let Err(e) = crate::recording::write_index_json(&media_dir, &base_url, &sizes).await {
                     tracing::warn!("write_index_json failed for {}: {}", key, e);
                 }
+                // Background remux (non-blocking, concurrency-limited)
+                app_state.remux_queue.enqueue(remux_path);
                 // Only clean up HLS files if no new publisher has taken over
                 let sm = app_state.stream_manager.read().await;
                 let still_in_use = sm.is_live_or_pending(&key);

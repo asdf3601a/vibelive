@@ -16,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 pub struct AppState {
     pub stream_manager: RwLock<rtmp::StreamManager>,
     pub config: config::Config,
+    pub remux_queue: Arc<recording::RemuxQueue>,
 }
 
 #[tokio::main]
@@ -30,6 +31,10 @@ async fn main() -> anyhow::Result<()> {
     let app_state = Arc::new(AppState {
         stream_manager: RwLock::new(rtmp::StreamManager::new()),
         config: cfg.clone(),
+        remux_queue: Arc::new(recording::RemuxQueue::new(
+            cfg.recording_remux_enabled,
+            cfg.recording_remux_concurrency as usize,
+        )),
     });
 
     let rtmp_addr: SocketAddr = format!("{}:{}", cfg.rtmp_host, cfg.rtmp_port).parse()?;

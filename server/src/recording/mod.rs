@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -183,6 +184,83 @@ pub struct RecordingEntry {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RecordingsIndex {
     pub recordings: Vec<RecordingEntry>,
+}
+
+/// Remux a fragmented MP4 into a regular MP4 with faststart.
+/// The input file is replaced atomically (tmp + rename).
+async fn remux_fmp4_to_mp4(path: &std::path::Path) -> anyhow::Result<()> {
+    let tmp_path = path.with_extension("mp4.tmp");
+
+    let output = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-strict",
+            "-2",
+            "-i",
+            path.to_str().unwrap(),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            tmp_path.to_str().unwrap(),
+        ])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(anyhow::anyhow!("ffmpeg remux failed: {}", stderr));
+    }
+
+    let meta = tokio::fs::metadata(&tmp_path).await?;
+    if meta.len() == 0 {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(anyhow::anyhow!("ffmpeg produced empty output"));
+    }
+
+    tokio::fs::rename(&tmp_path, path).await?;
+    Ok(())
+}
+
+/// A concurrency-limited background queue for FFmpeg remux jobs.
+/// Acquires a semaphore permit before running ffmpeg, limiting simultaneous
+/// remux operations to the configured concurrency.
+pub struct RemuxQueue {
+    semaphore: tokio::sync::Semaphore,
+    enabled: bool,
+}
+
+impl RemuxQueue {
+    pub fn new(enabled: bool, concurrency: usize) -> Self {
+        Self {
+            semaphore: tokio::sync::Semaphore::new(concurrency.max(1)),
+            enabled,
+        }
+    }
+
+    /// Enqueue a recording for background remuxing.
+    /// If remux is disabled or concurrency is zero, this is a no-op.
+    /// Returns immediately; the actual remux runs in a spawned task.
+    pub fn enqueue(self: &Arc<Self>, path: PathBuf) {
+        if !self.enabled {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let permit = this.semaphore.acquire().await;
+            tracing::info!("Remuxing recording: {}", path.display());
+            if let Err(e) = remux_fmp4_to_mp4(&path).await {
+                tracing::warn!("Remux failed for {}: {}", path.display(), e);
+            }
+            drop(permit);
+        });
+    }
 }
 
 /// Probe video duration using ffprobe.

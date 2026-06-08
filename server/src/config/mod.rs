@@ -14,6 +14,8 @@ pub struct Config {
     pub thumbnail_interval_seconds: u32,
     pub recordings_base_url: String,
     pub stream_grace_period_seconds: u64,
+    pub recording_remux_enabled: bool,
+    pub recording_remux_concurrency: u32,
 }
 
 impl Config {
@@ -52,6 +54,12 @@ impl Config {
                 .unwrap_or_else(|_| "/recordings".into()),
             stream_grace_period_seconds: env::var("STREAM_GRACE_PERIOD_SECONDS")
                 .unwrap_or_else(|_| "30".into())
+                .parse()?,
+            recording_remux_enabled: env::var("RECORDING_REMUX_ENABLED")
+                .unwrap_or_else(|_| "false".into())
+                .parse()?,
+            recording_remux_concurrency: env::var("RECORDING_REMUX_CONCURRENCY")
+                .unwrap_or_else(|_| "2".into())
                 .parse()?,
         })
     }
