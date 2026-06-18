@@ -198,6 +198,8 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       hls.loadSource(url)
       hls.attachMedia(videoRef.value)
       hlsInstance = hls
+
+      videoRef.value.play().catch(() => {})
     } else if (videoRef.value.canPlayType('application/vnd.apple.mpegurl')) {
       videoRef.value.src = url
     } else {
