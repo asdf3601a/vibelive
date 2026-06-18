@@ -364,6 +364,7 @@ currentHlsLevel,
   attachVideoEvents,
   detachVideoEvents,
   destroy,
+  requestAutoplayPermission,
 } = usePlayer({ enableKeyboard: true })
 
 // Sync tracks from props to composable
@@ -436,6 +437,12 @@ onMounted(() => {
     loadSource(props.src, props.isLive, true)
   }
   containerRef.value?.focus()
+
+  // First user interaction → proactively request autoplay permission
+  function onInteraction() {
+    requestAutoplayPermission()
+  }
+  containerRef.value?.addEventListener('pointerdown', onInteraction, { once: true })
 })
 
 onUnmounted(() => {

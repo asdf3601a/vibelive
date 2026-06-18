@@ -31,6 +31,8 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   const isMuted = ref(false)
   const displayVolume = ref(volume.value)
   const volumeBoostEnabled = ref(localStorage.getItem('player_volume_boost') === 'true')
+  const autoplayAllowed = ref(false)
+
   let audioCtx: AudioContext | null = null
   let gainNode: GainNode | null = null
   let audioBoostConnected = false
@@ -199,7 +201,12 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       hls.attachMedia(videoRef.value)
       hlsInstance = hls
 
-      videoRef.value.play().catch(() => {})
+      const video = videoRef.value
+      if (autoplayAllowed.value) {
+        video.muted = false
+        isMuted.value = false
+      }
+      video.play().catch(() => {})
     } else if (videoRef.value.canPlayType('application/vnd.apple.mpegurl')) {
       videoRef.value.src = url
     } else {
@@ -363,6 +370,18 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
     const jumped = Math.round(Math.abs(currentTime.value - prev))
     if (jumped > 0) {
       showSeekIndicator(dir, jumped)
+    }
+  }
+
+  async function requestAutoplayPermission() {
+    if (autoplayAllowed.value) return
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
+      await ctx.resume()
+      ctx.close()
+      autoplayAllowed.value = true
+    } catch {
+      /* permission not granted, fallback to muted autoplay */
     }
   }
 
@@ -893,5 +912,7 @@ currentHlsLevel,
     attachVideoEvents,
     detachVideoEvents,
     destroy,
+    autoplayAllowed,
+    requestAutoplayPermission,
   }
 }
