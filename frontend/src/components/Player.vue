@@ -383,7 +383,7 @@ watch(() => props.muted, (val) => {
     if (videoRef.value) videoRef.value.muted = false
     isMuted.value = false
   }
-})
+}, { immediate: true })
 
 watch(() => props.initialLoopA, (val) => {
   if (val != null) loopA.value = val
