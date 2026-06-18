@@ -333,10 +333,12 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
 - **Two-stage updates**: The Recordings page shows a "有新的錄影可查看 / Refresh" toast instead of abruptly re-rendering the list.
 - **Player**: `Player.vue` uses a custom overlay player powered by `usePlayer()` composable:
   - **Playback**: Play/pause, seek via progress bar with drag preview, keyboard shortcuts (`Space`/`K`/`J`/`L`/arrows/`F`/`M`), touch gestures (double-tap left/right edges to seek). Supports both HLS (via hls.js) and direct MP4 playback.
-  - **Volume**: 6-stage icon (mute → 1–25% → 25–50% → 50–75% → 75–100% → 100–150% boost), inline horizontal slider, mouse-wheel control, capsule container.
+  - **Autoplay**: On page load, the video autoplays **muted** (browser policy requirement). After hls.js initializes, `video.play()` is called explicitly since the browser's `autoplay` attribute does not reliably trigger playback with MediaSource across browsers. On the first user interaction (`pointerdown` on the player), an `AudioContext` is created and resumed via `requestAutoplayPermission()` to proactively request autoplay permission. If granted (`autoplayAllowed = true`), subsequent source changes (track switch, reconnect) play with **audio unmuted** from the start. If permission is denied, the player falls back to muted autoplay.
+  - **Volume**: 6-stage icon (mute → 1–25% → 25–50% → 50–75% → 75–100% → 100–150% boost), inline horizontal slider, mouse-wheel control, capsule container. User's volume preference is persisted to `localStorage` and applied to the video element on every metadata load (`v.volume = Math.min(1, volume.value)`), preventing the browser default (1.0) from overwriting the saved value.
+  - **Mute state**: The `isMuted` ref is synced with the `muted` prop on mount via `{ immediate: true }` watcher, ensuring the volume icon matches the video's actual muted state. `setVolume()` sets both `video.muted` and the `isMuted` ref atomically.
   - **Speed**: Discrete slider (0.25x–16x) with wheel control, pitch preservation, speed badge in control bar.
   - **A-B Loop** (recordings only): Set point A / point B, then choose loop on/off. When enabled and A is set, playback seeks to A on play; when B is set, it stops/loops at B. Shareable via URL (`&loopA=&loopB=&loop=true`).
-  - **Quality**: Multitrack track selector (right side, only visible when multiple tracks are available).
+  - **Quality**: Multitrack track selector (right side, only visible when multiple tracks are available). Track switching emits `trackChange` to the parent, which updates `props.src`, triggering a single `loadSource` call via watcher — eliminating duplicate HLS initialization.
   - **Debug overlay**: Toggleable horizontal stats bar showing time, resolution, volume, speed, dropped frames, HLS bandwidth estimate, buffer length, live latency, and active track.
   - **Live indicator**: Red pulsing dot when at live edge → grey when behind → click to catch up. Configurable threshold in settings.
   - **Seek indicator**: Floating `+N`/`−N` badge on seek via keyboard/touch.
@@ -592,6 +594,8 @@ Key metrics to monitor:
 | Stream thumbnails show spinner forever | Stream too short for ffmpeg to generate a thumbnail before it ends | This is expected for very short streams (< 3s); recording thumbnails are generated after finalization |
 | API_PORT conflict | Port 8080 already used | Set `API_PORT=8081` in `.env` and update nginx upstream |
 | Recordings not appearing in list | `index.json` stale | Restart server or trigger a new recording finalization |
+| No audio during live stream (player shows unmuted icon) | `video.muted` never reset when unmuting via UI | Fixed in `badbc80`: `setVolume()` now sets `video.muted = clamped === 0`; Player template removed `:muted` binding to prevent Vue re-setting muted on re-render |
+| Player does not autoplay on page load | hls.js MediaSource does not honor HTML `autoplay` attribute reliably | Fixed in `0c017a0`: explicit `video.play()` call after hls.js setup, plus proactive `AudioContext.resume()` on first interaction |
 
 ## 9. Testing
 
