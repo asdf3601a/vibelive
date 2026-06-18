@@ -17,7 +17,6 @@
         ref="videoRef"
         class="absolute inset-0 w-full h-full object-contain bg-black"
         :autoplay="autoplay"
-        :muted="muted"
         :poster="poster"
         playsinline
         preload="auto"

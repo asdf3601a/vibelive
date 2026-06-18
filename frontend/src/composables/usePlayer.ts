@@ -418,6 +418,8 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
     const video = videoRef.value
     if (!video) return
 
+    video.muted = clamped === 0
+
     if (clamped > 1) {
       if (!audioBoostConnected) setupAudioBoost()
       if (gainNode && audioCtx) {
