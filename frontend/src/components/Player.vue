@@ -373,7 +373,7 @@ watch(() => props.tracks, (val) => {
 
 watch(() => props.src, (val) => {
   loadSource(val, props.isLive)
-}, { immediate: true })
+})
 
 watch(() => props.muted, (val) => {
   if (val) {
@@ -420,10 +420,6 @@ function onSpeedWheel(e: WheelEvent) {
 
 function handleTrackSelect(trackId: number) {
   activeTrackId.value = trackId
-  const track = props.tracks?.find(t => t.track_id === trackId)
-  if (track?.hls_url) {
-    loadSource(track.hls_url, props.isLive)
-  }
   emit('trackChange', trackId)
 }
 

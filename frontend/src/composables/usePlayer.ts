@@ -669,7 +669,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
     duration.value = v.duration || 0
     videoWidth.value = v.videoWidth || 0
     videoHeight.value = v.videoHeight || 0
-    volume.value = v.volume
+    v.volume = Math.min(1, volume.value)
     setPlaybackRate(playbackRate.value)
     state.value = 'playing'
 
