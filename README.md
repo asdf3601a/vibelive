@@ -86,15 +86,18 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Adds `-strict -2` for FLAC-in-MP4 compatibility (Debian Bookworm's FFmpeg)
   - Concurrency controlled via `tokio::sync::Semaphore` (`RECORDING_REMUX_CONCURRENCY`, default 4)
   - Configurable via `RECORDING_REMUX_ENABLED` (default true) — no remux performed when disabled (file is already a valid fragmented MP4 with moov at front)
-- **`thumbnail.rs`** — Thumbnail generation using ffmpeg:
-  - **Live thumbnails**: Concatenates `init.mp4` + latest `segment*.m4s` into a temp MP4, then runs ffmpeg
-  - **Recording thumbnails**: Directly from the finalized MP4
-  - **Atomic writes**: ffmpeg writes to `{output}.webp.tmp`, then renames to `{output}.webp` only after success. nginx never serves a partially-written file.
-  - Uses `scale={width}:-1` maintaining aspect ratio
-  - Output format: **WebP** (`-q:v 75`)
-  - **Cleanup**: Live stream thumbnails are deleted when the stream ends; recording thumbnails persist indefinitely.
 
-### 3.4 API (`api/`)
+### 3.4 Thumbnails (`thumbnail.rs`)
+
+Top-level module at `server/src/thumbnail.rs`, using ffmpeg for WebP thumbnail generation:
+- **Live thumbnails**: Concatenates `init.mp4` + latest `segment*.m4s` into a temp MP4, then runs ffmpeg
+- **Recording thumbnails**: Directly from the finalized MP4
+- **Atomic writes**: ffmpeg writes to `{output}.webp.tmp`, then renames to `{output}.webp` only after success. nginx never serves a partially-written file.
+- Uses `scale={width}:-1` maintaining aspect ratio
+- Output format: **WebP** (`-q:v 75`)
+- **Cleanup**: Live stream thumbnails are deleted when the stream ends; recording thumbnails persist indefinitely.
+
+### 3.5 API (`api/`)
 
 Axum router with these endpoints:
 
@@ -287,7 +290,7 @@ Return a recording thumbnail image. If the pre-generated thumbnail does not exis
 
 **Response (500 Internal Server Error):** Thumbnail generation or read failed.
 
-### 3.5 Configuration (`config/`)
+### 3.6 Configuration (`config/`)
 
 Environment variables (all in `.env`). Below are the code defaults and the `.env.example` template values:
 
@@ -347,7 +350,7 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
   - Displays a loading spinner placeholder (gray background + animated spinner) while the image is not yet available.
   - If the image fails to load, auto-retries every 5 seconds up to 12 retries.
   - Uses `?_retry={tick}` cache-busting query parameter so the browser does not cache the 404 response.
-  - Once the thumbnail file is written atomically (see atomic writes in 3.3), the next retry succeeds and the placeholder is replaced by the actual image.
+  - Once the thumbnail file is written atomically (see atomic writes in 3.4), the next retry succeeds and the placeholder is replaced by the actual image.
   - Stream thumbnails are cleaned up when the stream ends; recording thumbnails persist indefinitely.
 
 ### 4.4 API Client
@@ -795,7 +798,7 @@ Keep the same filename (`icon.svg`) for a seamless swap. The file is served as a
 GitHub Actions (`.github/workflows/ci.yml`):
 
 1. **Check & Lint** — `cargo check`, `cargo clippy`, `cargo fmt --check`
-2. **Tests** — `cargo test --lib`
+2. **Tests** — `cargo test -- --nocapture`
 3. **Frontend Build** — `npm ci && npm run build`
 4. **Docker Build** — `docker build`
 

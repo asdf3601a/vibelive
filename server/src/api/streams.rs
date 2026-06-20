@@ -1,4 +1,9 @@
-use axum::{Json, extract::{State, Path}, response::IntoResponse, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,7 +23,10 @@ pub struct StreamResponse {
     pub tracks: Vec<crate::rtmp::TrackInfo>,
 }
 
-fn build_stream_response(info: &crate::rtmp::PublisherInfo, thumbnail_sizes: &[u32]) -> StreamResponse {
+fn build_stream_response(
+    info: &crate::rtmp::PublisherInfo,
+    thumbnail_sizes: &[u32],
+) -> StreamResponse {
     let hls_url = Some(format!("/hls/{}/index.m3u8", info.stream_key));
     let player_url = Some(format!("/live/{}", info.stream_key));
 
@@ -29,7 +37,8 @@ fn build_stream_response(info: &crate::rtmp::PublisherInfo, thumbnail_sizes: &[u
             format!("/thumbnails/streams/{}_w{}.webp", info.stream_key, width),
         );
     }
-    let thumbnail_url = thumbnail_sizes.first()
+    let thumbnail_url = thumbnail_sizes
+        .first()
         .map(|w| format!("/thumbnails/streams/{}_w{}.webp", info.stream_key, w))
         .unwrap_or_default();
 
@@ -46,35 +55,34 @@ fn build_stream_response(info: &crate::rtmp::PublisherInfo, thumbnail_sizes: &[u
     }
 }
 
-pub async fn list(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sm = state.stream_manager.read().await;
     let sizes = state.config.thumbnail_sizes.clone();
     let media_dir = state.config.media_dir.clone();
     let interval = state.config.thumbnail_interval_seconds;
 
-    let mut streams: Vec<StreamResponse> = sm.publishers().values().map(|info| {
-        // Fire-and-forget thumbnail generation so static files exist for nginx
-        let key = info.stream_key.clone();
-        let md = media_dir.clone();
-        let sz = sizes.clone();
-        let iv = interval;
-        tokio::spawn(async move {
-            let _ = crate::thumbnail::generate_thumbnails_for_stream(&md, &key, &sz, iv).await;
-        });
-        build_stream_response(info, &sizes)
-    }).collect();
+    let mut streams: Vec<StreamResponse> = sm
+        .publishers()
+        .values()
+        .map(|info| {
+            // Fire-and-forget thumbnail generation so static files exist for nginx
+            let key = info.stream_key.clone();
+            let md = media_dir.clone();
+            let sz = sizes.clone();
+            let iv = interval;
+            tokio::spawn(async move {
+                let _ = crate::thumbnail::generate_thumbnails_for_stream(&md, &key, &sz, iv).await;
+            });
+            build_stream_response(info, &sizes)
+        })
+        .collect();
 
     streams.sort_by(|a, b| a.stream_key.cmp(&b.stream_key));
 
     (StatusCode::OK, Json(serde_json::json!(streams)))
 }
 
-pub async fn get(
-    State(state): State<Arc<AppState>>,
-    Path(key): Path<String>,
-) -> impl IntoResponse {
+pub async fn get(State(state): State<Arc<AppState>>, Path(key): Path<String>) -> impl IntoResponse {
     let sm = state.stream_manager.read().await;
     match sm.get_publisher(&key) {
         Some(info) => {
@@ -84,11 +92,21 @@ pub async fn get(
             let iv = state.config.thumbnail_interval_seconds;
             let stream_key = key.clone();
             tokio::spawn(async move {
-                let _ = crate::thumbnail::generate_thumbnails_for_stream(&md, &stream_key, &sz, iv).await;
+                let _ = crate::thumbnail::generate_thumbnails_for_stream(&md, &stream_key, &sz, iv)
+                    .await;
             });
 
-            (StatusCode::OK, Json(serde_json::json!(build_stream_response(info, &state.config.thumbnail_sizes))))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!(build_stream_response(
+                    info,
+                    &state.config.thumbnail_sizes
+                ))),
+            )
         }
-        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Stream not found"}))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Stream not found"})),
+        ),
     }
 }

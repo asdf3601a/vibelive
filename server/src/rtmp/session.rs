@@ -1,14 +1,16 @@
-use std::sync::Arc;
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::collections::{HashMap, HashSet};
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
-use rml_rtmp::sessions::{ServerSession, ServerSessionConfig, ServerSessionResult, ServerSessionEvent};
 use crate::AppState;
 use crate::hls::HlsStreamState;
 use crate::recording::Fmp4Recorder;
+use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
+use rml_rtmp::sessions::{
+    ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
+};
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 pub async fn handle_rtmp_session(
     mut stream: TcpStream,
@@ -22,8 +24,8 @@ pub async fn handle_rtmp_session(
         chunk_size: 4096,
         ..ServerSessionConfig::new()
     };
-    let (mut session, init_results) = ServerSession::new(config)
-        .map_err(|e| anyhow::anyhow!("session create: {}", e))?;
+    let (mut session, init_results) =
+        ServerSession::new(config).map_err(|e| anyhow::anyhow!("session create: {}", e))?;
     let mut init_results = Some(init_results);
 
     let mut buf = vec![0u8; 1024 * 64];
@@ -53,7 +55,10 @@ pub async fn handle_rtmp_session(
                         }
                         continue;
                     }
-                    Ok(HandshakeProcessResult::Completed { response_bytes, remaining_bytes }) => {
+                    Ok(HandshakeProcessResult::Completed {
+                        response_bytes,
+                        remaining_bytes,
+                    }) => {
                         if !response_bytes.is_empty() {
                             stream.write_all(&response_bytes).await?;
                             stream.flush().await?;
@@ -65,7 +70,15 @@ pub async fn handle_rtmp_session(
                         if !remaining_bytes.is_empty() {
                             match session.handle_input(&remaining_bytes) {
                                 Ok(results) => {
-                                    if let Err(e) = process_results(results, &mut session, &mut stream, &app_state, &mut session_ctx).await {
+                                    if let Err(e) = process_results(
+                                        results,
+                                        &mut session,
+                                        &mut stream,
+                                        &app_state,
+                                        &mut session_ctx,
+                                    )
+                                    .await
+                                    {
                                         tracing::error!("process_results after handshake: {:?}", e);
                                         break;
                                     }
@@ -84,7 +97,15 @@ pub async fn handle_rtmp_session(
 
             match session.handle_input(data) {
                 Ok(results) => {
-                    if let Err(e) = process_results(results, &mut session, &mut stream, &app_state, &mut session_ctx).await {
+                    if let Err(e) = process_results(
+                        results,
+                        &mut session,
+                        &mut stream,
+                        &app_state,
+                        &mut session_ctx,
+                    )
+                    .await
+                    {
                         tracing::error!("process_results error {}: {:?}", peer_addr, e);
                         break;
                     }
@@ -96,7 +117,8 @@ pub async fn handle_rtmp_session(
             }
         }
         Ok(())
-    }.await;
+    }
+    .await;
 
     // If not a graceful stop, enter grace period for reconnection
     if !session_ctx.graceful_stop {
@@ -151,13 +173,24 @@ impl SessionContext {
         }
     }
 
-    fn get_or_create_track_state(&mut self, track_id: u32, is_audio_only: bool) -> &mut HlsStreamState {
+    fn get_or_create_track_state(
+        &mut self,
+        track_id: u32,
+        is_audio_only: bool,
+    ) -> &mut HlsStreamState {
         let media_dir = self.media_dir.as_ref().unwrap().clone();
         let stream_key = self.current_stream_key.as_ref().unwrap().clone();
         let segment_duration = self.hls_segment_duration;
         let segments_keep = self.hls_segments_keep;
         let state = self.track_states.entry(track_id).or_insert_with(|| {
-            HlsStreamState::new(&media_dir, &stream_key, track_id, is_audio_only, segment_duration, segments_keep)
+            HlsStreamState::new(
+                &media_dir,
+                &stream_key,
+                track_id,
+                is_audio_only,
+                segment_duration,
+                segments_keep,
+            )
         });
         // If video data arrives for a track previously created as audio-only,
         // clear the flag so write_video doesn't drop video samples.
@@ -200,7 +233,11 @@ async fn notify_track_discovered(
     }
 }
 
-async fn write_master_playlist(media_dir: &str, stream_key: &str, track_ids: &[u32]) -> anyhow::Result<()> {
+async fn write_master_playlist(
+    media_dir: &str,
+    stream_key: &str,
+    track_ids: &[u32],
+) -> anyhow::Result<()> {
     let stream_dir = PathBuf::from(media_dir).join("hls").join(stream_key);
     let mut playlist = String::new();
     playlist.push_str("#EXTM3U\n");
@@ -208,15 +245,23 @@ async fn write_master_playlist(media_dir: &str, stream_key: &str, track_ids: &[u
 
     // Default playlist (index.m3u8) always included if it exists
     let default_playlist = stream_dir.join("index.m3u8");
-    if tokio::fs::try_exists(&default_playlist).await.unwrap_or(false) {
+    if tokio::fs::try_exists(&default_playlist)
+        .await
+        .unwrap_or(false)
+    {
         playlist.push_str("#EXT-X-STREAM-INF:BANDWIDTH=2500000\n");
         playlist.push_str("index.m3u8\n");
     }
 
     // Include each track playlist
     for track_id in track_ids {
-        let track_playlist = stream_dir.join(format!("track_{}", track_id)).join("index.m3u8");
-        if tokio::fs::try_exists(&track_playlist).await.unwrap_or(false) {
+        let track_playlist = stream_dir
+            .join(format!("track_{}", track_id))
+            .join("index.m3u8");
+        if tokio::fs::try_exists(&track_playlist)
+            .await
+            .unwrap_or(false)
+        {
             playlist.push_str("#EXT-X-STREAM-INF:BANDWIDTH=2500000\n");
             playlist.push_str(&format!("track_{}/index.m3u8\n", track_id));
         }
@@ -257,7 +302,7 @@ async fn finalize_stream(
         tracing::warn!("Failed to write master playlist for {}: {}", stream_key, e);
     }
 
-if let Some(ref mut r) = recorder {
+    if let Some(ref mut r) = recorder {
         drain_hls_to_recorder(&mut hls, r).await;
         let total_duration_secs: f64 = hls.total_duration_secs();
         let total_duration = if total_duration_secs > 0.0 {
@@ -277,9 +322,18 @@ if let Some(ref mut r) = recorder {
                 .map(|n| n.to_string())
                 .unwrap_or_default();
             tokio::spawn(async move {
-                let thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("recordings");
-                if let Err(e) = crate::thumbnail::generate_thumbnails_for_file(&mp4_path, &thumb_dir, &sizes).await {
-                    tracing::warn!("Post-recording thumbnail generation failed for {}: {}", key, e);
+                let thumb_dir = PathBuf::from(&media_dir)
+                    .join("thumbnails")
+                    .join("recordings");
+                if let Err(e) =
+                    crate::thumbnail::generate_thumbnails_for_file(&mp4_path, &thumb_dir, &sizes)
+                        .await
+                {
+                    tracing::warn!(
+                        "Post-recording thumbnail generation failed for {}: {}",
+                        key,
+                        e
+                    );
                 }
                 if let Err(e) = crate::recording::update_index_json(
                     &media_dir,
@@ -288,7 +342,9 @@ if let Some(ref mut r) = recorder {
                     total_duration,
                     &base_url,
                     &sizes,
-                ).await {
+                )
+                .await
+                {
                     tracing::warn!("update_index_json failed for {}: {}", key, e);
                 }
                 // Background remux (non-blocking, concurrency-limited)
@@ -298,13 +354,20 @@ if let Some(ref mut r) = recorder {
                 let still_in_use = sm.is_live_or_pending(&key);
                 drop(sm);
                 if still_in_use {
-                    tracing::debug!("Skipping HLS cleanup for {} — stream is still live or in grace period", key);
+                    tracing::debug!(
+                        "Skipping HLS cleanup for {} — stream is still live or in grace period",
+                        key
+                    );
                 } else {
                     let hls_dir = PathBuf::from(&media_dir).join("hls").join(&key);
                     let _ = tokio::fs::remove_dir_all(&hls_dir).await;
-                    let stream_thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("streams");
+                    let stream_thumb_dir =
+                        PathBuf::from(&media_dir).join("thumbnails").join("streams");
                     for &w in &sizes {
-                        let _ = tokio::fs::remove_file(stream_thumb_dir.join(format!("{}_w{}.webp", key, w))).await;
+                        let _ = tokio::fs::remove_file(
+                            stream_thumb_dir.join(format!("{}_w{}.webp", key, w)),
+                        )
+                        .await;
                     }
                 }
             });
@@ -346,7 +409,11 @@ async fn enter_grace_period(app_state: &Arc<AppState>, ctx: &mut SessionContext)
     if let Some(ref key) = ctx.current_stream_key {
         let media_dir = app_state.config.media_dir.clone();
         if let Err(e) = write_master_playlist(&media_dir, key, &track_ids).await {
-            tracing::warn!("Failed to write master playlist during grace period for {}: {}", key, e);
+            tracing::warn!(
+                "Failed to write master playlist during grace period for {}: {}",
+                key,
+                e
+            );
         }
     }
 
@@ -374,7 +441,15 @@ async fn enter_grace_period(app_state: &Arc<AppState>, ctx: &mut SessionContext)
                 };
 
                 if let Some(pending) = pending {
-                    finalize_stream(&app_state_clone, &key_clone, pending.hls_state, HashMap::new(), pending.recorder, true).await;
+                    finalize_stream(
+                        &app_state_clone,
+                        &key_clone,
+                        pending.hls_state,
+                        HashMap::new(),
+                        pending.recorder,
+                        true,
+                    )
+                    .await;
                 }
             });
         } else if let Some(mut r) = ctx.recorder.take() {
@@ -435,24 +510,41 @@ async fn handle_event(
     event: ServerSessionEvent,
 ) -> anyhow::Result<()> {
     match event {
-        ServerSessionEvent::ConnectionRequested { request_id, app_name } => {
+        ServerSessionEvent::ConnectionRequested {
+            request_id,
+            app_name,
+        } => {
             tracing::debug!("RTMP connect: app={}", app_name);
             ctx.current_app = Some(app_name);
-            let responses = session.accept_request(request_id)
+            let responses = session
+                .accept_request(request_id)
                 .map_err(|e| anyhow::anyhow!("accept: {}", e))?;
             handle_outbound(stream, responses).await?;
         }
 
         ServerSessionEvent::ReleaseStreamRequested { request_id, .. } => {
-            handle_outbound(stream, session.accept_request(request_id)
-                .map_err(|e| anyhow::anyhow!("release: {}", e))?).await?;
+            handle_outbound(
+                stream,
+                session
+                    .accept_request(request_id)
+                    .map_err(|e| anyhow::anyhow!("release: {}", e))?,
+            )
+            .await?;
         }
 
-        ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
+        ServerSessionEvent::PublishStreamRequested {
+            request_id,
+            stream_key,
+            ..
+        } => {
             tracing::debug!("Publish request: stream_key={}", stream_key);
-            let responses = session.accept_request(request_id)
+            let responses = session
+                .accept_request(request_id)
                 .map_err(|e| anyhow::anyhow!("publish accept: {}", e))?;
-            tracing::debug!("Sending {} outbound responses for publish accept", responses.len());
+            tracing::debug!(
+                "Sending {} outbound responses for publish accept",
+                responses.len()
+            );
             handle_outbound(stream, responses).await?;
 
             let mut sm = app_state.stream_manager.write().await;
@@ -464,23 +556,35 @@ async fn handle_event(
                 ctx.current_stream_key = Some(stream_key.clone());
                 tracing::info!("Stream {} reconnected within grace period", stream_key);
             } else {
-                sm.add_publisher(&stream_key, crate::rtmp::PublisherInfo {
-                    stream_key: stream_key.clone(),
-                    app_name: ctx.current_app.clone().unwrap_or_default(),
-                    started_at: chrono::Utc::now(),
-                    metadata: None,
-                    tracks: Vec::new(),
-                    disconnected_at: None,
-                });
+                sm.add_publisher(
+                    &stream_key,
+                    crate::rtmp::PublisherInfo {
+                        stream_key: stream_key.clone(),
+                        app_name: ctx.current_app.clone().unwrap_or_default(),
+                        started_at: chrono::Utc::now(),
+                        metadata: None,
+                        tracks: Vec::new(),
+                        disconnected_at: None,
+                    },
+                );
                 drop(sm);
 
                 let media_dir = app_state.config.media_dir.clone();
-                let hls_dir = std::path::PathBuf::from(&media_dir).join("hls").join(&stream_key);
+                let hls_dir = std::path::PathBuf::from(&media_dir)
+                    .join("hls")
+                    .join(&stream_key);
                 let _ = tokio::fs::create_dir_all(&hls_dir).await;
                 ctx.media_dir = Some(media_dir.clone());
                 ctx.hls_segment_duration = app_state.config.hls_segment_duration;
                 ctx.hls_segments_keep = app_state.config.hls_segments_keep;
-                ctx.hls_state = Some(HlsStreamState::new(&media_dir, &stream_key, 0, false, app_state.config.hls_segment_duration, app_state.config.hls_segments_keep));
+                ctx.hls_state = Some(HlsStreamState::new(
+                    &media_dir,
+                    &stream_key,
+                    0,
+                    false,
+                    app_state.config.hls_segment_duration,
+                    app_state.config.hls_segments_keep,
+                ));
                 ctx.track_states.clear();
                 if app_state.config.recording_enabled {
                     let recordings_dir = std::path::PathBuf::from(&media_dir).join("recordings");
@@ -499,7 +603,12 @@ async fn handle_event(
             finalize_session(app_state, ctx).await;
         }
 
-        ServerSessionEvent::VideoDataReceived { stream_key, data, timestamp, .. } => {
+        ServerSessionEvent::VideoDataReceived {
+            stream_key,
+            data,
+            timestamp,
+            ..
+        } => {
             if let Some(ref key) = ctx.current_stream_key
                 && *key == stream_key
             {
@@ -508,7 +617,12 @@ async fn handle_event(
             }
         }
 
-        ServerSessionEvent::AudioDataReceived { stream_key, data, timestamp, .. } => {
+        ServerSessionEvent::AudioDataReceived {
+            stream_key,
+            data,
+            timestamp,
+            ..
+        } => {
             if let Some(ref key) = ctx.current_stream_key
                 && *key == stream_key
             {
@@ -526,39 +640,47 @@ async fn handle_event(
                 let _ = hls.update_video_resolution(width, height).await;
             }
             // Use codec names discovered from packet data rather than raw codec IDs
-            let video_codec_name = ctx.track_video_codecs.get(&0).map(|c| match c {
-                crate::hls::fmp4::VideoCodec::H264 => "H264".to_string(),
-                crate::hls::fmp4::VideoCodec::H265 => "HEVC".to_string(),
-                crate::hls::fmp4::VideoCodec::AV1 => "AV1".to_string(),
-            }).unwrap_or_else(|| match metadata.video_codec_id {
-                Some(7) => "H264".to_string(),
-                Some(12) => "HEVC".to_string(),
-                Some(13) => "AV1".to_string(),
-                Some(0x61766331) => "H264".to_string(),  // "avc1" FourCC
-                Some(0x68657631) => "HEVC".to_string(),  // "hev1" FourCC
-                Some(0x68766331) => "HEVC".to_string(),  // "hvc1" FourCC
-                Some(0x61763031) => "AV1".to_string(),   // "av01" FourCC
-                Some(0x76703039) => "VP9".to_string(),   // "vp09" FourCC
-                Some(0x76766331) => "VVC".to_string(),   // "vvc1" FourCC
-                Some(id) => format!("{}", id),
-                None => String::new(),
-            });
-            let audio_codec_name = ctx.track_audio_codecs.get(&0).map(|c| match c {
-                crate::hls::fmp4::AudioCodec::Aac => "AAC".to_string(),
-                crate::hls::fmp4::AudioCodec::Opus => "Opus".to_string(),
-                crate::hls::fmp4::AudioCodec::Flac => "FLAC".to_string(),
-            }).unwrap_or_else(|| match metadata.audio_codec_id {
-                Some(0) => "Linear PCM".to_string(),
-                Some(2) => "MP3".to_string(),
-                Some(10) => "AAC".to_string(),
-                Some(11) => "Speex".to_string(),
-                Some(0x4F707573) => "Opus".to_string(),  // "Opus" FourCC
-                Some(0x664C6143) => "FLAC".to_string(),  // "fLaC" FourCC
-                Some(0x61632D33) => "AC-3".to_string(),  // "ac-3" FourCC
-                Some(0x65632D33) => "E-AC-3".to_string(),// "ec-3" FourCC
-                Some(id) => format!("{}", id),
-                None => String::new(),
-            });
+            let video_codec_name = ctx
+                .track_video_codecs
+                .get(&0)
+                .map(|c| match c {
+                    crate::hls::fmp4::VideoCodec::H264 => "H264".to_string(),
+                    crate::hls::fmp4::VideoCodec::H265 => "HEVC".to_string(),
+                    crate::hls::fmp4::VideoCodec::AV1 => "AV1".to_string(),
+                })
+                .unwrap_or_else(|| match metadata.video_codec_id {
+                    Some(7) => "H264".to_string(),
+                    Some(12) => "HEVC".to_string(),
+                    Some(13) => "AV1".to_string(),
+                    Some(0x61766331) => "H264".to_string(), // "avc1" FourCC
+                    Some(0x68657631) => "HEVC".to_string(), // "hev1" FourCC
+                    Some(0x68766331) => "HEVC".to_string(), // "hvc1" FourCC
+                    Some(0x61763031) => "AV1".to_string(),  // "av01" FourCC
+                    Some(0x76703039) => "VP9".to_string(),  // "vp09" FourCC
+                    Some(0x76766331) => "VVC".to_string(),  // "vvc1" FourCC
+                    Some(id) => format!("{}", id),
+                    None => String::new(),
+                });
+            let audio_codec_name = ctx
+                .track_audio_codecs
+                .get(&0)
+                .map(|c| match c {
+                    crate::hls::fmp4::AudioCodec::Aac => "AAC".to_string(),
+                    crate::hls::fmp4::AudioCodec::Opus => "Opus".to_string(),
+                    crate::hls::fmp4::AudioCodec::Flac => "FLAC".to_string(),
+                })
+                .unwrap_or_else(|| match metadata.audio_codec_id {
+                    Some(0) => "Linear PCM".to_string(),
+                    Some(2) => "MP3".to_string(),
+                    Some(10) => "AAC".to_string(),
+                    Some(11) => "Speex".to_string(),
+                    Some(0x4F707573) => "Opus".to_string(), // "Opus" FourCC
+                    Some(0x664C6143) => "FLAC".to_string(), // "fLaC" FourCC
+                    Some(0x61632D33) => "AC-3".to_string(), // "ac-3" FourCC
+                    Some(0x65632D33) => "E-AC-3".to_string(), // "ec-3" FourCC
+                    Some(id) => format!("{}", id),
+                    None => String::new(),
+                });
             let meta = crate::rtmp::StreamMeta {
                 width: metadata.video_width.unwrap_or(0),
                 height: metadata.video_height.unwrap_or(0),
@@ -577,8 +699,13 @@ async fn handle_event(
         }
 
         ServerSessionEvent::PlayStreamRequested { request_id, .. } => {
-            handle_outbound(stream, session.accept_request(request_id)
-                .map_err(|e| anyhow::anyhow!("play accept: {}", e))?).await?;
+            handle_outbound(
+                stream,
+                session
+                    .accept_request(request_id)
+                    .map_err(|e| anyhow::anyhow!("play accept: {}", e))?,
+            )
+            .await?;
         }
 
         _ => {}
@@ -586,7 +713,9 @@ async fn handle_event(
     Ok(())
 }
 
-fn map_enhanced_video_codec(codec: crate::rtmp::enhanced::EnhancedVideoCodec) -> Option<crate::hls::fmp4::VideoCodec> {
+fn map_enhanced_video_codec(
+    codec: crate::rtmp::enhanced::EnhancedVideoCodec,
+) -> Option<crate::hls::fmp4::VideoCodec> {
     match codec {
         crate::rtmp::enhanced::EnhancedVideoCodec::Av1 => Some(crate::hls::fmp4::VideoCodec::AV1),
         crate::rtmp::enhanced::EnhancedVideoCodec::Avc => Some(crate::hls::fmp4::VideoCodec::H264),
@@ -595,7 +724,9 @@ fn map_enhanced_video_codec(codec: crate::rtmp::enhanced::EnhancedVideoCodec) ->
     }
 }
 
-fn map_enhanced_audio_codec(codec: crate::rtmp::enhanced::EnhancedAudioCodec) -> Option<crate::hls::fmp4::AudioCodec> {
+fn map_enhanced_audio_codec(
+    codec: crate::rtmp::enhanced::EnhancedAudioCodec,
+) -> Option<crate::hls::fmp4::AudioCodec> {
     match codec {
         crate::rtmp::enhanced::EnhancedAudioCodec::Opus => Some(crate::hls::fmp4::AudioCodec::Opus),
         crate::rtmp::enhanced::EnhancedAudioCodec::Flac => Some(crate::hls::fmp4::AudioCodec::Flac),
@@ -604,8 +735,20 @@ fn map_enhanced_audio_codec(codec: crate::rtmp::enhanced::EnhancedAudioCodec) ->
     }
 }
 
-async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_state: &Arc<AppState>, stream_key: &str) {
-    tracing::debug!("handle_video_data: ts={}, len={}, first_bytes={:02x?}, hls_state={}", ts, data.len(), &data[..data.len().min(8)], ctx.hls_state.is_some());
+async fn handle_video_data(
+    data: &[u8],
+    ts: u32,
+    ctx: &mut SessionContext,
+    app_state: &Arc<AppState>,
+    stream_key: &str,
+) {
+    tracing::debug!(
+        "handle_video_data: ts={}, len={}, first_bytes={:02x?}, hls_state={}",
+        ts,
+        data.len(),
+        &data[..data.len().min(8)],
+        ctx.hls_state.is_some()
+    );
     if crate::rtmp::enhanced::is_enhanced_video(data) {
         if let Ok((header, remainder)) = crate::rtmp::enhanced::parse_enhanced_video_header(data) {
             let is_keyframe = header.frame_type == crate::rtmp::enhanced::VideoFrameType::KeyFrame;
@@ -613,58 +756,110 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                 crate::rtmp::enhanced::VideoPacketType::Multitrack => {
                     match crate::rtmp::enhanced::parse_enhanced_video_multitrack(remainder) {
                         Ok((_multitrack_type, inner_pt, tracks)) => {
-                            tracing::debug!("Parsed video multitrack: {} tracks, inner_pt={:?}", tracks.len(), inner_pt);
+                            tracing::debug!(
+                                "Parsed video multitrack: {} tracks, inner_pt={:?}",
+                                tracks.len(),
+                                inner_pt
+                            );
                             for track in tracks.iter() {
                                 if ctx.closed_video_tracks.contains(&track.track_id) {
                                     continue;
                                 }
-                            let Some(codec) = map_enhanced_video_codec(track.codec.clone()) else {
-                                tracing::warn!("Unsupported video codec {:?}, skipping track {}", track.codec, track.track_id);
-                                continue;
-                            };
-                            let old_video_codec = ctx.track_video_codecs.insert(track.track_id, codec);
-                            let is_new_video_codec = old_video_codec.is_none() || old_video_codec != Some(codec);
-                            let is_new_track = !ctx.discovered_tracks.contains(&track.track_id);
-                            if is_new_track || is_new_video_codec {
-                                if is_new_track {
-                                    ctx.discovered_tracks.insert(track.track_id);
+                                let Some(codec) = map_enhanced_video_codec(track.codec.clone())
+                                else {
+                                    tracing::warn!(
+                                        "Unsupported video codec {:?}, skipping track {}",
+                                        track.codec,
+                                        track.track_id
+                                    );
+                                    continue;
+                                };
+                                let old_video_codec =
+                                    ctx.track_video_codecs.insert(track.track_id, codec);
+                                let is_new_video_codec =
+                                    old_video_codec.is_none() || old_video_codec != Some(codec);
+                                let is_new_track = !ctx.discovered_tracks.contains(&track.track_id);
+                                if is_new_track || is_new_video_codec {
+                                    if is_new_track {
+                                        ctx.discovered_tracks.insert(track.track_id);
+                                    }
+                                    let audio_codec =
+                                        ctx.track_audio_codecs.get(&track.track_id).copied();
+                                    notify_track_discovered(
+                                        app_state,
+                                        stream_key,
+                                        track.track_id,
+                                        Some(codec),
+                                        audio_codec,
+                                    )
+                                    .await;
                                 }
-                                let audio_codec = ctx.track_audio_codecs.get(&track.track_id).copied();
-                                notify_track_discovered(app_state, stream_key, track.track_id, Some(codec), audio_codec).await;
-                            }
-                            let video_width = ctx.video_width;
-                            let video_height = ctx.video_height;
-                            // Default hls_state gets track_id == 0 as primary track
-                            if track.track_id == 0
-                                && let Some(ref mut hls) = ctx.hls_state
-                            {
+                                let video_width = ctx.video_width;
+                                let video_height = ctx.video_height;
+                                // Default hls_state gets track_id == 0 as primary track
+                                if track.track_id == 0
+                                    && let Some(ref mut hls) = ctx.hls_state
+                                {
+                                    match inner_pt {
+                                        Some(
+                                            crate::rtmp::enhanced::VideoPacketType::SequenceStart,
+                                        ) => {
+                                            let _ = hls
+                                                .set_video_config(
+                                                    track.payload,
+                                                    codec,
+                                                    video_width,
+                                                    video_height,
+                                                )
+                                                .await;
+                                        }
+                                        Some(
+                                            crate::rtmp::enhanced::VideoPacketType::SequenceEnd,
+                                        ) => {
+                                            let _ = hls.finalize_segment().await;
+                                        }
+                                        _ => {
+                                            let _ = hls
+                                                .write_video(
+                                                    track.payload,
+                                                    ts,
+                                                    is_keyframe,
+                                                    track.composition_time_offset,
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                }
+                                // Every track gets its own track state
+                                let track_state =
+                                    ctx.get_or_create_track_state(track.track_id, false);
                                 match inner_pt {
                                     Some(crate::rtmp::enhanced::VideoPacketType::SequenceStart) => {
-                                        let _ = hls.set_video_config(track.payload, codec, video_width, video_height).await;
+                                        let _ = track_state
+                                            .set_video_config(
+                                                track.payload,
+                                                codec,
+                                                video_width,
+                                                video_height,
+                                            )
+                                            .await;
                                     }
                                     Some(crate::rtmp::enhanced::VideoPacketType::SequenceEnd) => {
-                                        let _ = hls.finalize_segment().await;
+                                        let _ = track_state.finalize_segment().await;
+                                        ctx.closed_video_tracks.insert(track.track_id);
                                     }
                                     _ => {
-                                        let _ = hls.write_video(track.payload, ts, is_keyframe, track.composition_time_offset).await;
+                                        let _ = track_state
+                                            .write_video(
+                                                track.payload,
+                                                ts,
+                                                is_keyframe,
+                                                track.composition_time_offset,
+                                            )
+                                            .await;
                                     }
                                 }
                             }
-                            // Every track gets its own track state
-                            let track_state = ctx.get_or_create_track_state(track.track_id, false);
-                            match inner_pt {
-                                Some(crate::rtmp::enhanced::VideoPacketType::SequenceStart) => {
-                                    let _ = track_state.set_video_config(track.payload, codec, video_width, video_height).await;
-                                }
-                                Some(crate::rtmp::enhanced::VideoPacketType::SequenceEnd) => {
-                                    let _ = track_state.finalize_segment().await;
-                                    ctx.closed_video_tracks.insert(track.track_id);
-                                }
-                                _ => {
-                                    let _ = track_state.write_video(track.payload, ts, is_keyframe, track.composition_time_offset).await;
-                                }
-                            }
-                        }
                         }
                         Err(e) => {
                             tracing::warn!("Failed to parse video multitrack: {}", e);
@@ -673,33 +868,43 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                 }
                 crate::rtmp::enhanced::VideoPacketType::SequenceStart => {
                     let Some(codec) = map_enhanced_video_codec(header.codec.clone()) else {
-                        tracing::warn!("Unsupported video codec {:?}, dropping SequenceStart", header.codec);
+                        tracing::warn!(
+                            "Unsupported video codec {:?}, dropping SequenceStart",
+                            header.codec
+                        );
                         return;
                     };
                     let old_video_codec = ctx.track_video_codecs.insert(0, codec);
-                    let is_new_video_codec = old_video_codec.is_none() || old_video_codec != Some(codec);
+                    let is_new_video_codec =
+                        old_video_codec.is_none() || old_video_codec != Some(codec);
                     let is_new_track = !ctx.discovered_tracks.contains(&0);
                     if is_new_track || is_new_video_codec {
                         if is_new_track {
                             ctx.discovered_tracks.insert(0);
                         }
                         let audio_codec = ctx.track_audio_codecs.get(&0).copied();
-                        notify_track_discovered(app_state, stream_key, 0, Some(codec), audio_codec).await;
+                        notify_track_discovered(app_state, stream_key, 0, Some(codec), audio_codec)
+                            .await;
                     }
                     if let Some(ref mut hls) = ctx.hls_state {
-                        let _ = hls.set_video_config(remainder, codec, ctx.video_width, ctx.video_height).await;
+                        let _ = hls
+                            .set_video_config(remainder, codec, ctx.video_width, ctx.video_height)
+                            .await;
                     }
                 }
-                crate::rtmp::enhanced::VideoPacketType::CodedFrames |
-                crate::rtmp::enhanced::VideoPacketType::CodedFramesX => {
+                crate::rtmp::enhanced::VideoPacketType::CodedFrames
+                | crate::rtmp::enhanced::VideoPacketType::CodedFramesX => {
                     if !ctx.discovered_tracks.contains(&0) {
                         ctx.discovered_tracks.insert(0);
                         let video_codec = ctx.track_video_codecs.get(&0).copied();
                         let audio_codec = ctx.track_audio_codecs.get(&0).copied();
-                        notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                        notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec)
+                            .await;
                     }
                     if let Some(ref mut hls) = ctx.hls_state {
-                        let _ = hls.write_video(remainder, ts, is_keyframe, header.composition_time_offset).await;
+                        let _ = hls
+                            .write_video(remainder, ts, is_keyframe, header.composition_time_offset)
+                            .await;
                     }
                 }
                 crate::rtmp::enhanced::VideoPacketType::SequenceEnd => {
@@ -708,7 +913,9 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     }
                 }
                 crate::rtmp::enhanced::VideoPacketType::Metadata => {
-                    tracing::debug!("Received Enhanced RTMP video metadata (HDR); not yet processed");
+                    tracing::debug!(
+                        "Received Enhanced RTMP video metadata (HDR); not yet processed"
+                    );
                 }
                 _ => {}
             }
@@ -718,23 +925,48 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
         let frame_type = (data[0] & 0xF0) >> 4;
         let codec_id = data[0] & 0x0F;
         let is_keyframe = frame_type == 1;
-        tracing::debug!("legacy video: frame_type={}, codec_id={}, len={}, hls_state={}", frame_type, codec_id, data.len(), ctx.hls_state.is_some());
+        tracing::debug!(
+            "legacy video: frame_type={}, codec_id={}, len={}, hls_state={}",
+            frame_type,
+            codec_id,
+            data.len(),
+            ctx.hls_state.is_some()
+        );
 
         if codec_id == 7 && data.len() >= 2 {
             let avc_packet_type = data[1];
             let remainder = if data.len() >= 5 { &data[5..] } else { &[] };
-            tracing::debug!("avc_packet_type={}, remainder_len={}", avc_packet_type, remainder.len());
+            tracing::debug!(
+                "avc_packet_type={}, remainder_len={}",
+                avc_packet_type,
+                remainder.len()
+            );
 
             if avc_packet_type == 0 {
                 // AVC sequence header -> avcC config
-                ctx.track_video_codecs.insert(0, crate::hls::fmp4::VideoCodec::H264);
+                ctx.track_video_codecs
+                    .insert(0, crate::hls::fmp4::VideoCodec::H264);
                 if !ctx.discovered_tracks.contains(&0) {
                     ctx.discovered_tracks.insert(0);
                 }
                 let audio_codec = ctx.track_audio_codecs.get(&0).copied();
-                notify_track_discovered(app_state, stream_key, 0, Some(crate::hls::fmp4::VideoCodec::H264), audio_codec).await;
+                notify_track_discovered(
+                    app_state,
+                    stream_key,
+                    0,
+                    Some(crate::hls::fmp4::VideoCodec::H264),
+                    audio_codec,
+                )
+                .await;
                 if let Some(ref mut hls) = ctx.hls_state
-                    && let Err(e) = hls.set_video_config(remainder, crate::hls::fmp4::VideoCodec::H264, ctx.video_width, ctx.video_height).await
+                    && let Err(e) = hls
+                        .set_video_config(
+                            remainder,
+                            crate::hls::fmp4::VideoCodec::H264,
+                            ctx.video_width,
+                            ctx.video_height,
+                        )
+                        .await
                 {
                     tracing::warn!("HLS set_video_config failed: {}", e);
                 }
@@ -744,7 +976,9 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     let ct_bytes: [u8; 3] = [data[2], data[3], data[4]];
                     i32::from_be_bytes([
                         if ct_bytes[0] & 0x80 != 0 { 0xFF } else { 0x00 },
-                        ct_bytes[0], ct_bytes[1], ct_bytes[2],
+                        ct_bytes[0],
+                        ct_bytes[1],
+                        ct_bytes[2],
                     ])
                 } else {
                     0
@@ -753,10 +987,13 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     ctx.discovered_tracks.insert(0);
                     let video_codec = ctx.track_video_codecs.get(&0).copied();
                     let audio_codec = ctx.track_audio_codecs.get(&0).copied();
-                    notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                    notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec)
+                        .await;
                 }
                 if let Some(ref mut hls) = ctx.hls_state
-                    && let Err(e) = hls.write_video(remainder, ts, is_keyframe, composition_time_offset).await
+                    && let Err(e) = hls
+                        .write_video(remainder, ts, is_keyframe, composition_time_offset)
+                        .await
                 {
                     tracing::warn!("HLS write_video failed: {}", e);
                 }
@@ -784,7 +1021,9 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
     }
 
     // Drain default hls_state to recorder
-    if let (Some(ref mut hls), Some(ref mut recorder)) = (ctx.hls_state.as_mut(), ctx.recorder.as_mut()) {
+    if let (Some(ref mut hls), Some(ref mut recorder)) =
+        (ctx.hls_state.as_mut(), ctx.recorder.as_mut())
+    {
         drain_hls_to_recorder(hls, recorder).await;
     }
 
@@ -793,67 +1032,105 @@ async fn handle_video_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
         let _ = track_state.drain_init_data();
         let _ = track_state.drain_segment_data();
     }
-
 }
 
-async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_state: &Arc<AppState>, stream_key: &str) {
-    tracing::debug!("handle_audio_data: ts={}, len={}, first_bytes={:02x?}, hls_state={}", ts, data.len(), &data[..data.len().min(8)], ctx.hls_state.is_some());
+async fn handle_audio_data(
+    data: &[u8],
+    ts: u32,
+    ctx: &mut SessionContext,
+    app_state: &Arc<AppState>,
+    stream_key: &str,
+) {
+    tracing::debug!(
+        "handle_audio_data: ts={}, len={}, first_bytes={:02x?}, hls_state={}",
+        ts,
+        data.len(),
+        &data[..data.len().min(8)],
+        ctx.hls_state.is_some()
+    );
     if crate::rtmp::enhanced::is_enhanced_audio(data) {
         if let Ok((header, remainder)) = crate::rtmp::enhanced::parse_enhanced_audio_header(data) {
             match header.packet_type {
                 crate::rtmp::enhanced::AudioPacketType::Multitrack => {
                     match crate::rtmp::enhanced::parse_enhanced_audio_multitrack(remainder) {
                         Ok((_multitrack_type, inner_pt, tracks)) => {
-                            tracing::debug!("Parsed audio multitrack: {} tracks, inner_pt={:?}", tracks.len(), inner_pt);
+                            tracing::debug!(
+                                "Parsed audio multitrack: {} tracks, inner_pt={:?}",
+                                tracks.len(),
+                                inner_pt
+                            );
                             for track in tracks.iter() {
                                 if ctx.closed_audio_tracks.contains(&track.track_id) {
                                     continue;
                                 }
-                            let Some(codec) = map_enhanced_audio_codec(track.codec.clone()) else {
-                                tracing::warn!("Unsupported audio codec {:?}, skipping track {}", track.codec, track.track_id);
-                                continue;
-                            };
-                            let old_audio_codec = ctx.track_audio_codecs.insert(track.track_id, codec);
-                            let is_new_audio_codec = old_audio_codec.is_none() || old_audio_codec != Some(codec);
-                            let is_new_track = !ctx.discovered_tracks.contains(&track.track_id);
-                            if is_new_track || is_new_audio_codec {
-                                if is_new_track {
-                                    ctx.discovered_tracks.insert(track.track_id);
+                                let Some(codec) = map_enhanced_audio_codec(track.codec.clone())
+                                else {
+                                    tracing::warn!(
+                                        "Unsupported audio codec {:?}, skipping track {}",
+                                        track.codec,
+                                        track.track_id
+                                    );
+                                    continue;
+                                };
+                                let old_audio_codec =
+                                    ctx.track_audio_codecs.insert(track.track_id, codec);
+                                let is_new_audio_codec =
+                                    old_audio_codec.is_none() || old_audio_codec != Some(codec);
+                                let is_new_track = !ctx.discovered_tracks.contains(&track.track_id);
+                                if is_new_track || is_new_audio_codec {
+                                    if is_new_track {
+                                        ctx.discovered_tracks.insert(track.track_id);
+                                    }
+                                    let video_codec =
+                                        ctx.track_video_codecs.get(&track.track_id).copied();
+                                    notify_track_discovered(
+                                        app_state,
+                                        stream_key,
+                                        track.track_id,
+                                        video_codec,
+                                        Some(codec),
+                                    )
+                                    .await;
                                 }
-                                let video_codec = ctx.track_video_codecs.get(&track.track_id).copied();
-                                notify_track_discovered(app_state, stream_key, track.track_id, video_codec, Some(codec)).await;
-                            }
-                            // Default hls_state gets track_id == 0 as primary track
-                            if track.track_id == 0
-                                && let Some(ref mut hls) = ctx.hls_state
-                            {
+                                // Default hls_state gets track_id == 0 as primary track
+                                if track.track_id == 0
+                                    && let Some(ref mut hls) = ctx.hls_state
+                                {
+                                    match inner_pt {
+                                        Some(
+                                            crate::rtmp::enhanced::AudioPacketType::SequenceStart,
+                                        ) => {
+                                            let _ =
+                                                hls.set_audio_config(codec, track.payload).await;
+                                        }
+                                        Some(
+                                            crate::rtmp::enhanced::AudioPacketType::SequenceEnd,
+                                        ) => {
+                                            let _ = hls.finalize_segment().await;
+                                        }
+                                        _ => {
+                                            let _ = hls.write_audio(track.payload, ts).await;
+                                        }
+                                    }
+                                }
+                                // Every track gets its own track state
+                                let track_state =
+                                    ctx.get_or_create_track_state(track.track_id, true);
                                 match inner_pt {
                                     Some(crate::rtmp::enhanced::AudioPacketType::SequenceStart) => {
-                                        let _ = hls.set_audio_config(codec, track.payload).await;
+                                        let _ = track_state
+                                            .set_audio_config(codec, track.payload)
+                                            .await;
                                     }
                                     Some(crate::rtmp::enhanced::AudioPacketType::SequenceEnd) => {
-                                        let _ = hls.finalize_segment().await;
+                                        let _ = track_state.finalize_segment().await;
+                                        ctx.closed_audio_tracks.insert(track.track_id);
                                     }
                                     _ => {
-                                        let _ = hls.write_audio(track.payload, ts).await;
+                                        let _ = track_state.write_audio(track.payload, ts).await;
                                     }
                                 }
                             }
-                            // Every track gets its own track state
-                            let track_state = ctx.get_or_create_track_state(track.track_id, true);
-                            match inner_pt {
-                                Some(crate::rtmp::enhanced::AudioPacketType::SequenceStart) => {
-                                    let _ = track_state.set_audio_config(codec, track.payload).await;
-                                }
-                                Some(crate::rtmp::enhanced::AudioPacketType::SequenceEnd) => {
-                                    let _ = track_state.finalize_segment().await;
-                                    ctx.closed_audio_tracks.insert(track.track_id);
-                                }
-                                _ => {
-                                    let _ = track_state.write_audio(track.payload, ts).await;
-                                }
-                            }
-                        }
                         }
                         Err(e) => {
                             tracing::warn!("Failed to parse audio multitrack: {}", e);
@@ -862,18 +1139,23 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                 }
                 crate::rtmp::enhanced::AudioPacketType::SequenceStart => {
                     let Some(codec) = map_enhanced_audio_codec(header.codec.clone()) else {
-                        tracing::warn!("Unsupported audio codec {:?}, dropping SequenceStart", header.codec);
+                        tracing::warn!(
+                            "Unsupported audio codec {:?}, dropping SequenceStart",
+                            header.codec
+                        );
                         return;
                     };
                     let old_audio_codec = ctx.track_audio_codecs.insert(0, codec);
-                    let is_new_audio_codec = old_audio_codec.is_none() || old_audio_codec != Some(codec);
+                    let is_new_audio_codec =
+                        old_audio_codec.is_none() || old_audio_codec != Some(codec);
                     let is_new_track = !ctx.discovered_tracks.contains(&0);
                     if is_new_track || is_new_audio_codec {
                         if is_new_track {
                             ctx.discovered_tracks.insert(0);
                         }
                         let video_codec = ctx.track_video_codecs.get(&0).copied();
-                        notify_track_discovered(app_state, stream_key, 0, video_codec, Some(codec)).await;
+                        notify_track_discovered(app_state, stream_key, 0, video_codec, Some(codec))
+                            .await;
                     }
                     if let Some(ref mut hls) = ctx.hls_state {
                         let _ = hls.set_audio_config(codec, remainder).await;
@@ -884,7 +1166,8 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                         ctx.discovered_tracks.insert(0);
                         let video_codec = ctx.track_video_codecs.get(&0).copied();
                         let audio_codec = ctx.track_audio_codecs.get(&0).copied();
-                        notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                        notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec)
+                            .await;
                     }
                     if let Some(ref mut hls) = ctx.hls_state {
                         let _ = hls.write_audio(remainder, ts).await;
@@ -900,19 +1183,34 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
         }
     } else if !data.is_empty() {
         let sound_format = (data[0] & 0xF0) >> 4;
-            tracing::debug!("legacy audio: sound_format={}, len={}, hls_state={}", sound_format, data.len(), ctx.hls_state.is_some());
+        tracing::debug!(
+            "legacy audio: sound_format={}, len={}, hls_state={}",
+            sound_format,
+            data.len(),
+            ctx.hls_state.is_some()
+        );
         if sound_format == 10 && data.len() >= 2 {
             let aac_packet_type = data[1];
             let remainder = &data[2..];
             if aac_packet_type == 0 {
-                ctx.track_audio_codecs.insert(0, crate::hls::fmp4::AudioCodec::Aac);
+                ctx.track_audio_codecs
+                    .insert(0, crate::hls::fmp4::AudioCodec::Aac);
                 if !ctx.discovered_tracks.contains(&0) {
                     ctx.discovered_tracks.insert(0);
                     let video_codec = ctx.track_video_codecs.get(&0).copied();
-                    notify_track_discovered(app_state, stream_key, 0, video_codec, Some(crate::hls::fmp4::AudioCodec::Aac)).await;
+                    notify_track_discovered(
+                        app_state,
+                        stream_key,
+                        0,
+                        video_codec,
+                        Some(crate::hls::fmp4::AudioCodec::Aac),
+                    )
+                    .await;
                 }
                 if let Some(ref mut hls) = ctx.hls_state
-                    && let Err(e) = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Aac, remainder).await
+                    && let Err(e) = hls
+                        .set_audio_config(crate::hls::fmp4::AudioCodec::Aac, remainder)
+                        .await
                 {
                     tracing::warn!("HLS set_audio_config failed: {}", e);
                 }
@@ -923,7 +1221,8 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     ctx.discovered_tracks.insert(0);
                     let video_codec = ctx.track_video_codecs.get(&0).copied();
                     let audio_codec = ctx.track_audio_codecs.get(&0).copied();
-                    notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                    notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec)
+                        .await;
                 }
                 if let Err(e) = hls.write_audio(remainder, ts).await {
                     tracing::warn!("HLS write_audio failed: {}", e);
@@ -935,21 +1234,32 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
             if remainder.starts_with(b"Opus") {
                 let opus_data = &remainder[4..];
                 if opus_data.starts_with(b"OpusHead") {
-                    ctx.track_audio_codecs.insert(0, crate::hls::fmp4::AudioCodec::Opus);
+                    ctx.track_audio_codecs
+                        .insert(0, crate::hls::fmp4::AudioCodec::Opus);
                     if !ctx.discovered_tracks.contains(&0) {
                         ctx.discovered_tracks.insert(0);
                         let video_codec = ctx.track_video_codecs.get(&0).copied();
-                        notify_track_discovered(app_state, stream_key, 0, video_codec, Some(crate::hls::fmp4::AudioCodec::Opus)).await;
+                        notify_track_discovered(
+                            app_state,
+                            stream_key,
+                            0,
+                            video_codec,
+                            Some(crate::hls::fmp4::AudioCodec::Opus),
+                        )
+                        .await;
                     }
                     if let Some(ref mut hls) = ctx.hls_state {
-                        let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Opus, opus_data).await;
+                        let _ = hls
+                            .set_audio_config(crate::hls::fmp4::AudioCodec::Opus, opus_data)
+                            .await;
                     }
                 } else {
                     if !ctx.discovered_tracks.contains(&0) {
                         ctx.discovered_tracks.insert(0);
                         let video_codec = ctx.track_video_codecs.get(&0).copied();
                         let audio_codec = ctx.track_audio_codecs.get(&0).copied();
-                        notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                        notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec)
+                            .await;
                     }
                     if let Some(ref mut hls) = ctx.hls_state {
                         let _ = hls.write_audio(opus_data, ts).await;
@@ -957,23 +1267,44 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                 }
             } else if remainder.starts_with(b"fLaC") {
                 if let Some(ref mut hls) = ctx.hls_state {
-                    if hls.audio_codec() != Some(crate::hls::fmp4::AudioCodec::Flac) && remainder.len() >= 38 {
+                    if hls.audio_codec() != Some(crate::hls::fmp4::AudioCodec::Flac)
+                        && remainder.len() >= 38
+                    {
                         // First packet: store config (includes "fLaC" prefix)
-                        ctx.track_audio_codecs.insert(0, crate::hls::fmp4::AudioCodec::Flac);
+                        ctx.track_audio_codecs
+                            .insert(0, crate::hls::fmp4::AudioCodec::Flac);
                         if !ctx.discovered_tracks.contains(&0) {
                             ctx.discovered_tracks.insert(0);
                             let video_codec = ctx.track_video_codecs.get(&0).copied();
-                            notify_track_discovered(app_state, stream_key, 0, video_codec, Some(crate::hls::fmp4::AudioCodec::Flac)).await;
+                            notify_track_discovered(
+                                app_state,
+                                stream_key,
+                                0,
+                                video_codec,
+                                Some(crate::hls::fmp4::AudioCodec::Flac),
+                            )
+                            .await;
                         }
-                        let _ = hls.set_audio_config(crate::hls::fmp4::AudioCodec::Flac, remainder).await;
-                    } else if hls.audio_codec() == Some(crate::hls::fmp4::AudioCodec::Flac) && remainder.len() > 4 {
+                        let _ = hls
+                            .set_audio_config(crate::hls::fmp4::AudioCodec::Flac, remainder)
+                            .await;
+                    } else if hls.audio_codec() == Some(crate::hls::fmp4::AudioCodec::Flac)
+                        && remainder.len() > 4
+                    {
                         // Subsequent packets: strip "fLaC" prefix before writing as audio sample.
                         // FFmpeg prepends "fLaC" to every FLAC packet in FLV.
                         if !ctx.discovered_tracks.contains(&0) {
                             ctx.discovered_tracks.insert(0);
                             let video_codec = ctx.track_video_codecs.get(&0).copied();
                             let audio_codec = ctx.track_audio_codecs.get(&0).copied();
-                            notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                            notify_track_discovered(
+                                app_state,
+                                stream_key,
+                                0,
+                                video_codec,
+                                audio_codec,
+                            )
+                            .await;
                         }
                         let frame_data = &remainder[4..];
                         // Valid FLAC frames start with 0xFF (frame sync); skip non-frame packets.
@@ -987,7 +1318,8 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
                     ctx.discovered_tracks.insert(0);
                     let video_codec = ctx.track_video_codecs.get(&0).copied();
                     let audio_codec = ctx.track_audio_codecs.get(&0).copied();
-                    notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec).await;
+                    notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec)
+                        .await;
                 }
                 if let Some(ref mut hls) = ctx.hls_state {
                     let _ = hls.write_audio(remainder, ts).await;
@@ -1008,7 +1340,9 @@ async fn handle_audio_data(data: &[u8], ts: u32, ctx: &mut SessionContext, app_s
     }
 
     // Drain default hls_state to recorder
-    if let (Some(ref mut hls), Some(ref mut recorder)) = (ctx.hls_state.as_mut(), ctx.recorder.as_mut()) {
+    if let (Some(ref mut hls), Some(ref mut recorder)) =
+        (ctx.hls_state.as_mut(), ctx.recorder.as_mut())
+    {
         drain_hls_to_recorder(hls, recorder).await;
     }
 

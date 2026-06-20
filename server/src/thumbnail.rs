@@ -9,18 +9,18 @@ async fn find_latest_segment(dir: &PathBuf) -> anyhow::Result<PathBuf> {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if name_str.starts_with("segment") && name_str.ends_with(".m4s") {
-            let idx_str = &name_str[7..name_str.len()-4];
+            let idx_str = &name_str[7..name_str.len() - 4];
             if let Ok(idx) = idx_str.parse::<u32>() {
                 let meta = entry.metadata().await?;
-                if meta.len() > 0
-                    && (latest.is_none() || idx > latest.as_ref().unwrap().0)
-                {
+                if meta.len() > 0 && (latest.is_none() || idx > latest.as_ref().unwrap().0) {
                     latest = Some((idx, entry.path()));
                 }
             }
         }
     }
-    latest.map(|(_, p)| p).ok_or_else(|| anyhow::anyhow!("no finalized segments found"))
+    latest
+        .map(|(_, p)| p)
+        .ok_or_else(|| anyhow::anyhow!("no finalized segments found"))
 }
 
 pub async fn generate_thumbnails_for_stream(
@@ -68,7 +68,8 @@ pub async fn generate_thumbnails_for_stream(
         // Check if existing thumbnail is fresh enough
         let should_generate = if let Ok(meta) = tokio::fs::metadata(&thumb_path).await {
             if let Ok(modified) = meta.modified() {
-                modified.elapsed().unwrap_or(Duration::MAX) >= Duration::from_secs(interval_seconds as u64)
+                modified.elapsed().unwrap_or(Duration::MAX)
+                    >= Duration::from_secs(interval_seconds as u64)
             } else {
                 true
             }
@@ -78,7 +79,12 @@ pub async fn generate_thumbnails_for_stream(
 
         if should_generate {
             if let Err(e) = run_ffmpeg_thumbnail(&tmp_path, &thumb_path, Some(width)).await {
-                tracing::warn!("Thumbnail generation failed for {} w={}: {}", stream_key, width, e);
+                tracing::warn!(
+                    "Thumbnail generation failed for {} w={}: {}",
+                    stream_key,
+                    width,
+                    e
+                );
             } else {
                 results.push(thumb_path);
             }
@@ -127,11 +133,16 @@ async fn run_ffmpeg_thumbnail(
     let mut args = vec![
         "-y".to_string(),
         "-hide_banner".to_string(),
-        "-loglevel".to_string(), "error".to_string(),
-        "-ss".to_string(), "00:00:00.5".to_string(),
-        "-i".to_string(), input.to_str().unwrap().to_string(),
-        "-vframes".to_string(), "1".to_string(),
-        "-q:v".to_string(), "75".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-ss".to_string(),
+        "00:00:00.5".to_string(),
+        "-i".to_string(),
+        input.to_str().unwrap().to_string(),
+        "-vframes".to_string(),
+        "1".to_string(),
+        "-q:v".to_string(),
+        "75".to_string(),
     ];
 
     if let Some(w) = width {
@@ -143,10 +154,7 @@ async fn run_ffmpeg_thumbnail(
     args.push("webp".to_string());
     args.push(tmp_output.to_str().unwrap().to_string());
 
-    let cmd_output = Command::new("ffmpeg")
-        .args(&args)
-        .output()
-        .await?;
+    let cmd_output = Command::new("ffmpeg").args(&args).output().await?;
 
     if !cmd_output.status.success() {
         let stderr = String::from_utf8_lossy(&cmd_output.stderr);

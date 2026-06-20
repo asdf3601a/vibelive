@@ -1,8 +1,8 @@
 use axum::{
-    extract::{Path, Query, State},
-    response::IntoResponse,
-    http::StatusCode,
     Json,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -41,7 +41,12 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 size_bytes: entry.size_bytes,
                 duration_seconds: entry.duration_seconds,
                 url: entry.url,
-                thumbnail_url: entry.thumbnails.values().next().cloned().unwrap_or_default(),
+                thumbnail_url: entry
+                    .thumbnails
+                    .values()
+                    .next()
+                    .cloned()
+                    .unwrap_or_default(),
                 thumbnails: entry.thumbnails,
             });
         }
@@ -121,41 +126,45 @@ pub async fn thumbnail(
 ) -> impl IntoResponse {
     let width = crate::api::closest_thumbnail_width(query.width, &state.config.thumbnail_sizes);
 
-    let thumb_dir = PathBuf::from(&state.config.media_dir).join("thumbnails").join("recordings");
+    let thumb_dir = PathBuf::from(&state.config.media_dir)
+        .join("thumbnails")
+        .join("recordings");
     let thumb_path = thumb_dir.join(format!("{}_w{}.webp", filename, width));
 
     match tokio::fs::read(&thumb_path).await {
-        Ok(data) => {
-            (
-                StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "image/webp")],
-                data,
-            ).into_response()
-        }
+        Ok(data) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "image/webp")],
+            data,
+        )
+            .into_response(),
         Err(_) => {
             // Fallback: generate on-the-fly if pre-generated doesn't exist
-            let video_path = PathBuf::from(&state.config.media_dir).join("recordings").join(&filename);
+            let video_path = PathBuf::from(&state.config.media_dir)
+                .join("recordings")
+                .join(&filename);
             if !tokio::fs::try_exists(&video_path).await.unwrap_or(false) {
                 return (StatusCode::NOT_FOUND, "Recording not found").into_response();
             }
 
             let _ = tokio::fs::create_dir_all(&thumb_dir).await;
-            match crate::thumbnail::generate_thumbnails_for_file(&video_path, &thumb_dir, &[width]).await {
-                Ok(paths) if !paths.is_empty() => {
-                    match tokio::fs::read(&paths[0]).await {
-                        Ok(data) => {
-                            (
-                                StatusCode::OK,
-                                [(axum::http::header::CONTENT_TYPE, "image/webp")],
-                                data,
-                            ).into_response()
-                        }
-                        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read thumbnail").into_response(),
-                    }
-                }
-                Ok(_) => {
-                    (StatusCode::NOT_FOUND, "Thumbnail not available").into_response()
-                }
+            match crate::thumbnail::generate_thumbnails_for_file(&video_path, &thumb_dir, &[width])
+                .await
+            {
+                Ok(paths) if !paths.is_empty() => match tokio::fs::read(&paths[0]).await {
+                    Ok(data) => (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "image/webp")],
+                        data,
+                    )
+                        .into_response(),
+                    Err(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to read thumbnail",
+                    )
+                        .into_response(),
+                },
+                Ok(_) => (StatusCode::NOT_FOUND, "Thumbnail not available").into_response(),
                 Err(e) => {
                     tracing::warn!("Thumbnail generation failed for {}: {}", filename, e);
                     (StatusCode::NOT_FOUND, "Thumbnail not available").into_response()
@@ -164,5 +173,3 @@ pub async fn thumbnail(
         }
     }
 }
-
-

@@ -192,7 +192,11 @@ const activeRecordingLoopEnabled = ref(false)
 const selectedStreamKey = ref('')
 const startDate = ref('')
 const endDate = ref('')
-const viewMode = ref<'grid' | 'list'>('grid')
+const viewMode = ref<'grid' | 'list'>((localStorage.getItem('recordings_view_mode') as 'grid' | 'list') || 'grid')
+
+watch(viewMode, (val) => {
+  localStorage.setItem('recordings_view_mode', val)
+})
 
 // Only show refresh toast when recordings are actually added or removed.
 // Field-level changes (timestamps, thumbnails) should not trigger the toast.

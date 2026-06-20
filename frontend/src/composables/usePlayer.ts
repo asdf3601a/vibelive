@@ -31,7 +31,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   const isMuted = ref(false)
   const displayVolume = ref(volume.value)
   const volumeBoostEnabled = ref(localStorage.getItem('player_volume_boost') === 'true')
-  const autoplayAllowed = ref(false)
+  const autoplayAllowed = ref(sessionStorage.getItem('player_autoplay_allowed') === 'true')
 
   let audioCtx: AudioContext | null = null
   let gainNode: GainNode | null = null
@@ -380,6 +380,11 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       await ctx.resume()
       ctx.close()
       autoplayAllowed.value = true
+      sessionStorage.setItem('player_autoplay_allowed', 'true')
+      if (videoRef.value && isPlaying.value) {
+        videoRef.value.muted = false
+        isMuted.value = false
+      }
     } catch {
       /* permission not granted, fallback to muted autoplay */
     }

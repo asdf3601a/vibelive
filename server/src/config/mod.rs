@@ -35,8 +35,7 @@ impl Config {
             api_port: env::var("API_PORT")
                 .unwrap_or_else(|_| "8080".into())
                 .parse()?,
-            media_dir: env::var("MEDIA_DIR")
-                .unwrap_or_else(|_| "./data".into()),
+            media_dir: env::var("MEDIA_DIR").unwrap_or_else(|_| "./data".into()),
             hls_segment_duration: env::var("HLS_SEGMENT_DURATION")
                 .unwrap_or_else(|_| "2".into())
                 .parse()?,

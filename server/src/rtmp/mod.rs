@@ -4,9 +4,9 @@ pub mod session;
 
 pub use server::start_rtmp_server;
 
-use std::collections::HashMap;
 use crate::hls::HlsStreamState;
 use crate::recording::Fmp4Recorder;
+use std::collections::HashMap;
 
 pub struct StreamManager {
     publishers: HashMap<String, PublisherInfo>,
@@ -84,12 +84,15 @@ impl StreamManager {
         if let Some(ref mut info) = self.publishers.get_mut(stream_key) {
             info.disconnected_at = Some(now);
         }
-        self.pending_streams.insert(stream_key.to_string(), PendingStream {
-            stream_key: stream_key.to_string(),
-            disconnected_at: now,
-            hls_state,
-            recorder,
-        });
+        self.pending_streams.insert(
+            stream_key.to_string(),
+            PendingStream {
+                stream_key: stream_key.to_string(),
+                disconnected_at: now,
+                hls_state,
+                recorder,
+            },
+        );
     }
 
     pub fn reconnect(&mut self, stream_key: &str) -> Option<PendingStream> {

@@ -40,8 +40,7 @@ pub fn write_u32(data: &mut [u8], value: u32) {
 
 pub fn read_u64(data: &[u8]) -> u64 {
     u64::from_be_bytes([
-        data[0], data[1], data[2], data[3],
-        data[4], data[5], data[6], data[7],
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
     ])
 }
 

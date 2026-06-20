@@ -1,4 +1,4 @@
-use super::{VideoCodec, AudioCodec, Fmp4Muxer};
+use super::{AudioCodec, Fmp4Muxer, VideoCodec};
 
 // ── RFC 6381 codec strings ───────────────────────────────────────
 
@@ -17,7 +17,10 @@ impl Fmp4Muxer {
                 if config.len() < 4 {
                     return None;
                 }
-                Some(format!("avc1.{:02X}{:02X}{:02X}", config[1], config[2], config[3]))
+                Some(format!(
+                    "avc1.{:02X}{:02X}{:02X}",
+                    config[1], config[2], config[3]
+                ))
             }
             VideoCodec::H265 => {
                 let config = self.video_config.as_ref()?;
@@ -59,7 +62,7 @@ impl Fmp4Muxer {
             }
             VideoCodec::AV1 => {
                 let config = self.video_config.as_ref()?;
-                let av1c = if config.len() > 0 && config[0] == 0x81 {
+                let av1c = if !config.is_empty() && config[0] == 0x81 {
                     config.to_vec()
                 } else {
                     av1c_box_from_config(config)
@@ -80,7 +83,10 @@ impl Fmp4Muxer {
                     8
                 };
                 let tier = if seq_tier_0 == 1 { 'H' } else { 'M' };
-                Some(format!("av01.{}.{:02}{}{}", profile, level_idx, tier, bit_depth))
+                Some(format!(
+                    "av01.{}.{:02}{}{}",
+                    profile, level_idx, tier, bit_depth
+                ))
             }
         }
     }
@@ -100,7 +106,7 @@ impl Fmp4Muxer {
         v = ((v & 0x33333333) << 2) | ((v >> 2) & 0x33333333);
         v = ((v & 0x0F0F0F0F) << 4) | ((v >> 4) & 0x0F0F0F0F);
         v = ((v & 0x00FF00FF) << 8) | ((v >> 8) & 0x00FF00FF);
-        (v << 16) | (v >> 16)
+        v.rotate_right(16)
     }
 }
 
@@ -114,7 +120,11 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, byte_offset: 0, bit_offset: 0 }
+        Self {
+            data,
+            byte_offset: 0,
+            bit_offset: 0,
+        }
     }
 
     fn read_bit(&mut self) -> u8 {
@@ -159,7 +169,10 @@ fn parse_av1_sequence_header(payload: &[u8]) -> Option<Av1SeqHeader> {
     }
 
     let seq_profile = r.read_bits(3) as u8;
-    let mut h = Av1SeqHeader { seq_profile, ..Default::default() };
+    let mut h = Av1SeqHeader {
+        seq_profile,
+        ..Default::default()
+    };
     let _still_picture = r.read_bit();
     let reduced_still_picture_header = r.read_bit();
 
@@ -476,11 +489,15 @@ pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
         if obu_has_size_field == 1 {
             let mut shift = 0;
             loop {
-                if offset >= config.len() { break; }
+                if offset >= config.len() {
+                    break;
+                }
                 let byte = config[offset];
                 offset += 1;
                 obu_size |= ((byte & 0x7F) as usize) << shift;
-                if byte & 0x80 == 0 { break; }
+                if byte & 0x80 == 0 {
+                    break;
+                }
                 shift += 7;
             }
         } else {
@@ -564,7 +581,9 @@ pub fn build_dops(opus_head: &[u8]) -> Vec<u8> {
     };
 
     if head.len() < 11 {
-        return vec![0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xBB, 0x80, 0x00, 0x00, 0x00];
+        return vec![
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xBB, 0x80, 0x00, 0x00, 0x00,
+        ];
     }
 
     let version = 0u8;
@@ -661,12 +680,19 @@ mod tests {
     fn test_ensure_av1_sizeless_sequence_header_obu() {
         // Sequence Header OBU (obu_type=1) without size field: header 0x08
         let obu = vec![
-            0x08,       // obu_type=1, obu_extension_flag=0, obu_has_size_field=0
+            0x08, // obu_type=1, obu_extension_flag=0, obu_has_size_field=0
             0x00, 0x00, // arbitrary payload
         ];
         let result = ensure_av1_obu_size_fields(&obu);
-        assert!(result[0] & 0x02 != 0, "obu_has_size_field must be set after rewrite");
-        assert_ne!(result.len(), obu.len(), "result should differ from input (size field added)");
+        assert!(
+            result[0] & 0x02 != 0,
+            "obu_has_size_field must be set after rewrite"
+        );
+        assert_ne!(
+            result.len(),
+            obu.len(),
+            "result should differ from input (size field added)"
+        );
         // Parse LEB128 size
         let mut size = 0usize;
         let mut shift = 0;
@@ -675,10 +701,16 @@ mod tests {
             let byte = result[pos];
             size |= ((byte & 0x7F) as usize) << shift;
             pos += 1;
-            if byte & 0x80 == 0 { break; }
+            if byte & 0x80 == 0 {
+                break;
+            }
             shift += 7;
         }
-        assert_eq!(size, obu.len() - 1, "LEB128 size should equal original payload length");
+        assert_eq!(
+            size,
+            obu.len() - 1,
+            "LEB128 size should equal original payload length"
+        );
     }
 
     #[test]
@@ -686,14 +718,18 @@ mod tests {
         let mut muxer = super::super::Fmp4Muxer::new();
         muxer.set_video_codec(VideoCodec::H265, 1920, 1080);
         muxer.set_video_config(vec![
-            0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x78, 0xF0, 0x00, 0xFC,
-            0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 0x03, 0x20,
-            0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x03,
-            0x00, 0x00, 0x03, 0x00, 0x78, 0xAC, 0x09,
+            0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xF0,
+            0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 0x03, 0x20, 0x00, 0x00, 0x03, 0x00,
+            0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xAC, 0x09,
         ]);
-        assert_eq!(muxer.video_codec_string(), Some("hvc1.1.6.L120".to_string()));
-        assert_eq!(muxer.video_codec_string(), Some("hvc1.1.6.L120".to_string()));
+        assert_eq!(
+            muxer.video_codec_string(),
+            Some("hvc1.1.6.L120".to_string())
+        );
+        assert_eq!(
+            muxer.video_codec_string(),
+            Some("hvc1.1.6.L120".to_string())
+        );
     }
 
     #[test]
@@ -717,16 +753,17 @@ mod tests {
         let mut muxer = super::super::Fmp4Muxer::new();
         muxer.set_video_codec(VideoCodec::H265, 1920, 1080);
         muxer.set_video_config(vec![
-            0x01,       // configurationVersion
-            0x01,       // profile_space=0, tier_flag=0, profile_idc=1 (Main)
-            0x80, 0x00, 0x00, 0x00,  // profile_compatibility_flags
-            0x12, 0x34, 0x00, 0x00, 0x00, 0x00,  // constraint_indicator_flags
-            0x78,       // level_idc = 120
-            0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00,
-            0x0F, 0x03, 0x20, 0x00, 0x00, 0x03, 0x00, 0x80,
-            0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78,
-            0xAC, 0x09,
+            0x01, // configurationVersion
+            0x01, // profile_space=0, tier_flag=0, profile_idc=1 (Main)
+            0x80, 0x00, 0x00, 0x00, // profile_compatibility_flags
+            0x12, 0x34, 0x00, 0x00, 0x00, 0x00, // constraint_indicator_flags
+            0x78, // level_idc = 120
+            0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 0x03, 0x20, 0x00, 0x00, 0x03,
+            0x00, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xAC, 0x09,
         ]);
-        assert_eq!(muxer.video_codec_string(), Some("hvc1.1.1.L120.12.34".to_string()));
+        assert_eq!(
+            muxer.video_codec_string(),
+            Some("hvc1.1.1.L120.12.34".to_string())
+        );
     }
 }

@@ -160,32 +160,38 @@ fn read_composition_time(data: &[u8], offset: usize) -> Result<i32, &'static str
     let ct_bytes: [u8; 3] = [data[offset], data[offset + 1], data[offset + 2]];
     let ct = i32::from_be_bytes([
         if ct_bytes[0] & 0x80 != 0 { 0xFF } else { 0x00 },
-        ct_bytes[0], ct_bytes[1], ct_bytes[2],
+        ct_bytes[0],
+        ct_bytes[1],
+        ct_bytes[2],
     ]);
     Ok(ct)
 }
 
 /// Parse Enhanced RTMP video header.
 /// Supports both the legacy 0xCC draft format and the veovera/FFmpeg format.
-pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, &[u8]), &'static str> {
+pub fn parse_enhanced_video_header(
+    data: &[u8],
+) -> Result<(EnhancedVideoHeader, &[u8]), &'static str> {
     if data.len() < 5 {
         return Err("data too short for enhanced video header");
     }
 
     // Legacy 0xCC format: [0xCC, packet_type, FourCC(4), ...]
     if data[0] == ENHANCED_VIDEO_CODEC_ID && data.len() >= 6 {
-        let packet_type = parse_video_packet_type(data[1])
-            .ok_or("unknown video packet type")?;
+        let packet_type = parse_video_packet_type(data[1]).ok_or("unknown video packet type")?;
 
         // Multitrack wrapper: only consume 0xCC + packet_type
         if packet_type == VideoPacketType::Multitrack {
             let frame_type = VideoFrameType::KeyFrame;
-            return Ok((EnhancedVideoHeader {
-                packet_type,
-                frame_type,
-                codec: EnhancedVideoCodec::Unknown(0),
-                composition_time_offset: 0,
-            }, &data[2..]));
+            return Ok((
+                EnhancedVideoHeader {
+                    packet_type,
+                    frame_type,
+                    codec: EnhancedVideoCodec::Unknown(0),
+                    composition_time_offset: 0,
+                },
+                &data[2..],
+            ));
         }
 
         let fourcc_bytes: [u8; 4] = [data[2], data[3], data[4], data[5]];
@@ -194,14 +200,14 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
 
         let mut composition_time_offset = 0i32;
         let mut consumed = 6;
-        if codec == EnhancedVideoCodec::Avc || codec == EnhancedVideoCodec::Hevc {
-            if packet_type == VideoPacketType::CodedFrames {
-                if data.len() < 9 {
-                    return Err("data too short for avc/hevc header");
-                }
-                composition_time_offset = read_composition_time(data, 6)?;
-                consumed = 9;
+        if (codec == EnhancedVideoCodec::Avc || codec == EnhancedVideoCodec::Hevc)
+            && packet_type == VideoPacketType::CodedFrames
+        {
+            if data.len() < 9 {
+                return Err("data too short for avc/hevc header");
             }
+            composition_time_offset = read_composition_time(data, 6)?;
+            consumed = 9;
         }
 
         let frame_type = if packet_type == VideoPacketType::SequenceStart {
@@ -210,12 +216,15 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
             VideoFrameType::InterFrame
         };
 
-        return Ok((EnhancedVideoHeader {
-            packet_type,
-            frame_type,
-            codec,
-            composition_time_offset,
-        }, &data[consumed..]));
+        return Ok((
+            EnhancedVideoHeader {
+                packet_type,
+                frame_type,
+                codec,
+                composition_time_offset,
+            },
+            &data[consumed..],
+        ));
     }
 
     // Veovera/FFmpeg format: [isExHeader(1) | frameType(3) | packetType(4), FourCC(4), ...]
@@ -225,19 +234,22 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
         return Err("not an enhanced video header");
     }
 
-    let frame_type = parse_video_frame_type((first_byte >> 4) & 0x07)
-        .ok_or("unknown video frame type")?;
-    let packet_type = parse_video_packet_type(first_byte & 0x0F)
-        .ok_or("unknown video packet type")?;
+    let frame_type =
+        parse_video_frame_type((first_byte >> 4) & 0x07).ok_or("unknown video frame type")?;
+    let packet_type =
+        parse_video_packet_type(first_byte & 0x0F).ok_or("unknown video packet type")?;
 
     // Multitrack wrapper: only consume header + multitrack control byte
     if packet_type == VideoPacketType::Multitrack {
-        return Ok((EnhancedVideoHeader {
-            packet_type,
-            frame_type,
-            codec: EnhancedVideoCodec::Unknown(0),
-            composition_time_offset: 0,
-        }, &data[1..]));
+        return Ok((
+            EnhancedVideoHeader {
+                packet_type,
+                frame_type,
+                codec: EnhancedVideoCodec::Unknown(0),
+                composition_time_offset: 0,
+            },
+            &data[1..],
+        ));
     }
 
     let fourcc_bytes: [u8; 4] = [data[1], data[2], data[3], data[4]];
@@ -253,15 +265,20 @@ pub fn parse_enhanced_video_header(data: &[u8]) -> Result<(EnhancedVideoHeader, 
         consumed = 8;
     }
 
-    Ok((EnhancedVideoHeader {
-        packet_type,
-        frame_type,
-        codec,
-        composition_time_offset,
-    }, &data[consumed..]))
+    Ok((
+        EnhancedVideoHeader {
+            packet_type,
+            frame_type,
+            codec,
+            composition_time_offset,
+        },
+        &data[consumed..],
+    ))
 }
 
-pub fn parse_enhanced_audio_header(data: &[u8]) -> Result<(EnhancedAudioHeader, &[u8]), &'static str> {
+pub fn parse_enhanced_audio_header(
+    data: &[u8],
+) -> Result<(EnhancedAudioHeader, &[u8]), &'static str> {
     if data.is_empty() {
         return Err("data too short for enhanced audio header");
     }
@@ -280,33 +297,36 @@ pub fn parse_enhanced_audio_header(data: &[u8]) -> Result<(EnhancedAudioHeader, 
         };
 
         if packet_type == AudioPacketType::Multitrack {
-            return Ok((EnhancedAudioHeader {
-                packet_type,
-                codec: EnhancedAudioCodec::Unknown(0),
-            }, &data[2..]));
+            return Ok((
+                EnhancedAudioHeader {
+                    packet_type,
+                    codec: EnhancedAudioCodec::Unknown(0),
+                },
+                &data[2..],
+            ));
         }
 
         let fourcc_bytes: [u8; 4] = [data[2], data[3], data[4], data[5]];
         let fourcc = u32::from_be_bytes(fourcc_bytes);
         let codec = EnhancedAudioCodec::from_fourcc(fourcc);
 
-        return Ok((EnhancedAudioHeader {
-            packet_type,
-            codec,
-        }, &data[6..]));
+        return Ok((EnhancedAudioHeader { packet_type, codec }, &data[6..]));
     }
 
     // Veovera/FFmpeg format: [soundFormat(4) | packetType(4), FourCC(4), ...]
     // soundFormat == 9 means extended header
     let packet_type_byte = data[0] & 0x0F;
-    let packet_type = parse_audio_packet_type(packet_type_byte)
-        .ok_or("unknown audio packet type")?;
+    let packet_type =
+        parse_audio_packet_type(packet_type_byte).ok_or("unknown audio packet type")?;
 
     if packet_type == AudioPacketType::Multitrack {
-        return Ok((EnhancedAudioHeader {
-            packet_type,
-            codec: EnhancedAudioCodec::Unknown(0),
-        }, &data[1..]));
+        return Ok((
+            EnhancedAudioHeader {
+                packet_type,
+                codec: EnhancedAudioCodec::Unknown(0),
+            },
+            &data[1..],
+        ));
     }
 
     if data.len() < 5 {
@@ -316,13 +336,19 @@ pub fn parse_enhanced_audio_header(data: &[u8]) -> Result<(EnhancedAudioHeader, 
     let fourcc = u32::from_be_bytes(fourcc_bytes);
     let codec = EnhancedAudioCodec::from_fourcc(fourcc);
 
-    Ok((EnhancedAudioHeader {
-        packet_type,
-        codec,
-    }, &data[5..]))
+    Ok((EnhancedAudioHeader { packet_type, codec }, &data[5..]))
 }
 
-pub fn parse_enhanced_video_multitrack(data: &[u8]) -> Result<(MultitrackType, Option<VideoPacketType>, Vec<EnhancedVideoTrack<'_>>), &'static str> {
+pub fn parse_enhanced_video_multitrack(
+    data: &[u8],
+) -> Result<
+    (
+        MultitrackType,
+        Option<VideoPacketType>,
+        Vec<EnhancedVideoTrack<'_>>,
+    ),
+    &'static str,
+> {
     if data.is_empty() {
         return Err("data too short for multitrack header");
     }
@@ -345,7 +371,12 @@ pub fn parse_enhanced_video_multitrack(data: &[u8]) -> Result<(MultitrackType, O
         if data.len() < offset + 4 {
             return Err("data too short for shared fourcc");
         }
-        let fourcc = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+        let fourcc = u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
         shared_codec = Some(EnhancedVideoCodec::from_fourcc(fourcc));
         offset += 4;
     }
@@ -365,11 +396,18 @@ pub fn parse_enhanced_video_multitrack(data: &[u8]) -> Result<(MultitrackType, O
             if data.len() < offset + 4 {
                 return Err("data too short for manytracksmanycodecs fourcc");
             }
-            let fourcc = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+            let fourcc = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
             offset += 4;
             EnhancedVideoCodec::from_fourcc(fourcc)
         } else {
-            shared_codec.clone().unwrap_or(EnhancedVideoCodec::Unknown(0))
+            shared_codec
+                .clone()
+                .unwrap_or(EnhancedVideoCodec::Unknown(0))
         };
 
         let size = if multitrack_type != MultitrackType::OneTrack {
@@ -405,7 +443,12 @@ pub fn parse_enhanced_video_multitrack(data: &[u8]) -> Result<(MultitrackType, O
             payload = &payload[3..];
         }
 
-        tracks.push(EnhancedVideoTrack { track_id, codec, payload, composition_time_offset: track_cto });
+        tracks.push(EnhancedVideoTrack {
+            track_id,
+            codec,
+            payload,
+            composition_time_offset: track_cto,
+        });
 
         if multitrack_type == MultitrackType::OneTrack {
             break;
@@ -415,7 +458,16 @@ pub fn parse_enhanced_video_multitrack(data: &[u8]) -> Result<(MultitrackType, O
     Ok((multitrack_type, inner_packet_type, tracks))
 }
 
-pub fn parse_enhanced_audio_multitrack(data: &[u8]) -> Result<(MultitrackType, Option<AudioPacketType>, Vec<EnhancedAudioTrack<'_>>), &'static str> {
+pub fn parse_enhanced_audio_multitrack(
+    data: &[u8],
+) -> Result<
+    (
+        MultitrackType,
+        Option<AudioPacketType>,
+        Vec<EnhancedAudioTrack<'_>>,
+    ),
+    &'static str,
+> {
     if data.is_empty() {
         return Err("data too short for multitrack header");
     }
@@ -438,7 +490,12 @@ pub fn parse_enhanced_audio_multitrack(data: &[u8]) -> Result<(MultitrackType, O
         if data.len() < offset + 4 {
             return Err("data too short for shared fourcc");
         }
-        let fourcc = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+        let fourcc = u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
         shared_codec = Some(EnhancedAudioCodec::from_fourcc(fourcc));
         offset += 4;
     }
@@ -457,11 +514,18 @@ pub fn parse_enhanced_audio_multitrack(data: &[u8]) -> Result<(MultitrackType, O
             if data.len() < offset + 4 {
                 return Err("data too short for manytracksmanycodecs fourcc");
             }
-            let fourcc = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+            let fourcc = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
             offset += 4;
             EnhancedAudioCodec::from_fourcc(fourcc)
         } else {
-            shared_codec.clone().unwrap_or(EnhancedAudioCodec::Unknown(0))
+            shared_codec
+                .clone()
+                .unwrap_or(EnhancedAudioCodec::Unknown(0))
         };
 
         let size = if multitrack_type != MultitrackType::OneTrack {
@@ -483,7 +547,11 @@ pub fn parse_enhanced_audio_multitrack(data: &[u8]) -> Result<(MultitrackType, O
         let payload = &data[offset..offset + size];
         offset += size;
 
-        tracks.push(EnhancedAudioTrack { track_id, codec, payload });
+        tracks.push(EnhancedAudioTrack {
+            track_id,
+            codec,
+            payload,
+        });
 
         if multitrack_type == MultitrackType::OneTrack {
             break;
@@ -545,10 +613,10 @@ mod tests {
     #[test]
     fn test_parse_enhanced_av1_header_legacy() {
         let data: Vec<u8> = vec![
-            0xCC,             // Enhanced Video CodecID (legacy)
-            1,                  // packet_type = CodedFrames
+            0xCC, // Enhanced Video CodecID (legacy)
+            1,    // packet_type = CodedFrames
             b'a', b'v', b'0', b'1', // fourcc "av01"
-            0x0A, 0x0B, 0x0C,      // AV1 OBU data
+            0x0A, 0x0B, 0x0C, // AV1 OBU data
         ];
         assert!(is_enhanced_video(&data));
         let (header, remainder) = parse_enhanced_video_header(&data).unwrap();
@@ -561,9 +629,9 @@ mod tests {
     fn test_parse_enhanced_av1_header_veovera() {
         // Veovera/FFmpeg format: [0x80 | frame_type | packet_type, FourCC, payload]
         let data: Vec<u8> = vec![
-            0x91,             // is_ex=1, frame_type=Key(1), packet_type=CodedFrames(1)
+            0x91, // is_ex=1, frame_type=Key(1), packet_type=CodedFrames(1)
             b'a', b'v', b'0', b'1', // fourcc "av01"
-            0x12, 0x00, 0x0A,      // AV1 OBU data
+            0x12, 0x00, 0x0A, // AV1 OBU data
         ];
         assert!(is_enhanced_video(&data));
         let (header, remainder) = parse_enhanced_video_header(&data).unwrap();
@@ -576,9 +644,9 @@ mod tests {
     #[test]
     fn test_parse_enhanced_av1_sequence_start() {
         let data: Vec<u8> = vec![
-            0x90,             // is_ex=1, frame_type=Key(1), packet_type=SequenceStart(0)
+            0x90, // is_ex=1, frame_type=Key(1), packet_type=SequenceStart(0)
             b'a', b'v', b'0', b'1', // fourcc "av01"
-            0x81, 0x04, 0x0c,      // AV1 sequence header OBU
+            0x81, 0x04, 0x0c, // AV1 sequence header OBU
         ];
         assert!(is_enhanced_video(&data));
         let (header, remainder) = parse_enhanced_video_header(&data).unwrap();
@@ -591,7 +659,7 @@ mod tests {
     #[test]
     fn test_parse_enhanced_avc_with_composition_time() {
         let data: Vec<u8> = vec![
-            0x91,             // is_ex=1, frame_type=Key, packet_type=CodedFrames
+            0x91, // is_ex=1, frame_type=Key, packet_type=CodedFrames
             b'a', b'v', b'c', b'1', // fourcc "avc1"
             0x00, 0x00, 0x21, // composition time = 33ms
             0x67, 0x42, 0xC0, // NAL data
@@ -607,9 +675,9 @@ mod tests {
     #[test]
     fn test_parse_enhanced_inter_frame() {
         let data: Vec<u8> = vec![
-            0xA1,             // is_ex=1, frame_type=Inter(2), packet_type=CodedFrames(1)
+            0xA1, // is_ex=1, frame_type=Inter(2), packet_type=CodedFrames(1)
             b'a', b'v', b'0', b'1', // fourcc "av01"
-            0x12, 0x00, 0x00,      // AV1 OBU data
+            0x12, 0x00, 0x00, // AV1 OBU data
         ];
         let (header, _) = parse_enhanced_video_header(&data).unwrap();
         assert_eq!(header.frame_type, VideoFrameType::InterFrame);
@@ -618,10 +686,10 @@ mod tests {
     #[test]
     fn test_parse_enhanced_audio_header_legacy() {
         let data: Vec<u8> = vec![
-            0xCA,             // Enhanced Audio CodecID (legacy)
-            1,                  // packet_type = CodedFrames
+            0xCA, // Enhanced Audio CodecID (legacy)
+            1,    // packet_type = CodedFrames
             b'O', b'p', b'u', b's', // fourcc "Opus"
-            0x0A, 0x0B,         // Opus frame data
+            0x0A, 0x0B, // Opus frame data
         ];
         assert!(is_enhanced_audio(&data));
         let (header, remainder) = parse_enhanced_audio_header(&data).unwrap();
@@ -633,9 +701,9 @@ mod tests {
     #[test]
     fn test_parse_enhanced_audio_header_veovera() {
         let data: Vec<u8> = vec![
-            0x91,             // soundFormat=9, packet_type=CodedFrames
+            0x91, // soundFormat=9, packet_type=CodedFrames
             b'O', b'p', b'u', b's', // fourcc "Opus"
-            0x0A, 0x0B,         // Opus frame data
+            0x0A, 0x0B, // Opus frame data
         ];
         assert!(is_enhanced_audio(&data));
         let (header, remainder) = parse_enhanced_audio_header(&data).unwrap();
@@ -648,11 +716,11 @@ mod tests {
     fn test_parse_enhanced_audio_multitrack() {
         // OBS/FFmpeg audio multitrack: [0x95, 0x01, "Opus", 0x01, payload]
         let data: Vec<u8> = vec![
-            0x95,             // soundFormat=9 | Multitrack(5)
-            0x01,             // OneTrack | CodedFrames(1)
+            0x95, // soundFormat=9 | Multitrack(5)
+            0x01, // OneTrack | CodedFrames(1)
             b'O', b'p', b'u', b's', // fourcc "Opus"
-            0x01,             // track_id = 1
-            0x0A, 0x0B,       // Opus frame data
+            0x01, // track_id = 1
+            0x0A, 0x0B, // Opus frame data
         ];
         assert!(is_enhanced_audio(&data));
         let (header, remainder) = parse_enhanced_audio_header(&data).unwrap();
@@ -670,10 +738,10 @@ mod tests {
     fn test_parse_enhanced_video_multitrack_onetrack() {
         // OBS/FFmpeg video multitrack: [0x96, 0x01, "av01", 0x01, payload]
         let data: Vec<u8> = vec![
-            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame(0x10)
-            0x01,             // OneTrack | CodedFrames(1)
+            0x96, // is_ex=1 | Multitrack(6) | KeyFrame(0x10)
+            0x01, // OneTrack | CodedFrames(1)
             b'a', b'v', b'0', b'1', // fourcc "av01"
-            0x01,             // track_id = 1
+            0x01, // track_id = 1
             0x0A, 0x0B, 0x0C, // payload
         ];
         assert!(is_enhanced_video(&data));
@@ -691,10 +759,10 @@ mod tests {
     #[test]
     fn test_parse_enhanced_video_multitrack_onetrack_sequence_start() {
         let data: Vec<u8> = vec![
-            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame(0x10)
-            0x00,             // OneTrack | SequenceStart(0)
+            0x96, // is_ex=1 | Multitrack(6) | KeyFrame(0x10)
+            0x00, // OneTrack | SequenceStart(0)
             b'a', b'v', b'0', b'1', // fourcc "av01"
-            0x01,             // track_id = 1
+            0x01, // track_id = 1
             0x81, 0x04, 0x0c, // AV1 config payload
         ];
         let (header, remainder) = parse_enhanced_video_header(&data).unwrap();
@@ -712,10 +780,10 @@ mod tests {
         // Data: [exVideo] [OneTrack|CodedFrames] ["avc1"] [track=1] [CTS=0x001234] [NAL data]
         let nal_data = vec![0x00, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x00, 0x01];
         let mut data: Vec<u8> = vec![
-            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
-            0x01,             // OneTrack | CodedFrames(1)
+            0x96, // is_ex=1 | Multitrack(6) | KeyFrame
+            0x01, // OneTrack | CodedFrames(1)
             b'a', b'v', b'c', b'1', // "avc1"
-            0x00,             // track_id = 0
+            0x00, // track_id = 0
             0x00, 0x12, 0x34, // CTS = 0x1234 (4660)
         ];
         data.extend_from_slice(&nal_data);
@@ -737,10 +805,10 @@ mod tests {
         // CodedFramesX (DTS==PTS optimization) has NO CTS bytes.
         let nal_data = vec![0x00, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x00, 0x01];
         let mut data: Vec<u8> = vec![
-            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
-            0x03,             // OneTrack | CodedFramesX(3)
+            0x96, // is_ex=1 | Multitrack(6) | KeyFrame
+            0x03, // OneTrack | CodedFramesX(3)
             b'a', b'v', b'c', b'1', // "avc1"
-            0x00,             // track_id = 0
+            0x00, // track_id = 0
         ];
         data.extend_from_slice(&nal_data);
 
@@ -755,10 +823,10 @@ mod tests {
     fn test_parse_hevc_multitrack_strips_cts() {
         let nal_data = vec![0x00, 0x00, 0x00, 0x06, 0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF];
         let mut data: Vec<u8> = vec![
-            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
-            0x01,             // OneTrack | CodedFrames(1)
+            0x96, // is_ex=1 | Multitrack(6) | KeyFrame
+            0x01, // OneTrack | CodedFrames(1)
             b'h', b'v', b'c', b'1', // "hvc1"
-            0x00,             // track_id = 0
+            0x00, // track_id = 0
             0xFF, 0xFE, 0x00, // CTS = -512 (sign-extended from 0xFFFE00)
         ];
         data.extend_from_slice(&nal_data);
@@ -775,11 +843,11 @@ mod tests {
         // Legacy 0xCC format: [0xCC] [Multitrack|frameType] [multitrack_type] ["avc1"] [track_id] [CTS] [NAL]
         let nal_data = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88];
         let mut data: Vec<u8> = vec![
-            0xCC,             // legacy ExVideo marker
-            0x06,             // packet_type = Multitrack(6), frame_type=InterFrame
-            0x01,             // multitrack_type: OneTrack | CodedFrames
+            0xCC, // legacy ExVideo marker
+            0x06, // packet_type = Multitrack(6), frame_type=InterFrame
+            0x01, // multitrack_type: OneTrack | CodedFrames
             b'a', b'v', b'c', b'1', // "avc1"
-            0x00,             // track_id = 0
+            0x00, // track_id = 0
             0x00, 0x00, 0x00, // CTS = 0
         ];
         data.extend_from_slice(&nal_data);
@@ -797,10 +865,10 @@ mod tests {
         // SequenceStart has NO CTS, only raw AVCC config.
         let config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         let mut data: Vec<u8> = vec![
-            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
-            0x00,             // OneTrack | SequenceStart(0)
+            0x96, // is_ex=1 | Multitrack(6) | KeyFrame
+            0x00, // OneTrack | SequenceStart(0)
             b'a', b'v', b'c', b'1', // "avc1"
-            0x00,             // track_id = 0
+            0x00, // track_id = 0
         ];
         data.extend_from_slice(&config);
 
@@ -815,10 +883,10 @@ mod tests {
         // AV1 has no CTS - payload should pass through unchanged
         let obu_data = vec![0x0A, 0x04, 0x00, 0x00, 0x00, 0x40];
         let mut data: Vec<u8> = vec![
-            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
-            0x01,             // OneTrack | CodedFrames(1)
+            0x96, // is_ex=1 | Multitrack(6) | KeyFrame
+            0x01, // OneTrack | CodedFrames(1)
             b'a', b'v', b'0', b'1', // "av01"
-            0x00,             // track_id = 0
+            0x00, // track_id = 0
         ];
         data.extend_from_slice(&obu_data);
 
@@ -836,18 +904,29 @@ mod tests {
         let track0_size = 3 + nal1.len(); // CTS 3 + NAL
         let track1_size = 3 + nal2.len();
         let mut data: Vec<u8> = vec![
-            0x96,             // is_ex=1 | Multitrack(6) | KeyFrame
-            0x11,             // ManyTracks(1) | CodedFrames(1)
-            b'a', b'v', b'c', b'1', // "avc1"
-            0x00,             // track 0 id
-            (track0_size >> 16) as u8, (track0_size >> 8) as u8, track0_size as u8, // size
-            0x00, 0x00, 0x01, // CTS = 1
+            0x96, // is_ex=1 | Multitrack(6) | KeyFrame
+            0x11, // ManyTracks(1) | CodedFrames(1)
+            b'a',
+            b'v',
+            b'c',
+            b'1', // "avc1"
+            0x00, // track 0 id
+            (track0_size >> 16) as u8,
+            (track0_size >> 8) as u8,
+            track0_size as u8, // size
+            0x00,
+            0x00,
+            0x01, // CTS = 1
         ];
         data.extend_from_slice(&nal1);
         data.extend_from_slice(&[
-            0x01,             // track 1 id
-            (track1_size >> 16) as u8, (track1_size >> 8) as u8, track1_size as u8, // size
-            0x00, 0x00, 0x02, // CTS = 2
+            0x01, // track 1 id
+            (track1_size >> 16) as u8,
+            (track1_size >> 8) as u8,
+            track1_size as u8, // size
+            0x00,
+            0x00,
+            0x02, // CTS = 2
         ]);
         data.extend_from_slice(&nal2);
 

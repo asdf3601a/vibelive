@@ -63,7 +63,8 @@ async fn main() -> anyhow::Result<()> {
                 let md = media_dir.clone();
                 let sz = sizes.clone();
                 tokio::spawn(async move {
-                    let _ = crate::thumbnail::generate_thumbnails_for_stream(&md, &key, &sz, iv).await;
+                    let _ =
+                        crate::thumbnail::generate_thumbnails_for_stream(&md, &key, &sz, iv).await;
                 });
             }
         }

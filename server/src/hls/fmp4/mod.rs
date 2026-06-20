@@ -2,10 +2,8 @@ pub mod codec;
 
 pub use codec::ensure_av1_obu_size_fields;
 
+use codec::{av1c_box_from_config, build_dfla, build_dops, build_esds, parse_flac_streaminfo};
 use std::borrow::Cow;
-use codec::{
-    av1c_box_from_config, build_esds, build_dops, build_dfla, parse_flac_streaminfo,
-};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum VideoCodec {
@@ -90,10 +88,11 @@ impl Fmp4Muxer {
                 AudioCodec::Aac => {
                     if config.len() >= 2 {
                         const AAC_SAMPLE_RATES: [u32; 16] = [
-                            96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
-                            16000, 12000, 11025, 8000, 7350, 0, 0, 0,
+                            96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000,
+                            11025, 8000, 7350, 0, 0, 0,
                         ];
-                        let rate_index = ((config[0] as u32 & 0x07) << 1) | ((config[1] as u32 >> 7) & 0x01);
+                        let rate_index =
+                            ((config[0] as u32 & 0x07) << 1) | ((config[1] as u32 >> 7) & 0x01);
                         if (rate_index as usize) < AAC_SAMPLE_RATES.len() {
                             self.audio_sample_rate = AAC_SAMPLE_RATES[rate_index as usize];
                         }
@@ -124,11 +123,7 @@ impl Fmp4Muxer {
             self.video_base_dts = dts;
         }
         let size = data.len() as u32;
-        let flags = if is_keyframe {
-            0x02000000
-        } else {
-            0x01010000
-        };
+        let flags = if is_keyframe { 0x02000000 } else { 0x01010000 };
         self.video_samples.push(Sample {
             data: data.into_owned(),
             dts,
@@ -158,17 +153,24 @@ impl Fmp4Muxer {
     }
 
     pub fn last_video_sample_duration(&self) -> u64 {
-        self.video_samples.last().map(|s| s.duration as u64).unwrap_or(33)
+        self.video_samples
+            .last()
+            .map(|s| s.duration as u64)
+            .unwrap_or(33)
     }
 
     pub fn last_audio_sample_duration(&self) -> u64 {
-        self.audio_samples.last().map(|s| s.duration as u64).unwrap_or(21)
+        self.audio_samples
+            .last()
+            .map(|s| s.duration as u64)
+            .unwrap_or(21)
     }
 
     fn compute_and_set_durations(&mut self) {
         if !self.video_samples.is_empty() {
             let avg_dur = if self.video_samples.len() > 1 {
-                let total = self.video_samples.last().unwrap().dts - self.video_samples.first().unwrap().dts;
+                let total = self.video_samples.last().unwrap().dts
+                    - self.video_samples.first().unwrap().dts;
                 (total / (self.video_samples.len() - 1) as u64) as u32
             } else {
                 33
@@ -180,7 +182,8 @@ impl Fmp4Muxer {
 
         if !self.audio_samples.is_empty() {
             let avg_dur = if self.audio_samples.len() > 1 {
-                let total = self.audio_samples.last().unwrap().dts - self.audio_samples.first().unwrap().dts;
+                let total = self.audio_samples.last().unwrap().dts
+                    - self.audio_samples.first().unwrap().dts;
                 (total / (self.audio_samples.len() - 1) as u64) as u32
             } else {
                 21
@@ -209,7 +212,8 @@ impl Fmp4Muxer {
         let mut moof_buf = Vec::new();
         self.write_moof_multi(&mut moof_buf, self.video_sequence_number, &tracks);
 
-        let mdat_payload_size: usize = tracks.iter()
+        let mdat_payload_size: usize = tracks
+            .iter()
             .map(|(_, _, samples)| samples.iter().map(|s| s.data.len()).sum::<usize>())
             .sum();
         let mdat_size = 8 + mdat_payload_size;
@@ -297,16 +301,26 @@ impl Fmp4Muxer {
         data.extend_from_slice(&0x00010000u32.to_be_bytes());
         data.extend_from_slice(&0x0100u16.to_be_bytes());
         data.extend_from_slice(&[0u8; 10]);
-        data.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(&[
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+        ]);
         data.extend_from_slice(&[0u8; 24]);
-        let max_track_id = if self.audio_codec.is_some() { 2 } else if self.video_codec.is_some() { 1 } else { 1 };
+        let max_track_id = if self.audio_codec.is_some() { 2 } else { 1 };
         data.extend_from_slice(&(max_track_id + 1u32).to_be_bytes());
         write_fullbox(w, b"mvhd", 0, 0, &data);
     }
 
     fn write_video_trak(&self, w: &mut Vec<u8>) {
         let mut trak_data = Vec::new();
-        self.write_tkhd(&mut trak_data, 1, 0, (self.video_width as u32) << 16, (self.video_height as u32) << 16);
+        self.write_tkhd(
+            &mut trak_data,
+            1,
+            0,
+            (self.video_width as u32) << 16,
+            (self.video_height as u32) << 16,
+        );
         self.write_edts(&mut trak_data, true);
         self.write_mdia_video(&mut trak_data);
         write_box(w, b"trak", &trak_data);
@@ -356,7 +370,11 @@ impl Fmp4Muxer {
         data.extend_from_slice(&0u16.to_be_bytes());
         data.extend_from_slice(&volume.to_be_bytes());
         data.extend_from_slice(&0u16.to_be_bytes());
-        data.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(&[
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+        ]);
         data.extend_from_slice(&width.to_be_bytes());
         data.extend_from_slice(&height.to_be_bytes());
         write_fullbox(w, b"tkhd", 0, 0x000003, &data);
@@ -471,13 +489,17 @@ impl Fmp4Muxer {
     }
 
     fn opus_roll_distance(&self) -> i16 {
-        let Some(ref config) = self.audio_config else { return -1 };
+        let Some(ref config) = self.audio_config else {
+            return -1;
+        };
         let head = if config.len() > 8 && &config[..8] == b"OpusHead" {
             &config[8..]
         } else {
             config.as_slice()
         };
-        if head.len() < 12 { return -1; }
+        if head.len() < 12 {
+            return -1;
+        }
         let pre_skip = u16::from_le_bytes([head[2], head[3]]);
         -(pre_skip as i16)
     }
@@ -525,7 +547,12 @@ impl Fmp4Muxer {
 
     // ── Consolidated visual sample entry ─────────────────────────
 
-    fn write_visual_sample_entry(&self, w: &mut Vec<u8>, codec_fourcc: &[u8; 4], config_box_name: &[u8; 4]) {
+    fn write_visual_sample_entry(
+        &self,
+        w: &mut Vec<u8>,
+        codec_fourcc: &[u8; 4],
+        config_box_name: &[u8; 4],
+    ) {
         let mut data = Vec::new();
         data.extend_from_slice(&[0u8; 6]);
         data.extend_from_slice(&1u16.to_be_bytes());
@@ -602,8 +629,15 @@ impl Fmp4Muxer {
 
     fn write_opus_sample_entry(&self, w: &mut Vec<u8>) {
         let dops = self.audio_config.as_ref().map(|c| build_dops(c));
-        let channel_count = dops.as_ref()
-            .and_then(|d| if d.len() > 1 && d[1] >= 1 { Some(d[1]) } else { None })
+        let channel_count = dops
+            .as_ref()
+            .and_then(|d| {
+                if d.len() > 1 && d[1] >= 1 {
+                    Some(d[1])
+                } else {
+                    None
+                }
+            })
             .unwrap_or(2);
 
         let mut data = Vec::new();
@@ -618,14 +652,32 @@ impl Fmp4Muxer {
 
         match dops {
             Some(ref d) => write_box(&mut data, b"dOps", d),
-            None => write_box(&mut data, b"dOps", &[0x00, channel_count, 0x00, 0x00, 0x00, 0x00, 0xBB, 0x80, 0x00, 0x00, 0x00]),
+            None => write_box(
+                &mut data,
+                b"dOps",
+                &[
+                    0x00,
+                    channel_count,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0xBB,
+                    0x80,
+                    0x00,
+                    0x00,
+                    0x00,
+                ],
+            ),
         }
 
         write_box(w, b"Opus", &data);
     }
 
     fn write_flac_sample_entry(&self, w: &mut Vec<u8>) {
-        let (sample_rate, channel_count) = self.audio_config.as_ref()
+        let (sample_rate, channel_count) = self
+            .audio_config
+            .as_ref()
             .and_then(|c| parse_flac_streaminfo(c))
             .unwrap_or((44100u32, 1u16));
 
@@ -672,7 +724,12 @@ impl Fmp4Muxer {
 
     // ── Fragment writers ─────────────────────────────────────────
 
-    fn write_moof_multi(&self, w: &mut Vec<u8>, sequence_number: u32, tracks: &[(u32, u64, &[Sample])]) {
+    fn write_moof_multi(
+        &self,
+        w: &mut Vec<u8>,
+        sequence_number: u32,
+        tracks: &[(u32, u64, &[Sample])],
+    ) {
         let mut moof_data = Vec::new();
         self.write_mfhd(&mut moof_data, sequence_number);
 
@@ -686,7 +743,13 @@ impl Fmp4Muxer {
 
         for (track_id, base_dts, samples) in tracks {
             let track_data_offset = current_data_offset;
-            self.write_traf(&mut moof_data, *track_id, *base_dts, samples, track_data_offset as u32);
+            self.write_traf(
+                &mut moof_data,
+                *track_id,
+                *base_dts,
+                samples,
+                track_data_offset as u32,
+            );
             current_data_offset += samples.iter().map(|s| s.data.len()).sum::<usize>();
         }
 
@@ -719,7 +782,14 @@ impl Fmp4Muxer {
         write_fullbox(w, b"mfhd", 0, 0, &data);
     }
 
-    fn write_traf(&self, w: &mut Vec<u8>, track_id: u32, base_dts: u64, samples: &[Sample], data_offset: u32) {
+    fn write_traf(
+        &self,
+        w: &mut Vec<u8>,
+        track_id: u32,
+        base_dts: u64,
+        samples: &[Sample],
+        data_offset: u32,
+    ) {
         let is_video = track_id == 1;
         let is_opus_audio = !is_video && self.audio_codec == Some(AudioCodec::Opus);
         let (duration_scale, ts_scale) = if is_video {
@@ -727,13 +797,22 @@ impl Fmp4Muxer {
         } else {
             (self.audio_sample_rate as u64, 1000u64)
         };
-        let scaled_duration = samples.first().map(|s| s.duration as u64 * duration_scale / ts_scale).unwrap_or(if is_video { 33 } else { 21 }) as u32;
+        let scaled_duration = samples
+            .first()
+            .map(|s| s.duration as u64 * duration_scale / ts_scale)
+            .unwrap_or(if is_video { 33 } else { 21 }) as u32;
         let scaled_base_dts = base_dts * duration_scale / ts_scale;
         let default_size = samples.first().map(|s| s.size).unwrap_or(0);
         let default_flags = if is_video { 0x01010000 } else { 0x02000000 };
 
         let mut traf_data = Vec::new();
-        self.write_tfhd(&mut traf_data, track_id, scaled_duration, default_size, default_flags);
+        self.write_tfhd(
+            &mut traf_data,
+            track_id,
+            scaled_duration,
+            default_size,
+            default_flags,
+        );
         self.write_tfdt(&mut traf_data, scaled_base_dts);
         if is_opus_audio {
             self.write_sbgp_opus(&mut traf_data, samples.len() as u32);
@@ -751,7 +830,14 @@ impl Fmp4Muxer {
         write_fullbox(w, b"sbgp", 0, 0, &data);
     }
 
-    fn write_tfhd(&self, w: &mut Vec<u8>, track_id: u32, default_duration: u32, default_size: u32, default_flags: u32) {
+    fn write_tfhd(
+        &self,
+        w: &mut Vec<u8>,
+        track_id: u32,
+        default_duration: u32,
+        default_size: u32,
+        default_flags: u32,
+    ) {
         let flags = 0x020000 | 0x000008 | 0x000010 | 0x000020;
         let mut data = Vec::new();
         data.extend_from_slice(&track_id.to_be_bytes());
@@ -851,18 +937,34 @@ mod tests {
         // Walk top-level boxes, find moov, then walk moov children to find mvhd
         let mut off = 0;
         while off + 8 <= data.len() {
-            let box_size = u32::from_be_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-            if off + box_size > data.len() { break; }
-            if &data[off+4..off+8] == b"moov" {
+            let box_size =
+                u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                    as usize;
+            if off + box_size > data.len() {
+                break;
+            }
+            if &data[off + 4..off + 8] == b"moov" {
                 let moov_end = off + box_size;
                 let mut inner = off + 8;
                 while inner + 8 <= moov_end {
-                    let child_size = u32::from_be_bytes([data[inner], data[inner+1], data[inner+2], data[inner+3]]) as usize;
-                    if inner + child_size > moov_end { break; }
-                    if &data[inner+4..inner+8] == b"mvhd" {
+                    let child_size = u32::from_be_bytes([
+                        data[inner],
+                        data[inner + 1],
+                        data[inner + 2],
+                        data[inner + 3],
+                    ]) as usize;
+                    if inner + child_size > moov_end {
+                        break;
+                    }
+                    if &data[inner + 4..inner + 8] == b"mvhd" {
                         // next_track_ID is at offset 92 from FullBox data start
                         let data_off = inner + 12; // skip size(4)+type(4)+version(1)+flags(3)
-                        return u32::from_be_bytes([data[data_off+92], data[data_off+93], data[data_off+94], data[data_off+95]]);
+                        return u32::from_be_bytes([
+                            data[data_off + 92],
+                            data[data_off + 93],
+                            data[data_off + 94],
+                            data[data_off + 95],
+                        ]);
                     }
                     inner += child_size;
                 }
@@ -933,8 +1035,18 @@ mod tests {
         if offset + 8 > data.len() {
             return None;
         }
-        let size = u32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
-        Some((&data[offset+4..offset+8], size, offset + 8, size.saturating_sub(8)))
+        let size = u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        Some((
+            &data[offset + 4..offset + 8],
+            size,
+            offset + 8,
+            size.saturating_sub(8),
+        ))
     }
 
     /// Walk ISOBMFF box hierarchy to find a trun within a traf within a moof,
@@ -954,7 +1066,12 @@ mod tests {
                     while inner < traf_end {
                         let (it, isize, idata, _) = parse_box(frag, inner).unwrap();
                         if it == b"trun" {
-                            return u32::from_be_bytes([frag[idata+4], frag[idata+5], frag[idata+6], frag[idata+7]]);
+                            return u32::from_be_bytes([
+                                frag[idata + 4],
+                                frag[idata + 5],
+                                frag[idata + 6],
+                                frag[idata + 7],
+                            ]);
                         }
                         inner += isize;
                     }
@@ -978,7 +1095,12 @@ mod tests {
         let audio_data = vec![0xAF, 0x01];
 
         for i in 0..60 {
-            muxer.add_video_sample(video_data.clone().into(), i as u64 * 33, i as u64 * 33, i % 30 == 0);
+            muxer.add_video_sample(
+                video_data.clone().into(),
+                i as u64 * 33,
+                i as u64 * 33,
+                i % 30 == 0,
+            );
         }
         for i in 0..93 {
             muxer.add_audio_sample(audio_data.clone().into(), i as u64 * 21);
@@ -1063,8 +1185,18 @@ mod tests {
             // Check tfhd
             let tfhd_offset = traf_children[0].3;
             let tfhd_version = frag[tfhd_offset];
-            let tfhd_flags = u32::from_be_bytes([0, frag[tfhd_offset+1], frag[tfhd_offset+2], frag[tfhd_offset+3]]);
-            let tfhd_track_id = u32::from_be_bytes([frag[tfhd_offset+4], frag[tfhd_offset+5], frag[tfhd_offset+6], frag[tfhd_offset+7]]);
+            let tfhd_flags = u32::from_be_bytes([
+                0,
+                frag[tfhd_offset + 1],
+                frag[tfhd_offset + 2],
+                frag[tfhd_offset + 3],
+            ]);
+            let tfhd_track_id = u32::from_be_bytes([
+                frag[tfhd_offset + 4],
+                frag[tfhd_offset + 5],
+                frag[tfhd_offset + 6],
+                frag[tfhd_offset + 7],
+            ]);
             assert_eq!(tfhd_version, 0);
             assert!(tfhd_flags & 0x020000 != 0);
             assert!(tfhd_flags & 0x000008 != 0);
@@ -1077,11 +1209,22 @@ mod tests {
             let tfdt_version = frag[tfdt_offset];
             let tfdt_base = if tfdt_version == 1 {
                 u64::from_be_bytes([
-                    frag[tfdt_offset+4], frag[tfdt_offset+5], frag[tfdt_offset+6], frag[tfdt_offset+7],
-                    frag[tfdt_offset+8], frag[tfdt_offset+9], frag[tfdt_offset+10], frag[tfdt_offset+11],
+                    frag[tfdt_offset + 4],
+                    frag[tfdt_offset + 5],
+                    frag[tfdt_offset + 6],
+                    frag[tfdt_offset + 7],
+                    frag[tfdt_offset + 8],
+                    frag[tfdt_offset + 9],
+                    frag[tfdt_offset + 10],
+                    frag[tfdt_offset + 11],
                 ])
             } else {
-                u32::from_be_bytes([frag[tfdt_offset+4], frag[tfdt_offset+5], frag[tfdt_offset+6], frag[tfdt_offset+7]]) as u64
+                u32::from_be_bytes([
+                    frag[tfdt_offset + 4],
+                    frag[tfdt_offset + 5],
+                    frag[tfdt_offset + 6],
+                    frag[tfdt_offset + 7],
+                ]) as u64
             };
             assert_eq!(tfdt_version, 1);
             assert_eq!(tfdt_base, 0);
@@ -1089,9 +1232,24 @@ mod tests {
             // Check trun
             let trun_offset = traf_children[2].3;
             let trun_version = frag[trun_offset];
-            let trun_flags = u32::from_be_bytes([0, frag[trun_offset+1], frag[trun_offset+2], frag[trun_offset+3]]);
-            let sample_count = u32::from_be_bytes([frag[trun_offset+4], frag[trun_offset+5], frag[trun_offset+6], frag[trun_offset+7]]);
-            let data_offset_val = i32::from_be_bytes([frag[trun_offset+8], frag[trun_offset+9], frag[trun_offset+10], frag[trun_offset+11]]);
+            let trun_flags = u32::from_be_bytes([
+                0,
+                frag[trun_offset + 1],
+                frag[trun_offset + 2],
+                frag[trun_offset + 3],
+            ]);
+            let sample_count = u32::from_be_bytes([
+                frag[trun_offset + 4],
+                frag[trun_offset + 5],
+                frag[trun_offset + 6],
+                frag[trun_offset + 7],
+            ]);
+            let data_offset_val = i32::from_be_bytes([
+                frag[trun_offset + 8],
+                frag[trun_offset + 9],
+                frag[trun_offset + 10],
+                frag[trun_offset + 11],
+            ]);
             assert_eq!(trun_version, 0);
             assert_eq!(sample_count, 1);
             assert!(trun_flags & 0x000001 != 0);
@@ -1118,14 +1276,29 @@ mod tests {
             assert_eq!(data_offset_val, expected_data_offset);
 
             if i == 0 {
-                let first_flags = u32::from_be_bytes([frag[trun_offset+12], frag[trun_offset+13], frag[trun_offset+14], frag[trun_offset+15]]);
+                let first_flags = u32::from_be_bytes([
+                    frag[trun_offset + 12],
+                    frag[trun_offset + 13],
+                    frag[trun_offset + 14],
+                    frag[trun_offset + 15],
+                ]);
                 let entry_off = trun_offset + 16;
-                let size = u32::from_be_bytes([frag[entry_off], frag[entry_off+1], frag[entry_off+2], frag[entry_off+3]]);
+                let size = u32::from_be_bytes([
+                    frag[entry_off],
+                    frag[entry_off + 1],
+                    frag[entry_off + 2],
+                    frag[entry_off + 3],
+                ]);
                 assert_eq!(first_flags, 0x02000000);
                 assert_eq!(size, video_data.len() as u32);
             } else {
                 let entry_off = trun_offset + 12;
-                let size = u32::from_be_bytes([frag[entry_off], frag[entry_off+1], frag[entry_off+2], frag[entry_off+3]]);
+                let size = u32::from_be_bytes([
+                    frag[entry_off],
+                    frag[entry_off + 1],
+                    frag[entry_off + 2],
+                    frag[entry_off + 3],
+                ]);
                 assert_eq!(size, audio_data.len() as u32);
             }
         }
@@ -1146,8 +1319,8 @@ mod tests {
         let mut muxer = Fmp4Muxer::new();
         muxer.set_audio_codec(AudioCodec::Opus);
         let config = vec![
-            b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd',
-            0x01, 0x02, 0x38, 0x01, 0x80, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00,
+            b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd', 0x01, 0x02, 0x38, 0x01, 0x80, 0xBB,
+            0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         muxer.set_audio_config(config);
         let init = muxer.init_segment();
@@ -1173,7 +1346,11 @@ mod tests {
     fn test_hevc_init_segment() {
         let mut muxer = Fmp4Muxer::new();
         muxer.set_video_codec(VideoCodec::H265, 1920, 1080);
-        muxer.set_video_config(vec![0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 0x03, 0x20, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xAC, 0x09]);
+        muxer.set_video_config(vec![
+            0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xF0,
+            0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 0x03, 0x20, 0x00, 0x00, 0x03, 0x00,
+            0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xAC, 0x09,
+        ]);
         let init = muxer.init_segment();
         assert!(init.windows(4).any(|w| w == b"hvc1"));
         assert!(init.windows(4).any(|w| w == b"hvcC"));
@@ -1203,14 +1380,30 @@ mod tests {
                     let (it, _isize, idata, _) = parse_box(&frag, inner).unwrap();
                     if it == b"trun" {
                         let version = frag[idata];
-                        assert_eq!(version, 1, "trun version should be 1 when composition_time_offset is non-zero");
+                        assert_eq!(
+                            version, 1,
+                            "trun version should be 1 when composition_time_offset is non-zero"
+                        );
                         // Check CTO flag is set (0x000800)
-                        let flags = u32::from_be_bytes([0, frag[idata+1], frag[idata+2], frag[idata+3]]);
-                        assert!(flags & 0x000800 != 0, "trun should have sample_composition_time_offset flag");
+                        let flags = u32::from_be_bytes([
+                            0,
+                            frag[idata + 1],
+                            frag[idata + 2],
+                            frag[idata + 3],
+                        ]);
+                        assert!(
+                            flags & 0x000800 != 0,
+                            "trun should have sample_composition_time_offset flag"
+                        );
                         // trun data: version(1)+flags(3)+sample_count(4)+data_offset(4)+first_flags(4)+entries
                         // Each entry: sample_size(4)+composition_time_offset(4)
                         // CTO is at data_offset+20 for video
-                        let cto = i32::from_be_bytes([frag[idata+20], frag[idata+21], frag[idata+22], frag[idata+23]]);
+                        let cto = i32::from_be_bytes([
+                            frag[idata + 20],
+                            frag[idata + 21],
+                            frag[idata + 22],
+                            frag[idata + 23],
+                        ]);
                         assert_eq!(cto, 33);
                         return;
                     }
@@ -1227,12 +1420,9 @@ mod tests {
         let mut muxer = Fmp4Muxer::new();
         muxer.set_audio_codec(AudioCodec::Flac);
         let config = vec![
-            0x66, 0x4c, 0x61, 0x43,
-            0x12, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x24, 0x15, 0x0a, 0xc4, 0x40, 0xf0, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00,
+            0x66, 0x4c, 0x61, 0x43, 0x12, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x15,
+            0x0a, 0xc4, 0x40, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert_eq!(config.len(), 38);
         muxer.set_audio_config(config);
@@ -1241,18 +1431,27 @@ mod tests {
         assert!(init.windows(4).any(|w| w == b"dfLa"));
 
         let dfla_pos = init.windows(4).position(|w| w == b"dfLa").unwrap();
-        let dfla_size = u32::from_be_bytes([init[dfla_pos-4], init[dfla_pos-3], init[dfla_pos-2], init[dfla_pos-1]]) as usize;
-        let dfla_data = &init[dfla_pos+4..dfla_pos-4+dfla_size];
+        let dfla_size = u32::from_be_bytes([
+            init[dfla_pos - 4],
+            init[dfla_pos - 3],
+            init[dfla_pos - 2],
+            init[dfla_pos - 1],
+        ]) as usize;
+        let dfla_data = &init[dfla_pos + 4..dfla_pos - 4 + dfla_size];
         assert_eq!(dfla_data[0], 0x00);
         assert_eq!(&dfla_data[1..4], &[0x00, 0x00, 0x00]);
         assert_eq!(dfla_data[4], 0x80);
-        assert_eq!(u32::from_be_bytes([0x00, dfla_data[5], dfla_data[6], dfla_data[7]]), 34);
-        assert_eq!(&dfla_data[8..42], &[
-            0x12, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x24, 0x15, 0x0a, 0xc4, 0x40, 0xf0, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00,
-        ]);
+        assert_eq!(
+            u32::from_be_bytes([0x00, dfla_data[5], dfla_data[6], dfla_data[7]]),
+            34
+        );
+        assert_eq!(
+            &dfla_data[8..42],
+            &[
+                0x12, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x15, 0x0a, 0xc4, 0x40, 0xf0,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        );
     }
 }

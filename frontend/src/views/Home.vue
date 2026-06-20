@@ -41,14 +41,14 @@
     />
 
     <!-- Stream setup info -->
-    <div v-if="config" class="mb-6 rounded-xl border border-border-default bg-bg-surface/60 p-4">
+    <div class="mb-6 rounded-xl border border-border-default bg-bg-surface/60 p-4">
       <div class="flex items-center justify-between cursor-pointer" @click="showSetup = !showSetup">
         <div class="flex items-center gap-2">
           <svg class="h-4 w-4 text-accent-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
             <path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
           <span class="text-sm font-medium text-text-primary">Stream Setup</span>
-          <BaseTag v-if="config.multitrack_supported">Multitrack</BaseTag>
+          <BaseTag>Multitrack</BaseTag>
         </div>
         <svg class="h-4 w-4 text-text-muted transition" :class="showSetup ? 'rotate-180' : ''" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
           <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" />
@@ -57,19 +57,19 @@
       <div v-if="showSetup" class="mt-3 space-y-3 text-sm text-text-secondary">
         <div>
           <span class="font-medium">RTMP URL:</span>
-          <BaseCodeBlock :text="config.rtmp_url_template" />
+          <BaseCodeBlock :text="rtmpUrl" />
         </div>
         <div>
           <span class="font-medium">Supported codecs:</span>
-          <span class="ml-1">Video: {{ config.supported_video_codecs.join(', ') }} / Audio: {{ config.supported_audio_codecs.join(', ') }}</span>
+          <span class="ml-1">Video: {{ supportedVideoCodecs.join(', ') }} / Audio: {{ supportedAudioCodecs.join(', ') }}</span>
         </div>
         <div>
           <span class="font-medium">Single-track ffmpeg example:</span>
-          <BaseCodeBlock :text="config.example_ffmpeg_single" :multiline="true" />
+          <BaseCodeBlock :text="exampleFfmpegSingle" :multiline="true" />
         </div>
-        <div v-if="config.multitrack_supported">
+        <div>
           <span class="font-medium">Multitrack ffmpeg example:</span>
-          <BaseCodeBlock :text="config.example_ffmpeg_multitrack" :multiline="true" />
+          <BaseCodeBlock :text="exampleFfmpegMultitrack" :multiline="true" />
         </div>
       </div>
     </div>
@@ -92,12 +92,8 @@
         </svg>
       </template>
       <template #action>
-        <div v-if="config" class="space-y-2">
-          <BaseCodeBlock :text="config.rtmp_url_template" />
-        </div>
-        <div v-else class="flex items-center justify-center gap-2">
-          <BaseCodeBlock text="rtmp://localhost:1935/live/" />
-          <span class="font-mono text-xs text-text-muted">{any-key}</span>
+        <div class="space-y-2">
+          <BaseCodeBlock :text="rtmpUrl" />
         </div>
       </template>
     </BaseEmptyState>
@@ -105,7 +101,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch, onMounted } from 'vue'
+import { computed, ref, watch } from 'vue'
 import StreamCard from '@/components/StreamCard.vue'
 import BaseCard from '@/components/ui/BaseCard.vue'
 import BaseSkeleton from '@/components/ui/BaseSkeleton.vue'
@@ -114,9 +110,7 @@ import BaseErrorState from '@/components/ui/BaseErrorState.vue'
 import BaseCodeBlock from '@/components/ui/BaseCodeBlock.vue'
 import BaseTag from '@/components/ui/BaseTag.vue'
 import { useStreamList } from '@/composables/useStreamList'
-import { getConfig } from '@/api/streams'
 import type { Stream } from '@/types'
-import type { ServerConfig } from '@/api/streams'
 
 const { data, error, loading, refetch } = useStreamList()
 
@@ -153,16 +147,28 @@ watch(
   { immediate: true },
 )
 
-const config = ref<ServerConfig | null>(null)
-const showSetup = ref(false)
+const hostname = window.location.hostname
+const rtmpPort = 1935
+const rtmpUrl = `rtmp://${hostname}:${rtmpPort}/live/{stream_key}`
+const supportedVideoCodecs = ['H264', 'HEVC', 'AV1']
+const supportedAudioCodecs = ['AAC', 'Opus', 'FLAC']
+const exampleFfmpegSingle = `ffmpeg -re -f lavfi -i testsrc=duration=30:size=1280x720:rate=30 \\
+  -f lavfi -i "sine=frequency=440:duration=30" \\
+  -c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency \\
+  -c:a aac -ar 44100 \\
+  -f flv rtmp://${hostname}:${rtmpPort}/live/testkey`
+const exampleFfmpegMultitrack = `ffmpeg -re \\
+  -f lavfi -i "testsrc=duration=30:size=1280x720:rate=30" \\
+  -f lavfi -i "testsrc=duration=30:size=640x360:rate=30" \\
+  -f lavfi -i "sine=frequency=440:duration=30" \\
+  -f lavfi -i "sine=frequency=880:duration=30" \\
+  -map 0:v -c:v:0 libsvtav1 -preset:v:0 12 -pix_fmt:v:0 yuv420p -b:v:0 1500k -g:v:0 60 \\
+  -map 1:v -c:v:1 libx264 -preset:v:1 ultrafast -pix_fmt:v:1 yuv420p -b:v:1 500k -g:v:1 60 \\
+  -map 2:a -c:a:0 libopus -ar:a:0 48000 -b:a:0 128k \\
+  -map 3:a -c:a:1 aac -ar:a:1 44100 -b:a:1 128k \\
+  -f flv rtmp://${hostname}:${rtmpPort}/live/testkey`
 
-onMounted(async () => {
-  try {
-    config.value = await getConfig()
-  } catch (e) {
-    // silently ignore config fetch errors
-  }
-})
+const showSetup = ref(false)
 </script>
 
 <style>
