@@ -75,8 +75,6 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
             let stream_key = crate::recording::parse_stream_key_from_filename(&name);
 
-            let duration = crate::recording::get_video_duration(&path).await.ok();
-
             let mut thumbnails = HashMap::new();
             for width in &state.config.thumbnail_sizes {
                 let thumb_filename = format!("{}_w{}.webp", name, width);
@@ -97,7 +95,7 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 stream_key,
                 created_at: modified,
                 size_bytes: size,
-                duration_seconds: duration,
+                duration_seconds: None,
                 url: format!("{}/{}", state.config.recordings_base_url, name),
                 thumbnail_url: thumbnails.values().next().cloned().unwrap_or_default(),
                 thumbnails,

@@ -259,19 +259,37 @@ async fn finalize_stream(
 
 if let Some(ref mut r) = recorder {
         drain_hls_to_recorder(&mut hls, r).await;
+        let total_duration_secs: f64 = hls.total_duration_secs();
+        let total_duration = if total_duration_secs > 0.0 {
+            Some(total_duration_secs.ceil() as u64)
+        } else {
+            None
+        };
         if let Ok(mp4_path) = r.close().await {
             let sizes = app_state.config.thumbnail_sizes.clone();
             let base_url = app_state.config.recordings_base_url.clone();
             let key = stream_key.to_string();
             let app_state = Arc::clone(app_state);
             let remux_path = mp4_path.clone();
+            let filename = mp4_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_string())
+                .unwrap_or_default();
             tokio::spawn(async move {
                 let thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("recordings");
                 if let Err(e) = crate::thumbnail::generate_thumbnails_for_file(&mp4_path, &thumb_dir, &sizes).await {
                     tracing::warn!("Post-recording thumbnail generation failed for {}: {}", key, e);
                 }
-                if let Err(e) = crate::recording::write_index_json(&media_dir, &base_url, &sizes).await {
-                    tracing::warn!("write_index_json failed for {}: {}", key, e);
+                if let Err(e) = crate::recording::update_index_json(
+                    &media_dir,
+                    &filename,
+                    &key,
+                    total_duration,
+                    &base_url,
+                    &sizes,
+                ).await {
+                    tracing::warn!("update_index_json failed for {}: {}", key, e);
                 }
                 // Background remux (non-blocking, concurrency-limited)
                 app_state.remux_queue.enqueue(remux_path);

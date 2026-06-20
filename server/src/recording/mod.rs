@@ -263,97 +263,59 @@ impl RemuxQueue {
     }
 }
 
-/// Probe video duration using ffprobe.
-pub async fn get_video_duration(path: &std::path::Path) -> anyhow::Result<u64> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            path.to_str().unwrap(),
-        ])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        return Err(anyhow::anyhow!("ffprobe failed"));
-    }
-
-    let duration_str = String::from_utf8_lossy(&output.stdout);
-    let duration_sec: f64 = duration_str.trim().parse()?;
-    Ok(duration_sec.ceil() as u64)
-}
-
-pub async fn write_index_json(
+pub async fn update_index_json(
     media_dir: &str,
+    filename: &str,
+    stream_key: &str,
+    duration_seconds: Option<u64>,
     recordings_base_url: &str,
     thumbnail_sizes: &[u32],
 ) -> anyhow::Result<()> {
     let recordings_dir = PathBuf::from(media_dir).join("recordings");
+    let index_path = recordings_dir.join("index.json");
+
     let mut recordings = Vec::new();
-
-    if let Ok(mut rd) = tokio::fs::read_dir(&recordings_dir).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let path = entry.path();
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            if !name.ends_with(".mp4") {
-                continue;
-            }
-
-            let meta = match tokio::fs::metadata(&path).await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let size = meta.len();
-            let modified = match meta.modified() {
-                Ok(t) => {
-                    let dt: chrono::DateTime<chrono::Utc> = t.into();
-                    dt.to_rfc3339()
-                }
-                Err(_) => chrono::Utc::now().to_rfc3339(),
-            };
-
-            let stream_key = parse_stream_key_from_filename(&name);
-
-            let mut thumbnails = HashMap::new();
-            for width in thumbnail_sizes {
-                let thumb_filename = format!("{}_w{}.webp", name, width);
-                let thumb_path = PathBuf::from(media_dir)
-                    .join("thumbnails")
-                    .join("recordings")
-                    .join(&thumb_filename);
-                if tokio::fs::try_exists(&thumb_path).await.unwrap_or(false) {
-                    thumbnails.insert(
-                        width.to_string(),
-                        format!("/thumbnails/recordings/{}", thumb_filename),
-                    );
-                }
-            }
-
-            let duration = get_video_duration(&path).await.ok();
-
-            recordings.push(RecordingEntry {
-                filename: name.clone(),
-                stream_key,
-                created_at: modified,
-                size_bytes: size,
-                duration_seconds: duration,
-                url: format!("{}/{}", recordings_base_url, name),
-                thumbnails,
-            });
+    if let Ok(index_data) = tokio::fs::read_to_string(&index_path).await {
+        if let Ok(index) = serde_json::from_str::<RecordingsIndex>(&index_data) {
+            recordings = index.recordings
+                .into_iter()
+                .filter(|e| e.filename != filename)
+                .collect();
         }
     }
+
+    let path = recordings_dir.join(filename);
+    let meta = tokio::fs::metadata(&path).await?;
+    let modified: chrono::DateTime<chrono::Utc> = meta.modified()?.into();
+
+    let mut thumbnails = HashMap::new();
+    for width in thumbnail_sizes {
+        let thumb_filename = format!("{}_w{}.webp", filename, width);
+        let thumb_path = PathBuf::from(media_dir)
+            .join("thumbnails")
+            .join("recordings")
+            .join(&thumb_filename);
+        if tokio::fs::try_exists(&thumb_path).await.unwrap_or(false) {
+            thumbnails.insert(
+                width.to_string(),
+                format!("/thumbnails/recordings/{}", thumb_filename),
+            );
+        }
+    }
+
+    recordings.push(RecordingEntry {
+        filename: filename.to_string(),
+        stream_key: stream_key.to_string(),
+        created_at: modified.to_rfc3339(),
+        size_bytes: meta.len(),
+        duration_seconds,
+        url: format!("{}/{}", recordings_base_url, filename),
+        thumbnails,
+    });
 
     recordings.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
     let index = RecordingsIndex { recordings };
-    let index_path = recordings_dir.join("index.json");
     let tmp_path = recordings_dir.join("index.json.tmp");
     let json = serde_json::to_string_pretty(&index)?;
     tokio::fs::write(&tmp_path, json).await?;
@@ -361,6 +323,8 @@ pub async fn write_index_json(
 
     Ok(())
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -428,7 +392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_index_json() {
+    async fn test_update_index_json() {
         let test_dir = std::env::temp_dir().join("recording_index_test");
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
         tokio::fs::create_dir_all(&test_dir.join("recordings")).await.unwrap();
@@ -436,10 +400,14 @@ mod tests {
 
         recorder.write_init(&[0x66, 0x74, 0x79, 0x70]).await.unwrap();
         recorder.write_segment(vec![0x6d, 0x6f, 0x6f, 0x66]).await.unwrap();
-        let _path = recorder.close().await.unwrap();
+        let path = recorder.close().await.unwrap();
+        let filename = path.file_name().unwrap().to_str().unwrap().to_string();
 
-        crate::recording::write_index_json(
+        crate::recording::update_index_json(
             test_dir.to_str().unwrap(),
+            &filename,
+            "indexstream",
+            Some(42),
             "/recordings",
             &[320, 480],
         ).await.unwrap();
@@ -451,6 +419,7 @@ mod tests {
         let index: crate::recording::RecordingsIndex = serde_json::from_str(&index_data).unwrap();
         assert_eq!(index.recordings.len(), 1);
         assert_eq!(index.recordings[0].stream_key, "indexstream");
+        assert_eq!(index.recordings[0].duration_seconds, Some(42));
 
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }

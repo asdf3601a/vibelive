@@ -40,7 +40,7 @@ pub struct HlsStreamState {
     // Wall-clock time mapping
     stream_started_at: Option<chrono::DateTime<chrono::Utc>>,
     segment_start_offsets: Vec<u64>,
-// RFC 6381 codec string cache
+    // RFC 6381 codec string cache
     codec_string: Option<String>,
     // Actual max segment duration observed (ms), used for EXT-X-TARGETDURATION
     max_segment_duration_ms: u64,
@@ -103,6 +103,10 @@ impl HlsStreamState {
 
     pub fn audio_codec(&self) -> Option<fmp4::AudioCodec> {
         self.audio_codec
+    }
+
+    pub fn total_duration_secs(&self) -> f64 {
+        self.segment_durations.iter().sum()
     }
 
     /// Clear the audio-only flag when video data arrives for this track.
