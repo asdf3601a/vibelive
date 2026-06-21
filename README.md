@@ -107,8 +107,6 @@ Axum router with these endpoints:
 | `GET /api/streams` | List active streams with metadata and `tracks` array |
 | `GET /api/streams/{key}` | Get single stream details (includes `tracks` with per-track HLS URLs and codecs) |
 | `GET /api/recordings` | List recordings (from index.json or fallback scan) |
-| `GET /api/recordings/{filename}/thumbnail?width=W` | Recording thumbnail fallback (generates on-the-fly if missing) |
-
 Static file serving:
 - `/hls/*` → `MEDIA_DIR/hls/*`
 - `/recordings/*` → `MEDIA_DIR/recordings/*`
@@ -265,30 +263,6 @@ List all finalized recordings.
 | `thumbnails` | `Record<string, string>` | Map of width → thumbnail URL (only existing files are listed) |
 
 **Implementation note:** The endpoint first attempts to read `recordings/index.json`. If the index is missing or corrupt, it falls back to scanning the `recordings/` directory and probing each MP4 with ffprobe.
-
----
-
-##### `GET /api/recordings/{filename}/thumbnail?width={W}`
-
-Return a recording thumbnail image. If the pre-generated thumbnail does not exist, the server generates it on-the-fly using ffmpeg.
-
-**Path parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `filename` | `string` | Full MP4 file name (e.g. `testkey_20260527_063000.mp4`) |
-
-**Query parameters:**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `width` | `number` | smallest configured size | Requested thumbnail width. The server returns the closest configured size that is **≤** the requested width. |
-
-**Response (200 OK):** `image/webp` binary data
-
-**Response (404 Not Found):** Recording or thumbnail not available.
-
-**Response (500 Internal Server Error):** Thumbnail generation or read failed.
 
 ### 3.6 Configuration (`config/`)
 
