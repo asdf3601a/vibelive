@@ -42,11 +42,15 @@ DEFAULT_ACODEC="aac"
 STREAM_DURATION=6
 ASPECTS="16:9"
 GRACE_WAIT=""
+# FPS test rates (--tests fps); not part of --tests all
+FPS_VALUES="24000/1001 24 25 30000/1001 30 50 60000/1001 60"
 
 # ── Help ───────────────────────────────────────────────────────────
 show_help() {
     cat <<'EOF'
 Usage: ./test.sh [OPTIONS]
+
+Note: The 'fps' test suite is NOT included by default (--tests all).
 
 End-to-end test suite for livestream server.  Covers codec
 compatibility, resolution/aspect-ratio coverage, color-space validation,
@@ -69,12 +73,15 @@ Options:
                     reconnect  – abnormal disconnect + reconnect
                     hls        – live HLS segment verification
                     multitrack – Enhanced RTMP multitrack (2 video + 2 audio)
-                    all        – run every suite (default)
+                    fps        – NTSC/PAL frame rate consistency (NOT included in 'all')
+                    all        – run every suite EXCEPT fps
   --full          Run full Cartesian product for codec/res matrices.
                   Without this flag the suite runs in quick mode:
                     • codec matrix uses only 480p and 720p
                     • res matrix skips if codec already covers it
   --duration N    Stream duration in seconds for each test (default: 6)
+  --fps LIST      Comma-separated frame rates for fps test: 24000/1001,30,60000/1001,...
+                  (default: 24000/1001 24 25 30000/1001 30 50 60000/1001 60)
   --grace-wait N  Max seconds to wait for HLS cleanup in graceful-stop test
                   (default: STREAM_GRACE_PERIOD_SECONDS from .env + 5, fallback 35)
   -h, --help      Show this help message
@@ -140,6 +147,11 @@ while [[ $# -gt 0 ]]; do
         --grace-wait)
             shift
             GRACE_WAIT="$1"
+            shift
+            ;;
+        --fps)
+            shift
+            FPS_VALUES=$(echo "$1" | tr ',' ' ')
             shift
             ;;
         -h|--help)
@@ -1037,6 +1049,130 @@ for t in tracks:
     fi
 }
 
+# ── FPS frame rate test ────────────────────────────────────────────
+run_fps_test() {
+    local fps_frac="$1"
+    local key="fps_$(echo "$fps_frac" | tr '/' '_')_$(date +%s)"
+    local duration="${STREAM_DURATION}"
+
+    # Parse fps numerator/denominator
+    local fps_num=$fps_frac
+    local fps_den=1
+    if echo "$fps_frac" | grep -q '/'; then
+        fps_num=$(echo "$fps_frac" | cut -d/ -f1)
+        fps_den=$(echo "$fps_frac" | cut -d/ -f2)
+    fi
+
+    # GOP ≈ fps * 2 (approx 2-second keyframe interval)
+    local gop=$(( fps_num * 2 / fps_den ))
+    if [ "$gop" -lt 1 ]; then gop=1; fi
+
+    local size="640x360"
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "FPS Test: ${fps_num}/${fps_den}"
+    echo "Key:  $key"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    ffmpeg -y -re -f lavfi -i "testsrc=duration=${duration}:size=${size}:rate=${fps_frac}" \
+        -f lavfi -i "sine=frequency=440:duration=${duration}" \
+        -c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency \
+        -g "$gop" -keyint_min "$gop" \
+        -c:a aac -t "$duration" -f flv \
+        "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+    local ff_pid=$!
+
+    wait $ff_pid 2>/dev/null || true
+    sleep 3
+
+    local mp4_count
+    mp4_count=$(count_recordings "$key")
+
+    local result="FAIL"
+    local result_color="$RED"
+
+    if [ "$mp4_count" -gt 0 ]; then
+        local rec_file
+        rec_file=$(ls "$MEDIA_DIR/recordings/${key}_"*.mp4 2>/dev/null | head -1)
+        if [ -n "$rec_file" ]; then
+            # Check consistent frame duration via ffprobe
+            # Use -show_packets instead of -show_entries frame, since the
+            # recording may still be in fragmented MP4 format (remux runs async).
+            local frame_durations
+            frame_durations=$(ffprobe -v quiet -select_streams v:0 \
+                -show_packets "$rec_file" 2>/dev/null \
+                | grep '^duration=' | grep -v 'duration=0$' | sed 's/duration=//')
+
+            if [ -z "$frame_durations" ]; then
+                echo -e "${RED}  ✗ ffprobe returned no frame data${NC}"
+            else
+                local total unique
+                total=$(echo "$frame_durations" | wc -l)
+                unique=$(echo "$frame_durations" | sort -u | wc -l)
+
+                # Get the dominant (most common) duration
+                local dom_dur
+                dom_dur=$(echo "$frame_durations" | sort -n | uniq -c | sort -rn | head -1 | awk '{print $2}')
+                local dom_count
+                dom_count=$(echo "$frame_durations" | sort -n | uniq -c | sort -rn | head -1 | awk '{print $1}')
+                local dom_sec
+                dom_sec=$(python3 -c "print($dom_dur / 90000)")
+
+                echo -e "  frames=$total  dominant=${dom_dur}ticks (${dom_sec}s)  count=$dom_count/$total"
+
+                # Check frame-duration consistency: dominant duration covers ≥85% of frames.
+                # RTMP timestamps use integer milliseconds, so the actual frame spacing
+                # is round(1000*den/num)ms rather than ideal 1000*den/num. The muxer
+                # faithfully records the received spacing — what matters is consistency.
+                local ok
+                ok=$(python3 <<PY
+total = $total
+dom_count = $dom_count
+ratio = dom_count / total
+print("YES" if ratio >= 0.85 else f"NO (dominant covers {dom_count}/{total} = {ratio*100:.0f}%, need ≥85%)")
+PY
+)
+                if [ "$ok" = "YES" ] && [ "$dom_count" -gt $(( total * 85 / 100 )) ]; then
+                    echo -e "${GREEN}  ✓ Frame duration consistent ($dom_dur, ${dom_count}/${total} frames)${NC}"
+                    result="PASS"
+                    result_color="$GREEN"
+                else
+                    echo -e "${RED}  ✗ $ok${NC}"
+                    if [ "$dom_count" -le $(( total * 85 / 100 )) ]; then
+                        echo -e "${RED}  ✗ Dominant duration covers only ${dom_count}/${total} frames${NC}"
+                        echo "  All distinct durations:"
+                        echo "$frame_durations" | sort | uniq -c | sort -rn | head -10 | while read c d; do
+                            echo "    ${c}× ${d}s"
+                        done
+                    fi
+                fi
+            fi
+        else
+            echo -e "${RED}  ✗ No recording file found${NC}"
+        fi
+    else
+        echo -e "${RED}  ✗ No recording generated${NC}"
+    fi
+
+    echo -e "${result_color}  ● Result: $result${NC}"
+    echo "fps_${fps_frac}|$result" >> "$RESULTS_FILE"
+
+    if [ "$result" = "PASS" ]; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+    fi
+}
+
+run_fps_matrix() {
+    echo ""
+    echo "========== NTSC/PAL FRAME RATE TEST =========="
+    for fps in $FPS_VALUES; do
+        run_fps_test "$fps"
+    done
+}
+
 # ── JSON report ────────────────────────────────────────────────────
 generate_json_report() {
     local output_path="$1"
@@ -1147,6 +1283,9 @@ for t in $TESTS; do
             ;;
         multitrack)
             run_multitrack_test
+            ;;
+        fps)
+            run_fps_matrix
             ;;
         *)
             echo "Unknown test suite: $t"
