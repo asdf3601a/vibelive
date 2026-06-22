@@ -29,6 +29,8 @@ pub struct HlsStreamState {
     first_segment_index: u32,
     discontinuity_sequence: u32,
     segment_durations: Vec<f64>,
+    // Total across ALL segments (never drained), used for recording duration
+    total_duration_secs: f64,
     segment_init_versions: Vec<u32>,
     discontinuity_before: Vec<bool>,
     // Keyframe-aligned rotation
@@ -93,6 +95,7 @@ impl HlsStreamState {
             segment_start_offsets: Vec::new(),
             codec_string: None,
             max_segment_duration_ms: 0,
+            total_duration_secs: 0.0,
         }
     }
 
@@ -114,7 +117,7 @@ impl HlsStreamState {
     }
 
     pub fn total_duration_secs(&self) -> f64 {
-        self.segment_durations.iter().sum()
+        self.total_duration_secs
     }
 
     /// Clear the audio-only flag when video data arrives for this track.
@@ -414,6 +417,7 @@ impl HlsStreamState {
                 self.max_segment_duration_ms = self.max_segment_duration_ms.max(duration_ms);
                 let duration = duration_ms as f64 / 1000.0;
                 self.segment_durations.push(duration.max(0.001));
+                self.total_duration_secs += duration.max(0.001);
                 self.segment_start_offsets.push(self.current_segment_start);
                 let prev_init = self.segment_init_versions.last().copied();
                 let is_discontinuity = prev_init.is_some() && prev_init != Some(self.init_version);
