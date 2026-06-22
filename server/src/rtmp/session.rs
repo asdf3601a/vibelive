@@ -310,7 +310,7 @@ async fn finalize_stream(
         drain_hls_to_recorder(&mut hls, r).await;
         let total_duration_secs: f64 = hls.total_duration_secs();
         let total_duration = if total_duration_secs > 0.0 {
-            Some(total_duration_secs.ceil() as u64)
+            Some(total_duration_secs.round() as u64)
         } else {
             None
         };
