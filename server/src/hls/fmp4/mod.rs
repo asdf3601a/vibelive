@@ -43,6 +43,8 @@ pub struct Fmp4Muxer {
     audio_base_dts: u64,
     audio_sample_rate: u32,
     video_timescale: u32,
+    video_fps_num: u64,
+    video_fps_den: u64,
 }
 
 impl Fmp4Muxer {
@@ -61,7 +63,14 @@ impl Fmp4Muxer {
             audio_base_dts: 0,
             audio_sample_rate: 44100,
             video_timescale: 90000,
+            video_fps_num: 30,
+            video_fps_den: 1,
         }
+    }
+
+    pub fn set_video_framerate(&mut self, num: u64, den: u64) {
+        self.video_fps_num = num;
+        self.video_fps_den = den;
     }
 
     pub fn video_codec(&self) -> Option<VideoCodec> {
@@ -171,9 +180,10 @@ impl Fmp4Muxer {
             let avg_dur = if self.video_samples.len() > 1 {
                 let total = self.video_samples.last().unwrap().dts
                     - self.video_samples.first().unwrap().dts;
-                (total / (self.video_samples.len() - 1) as u64) as u32
+                let cnt = self.video_samples.len() as u64 - 1;
+                ((total + cnt / 2) / cnt) as u32
             } else {
-                33
+                (1000 * self.video_fps_den / self.video_fps_num) as u32
             };
             for s in &mut self.video_samples {
                 s.duration = avg_dur;
@@ -184,9 +194,10 @@ impl Fmp4Muxer {
             let avg_dur = if self.audio_samples.len() > 1 {
                 let total = self.audio_samples.last().unwrap().dts
                     - self.audio_samples.first().unwrap().dts;
-                (total / (self.audio_samples.len() - 1) as u64) as u32
+                let cnt = self.audio_samples.len() as u64 - 1;
+                ((total + cnt / 2) / cnt) as u32
             } else {
-                21
+                (1024u64 * 1000 / self.audio_sample_rate as u64) as u32
             };
             for s in &mut self.audio_samples {
                 s.duration = avg_dur;
@@ -797,10 +808,18 @@ impl Fmp4Muxer {
         } else {
             (self.audio_sample_rate as u64, 1000u64)
         };
-        let scaled_duration = samples
-            .first()
-            .map(|s| s.duration as u64 * duration_scale / ts_scale)
-            .unwrap_or(if is_video { 33 } else { 21 }) as u32;
+        let scaled_duration = if is_video {
+            samples
+                .first()
+                .map(|s| s.duration as u64 * duration_scale / ts_scale)
+                .unwrap_or(self.video_timescale as u64 * self.video_fps_den / self.video_fps_num)
+                as u32
+        } else {
+            samples
+                .first()
+                .map(|s| s.duration as u64 * duration_scale / ts_scale)
+                .unwrap_or(1024) as u32
+        };
         let scaled_base_dts = base_dts * duration_scale / ts_scale;
         let default_size = samples.first().map(|s| s.size).unwrap_or(0);
         let default_flags = if is_video { 0x01010000 } else { 0x02000000 };

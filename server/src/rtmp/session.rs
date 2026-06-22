@@ -149,6 +149,8 @@ struct SessionContext {
     closed_audio_tracks: HashSet<u32>,
     // Track IDs discovered for this stream (used to update PublisherInfo)
     discovered_tracks: HashSet<u32>,
+    video_fps_num: u64,
+    video_fps_den: u64,
 }
 
 impl SessionContext {
@@ -170,6 +172,8 @@ impl SessionContext {
             closed_video_tracks: HashSet::new(),
             closed_audio_tracks: HashSet::new(),
             discovered_tracks: HashSet::new(),
+            video_fps_num: 30,
+            video_fps_den: 1,
         }
     }
 
@@ -681,6 +685,16 @@ async fn handle_event(
                     Some(id) => format!("{}", id),
                     None => String::new(),
                 });
+            let fps_float = metadata.video_frame_rate.unwrap_or(0.0) as f64;
+            let (fps_num, fps_den) = fps_to_rational(fps_float);
+            ctx.video_fps_num = fps_num;
+            ctx.video_fps_den = fps_den;
+            if let Some(ref mut hls) = ctx.hls_state {
+                hls.set_video_framerate(fps_num, fps_den);
+            }
+            for track_state in ctx.track_states.values_mut() {
+                track_state.set_video_framerate(fps_num, fps_den);
+            }
             let meta = crate::rtmp::StreamMeta {
                 width: metadata.video_width.unwrap_or(0),
                 height: metadata.video_height.unwrap_or(0),
@@ -688,7 +702,7 @@ async fn handle_event(
                 audio_codec: audio_codec_name,
                 video_bitrate: metadata.video_bitrate_kbps.unwrap_or(0),
                 audio_bitrate: metadata.audio_bitrate_kbps.unwrap_or(0),
-                framerate: metadata.video_frame_rate.unwrap_or(0.0) as f64,
+                framerate: fps_float,
             };
             if let Some(ref key) = ctx.current_stream_key {
                 let mut sm = app_state.stream_manager.write().await;
@@ -733,6 +747,33 @@ fn map_enhanced_audio_codec(
         crate::rtmp::enhanced::EnhancedAudioCodec::Aac => Some(crate::hls::fmp4::AudioCodec::Aac),
         _ => None,
     }
+}
+
+fn fps_to_rational(fps: f64) -> (u64, u64) {
+    // Match common NTSC/PAL frame rates as exact rationals.
+    // The RTMP metadata often gives 29.97, 59.94, 23.976 as floats;
+    // converting these directly to fractions keeps frame durations exact.
+    let known: &[(f64, u64, u64)] = &[
+        (23.976, 24000, 1001),
+        (23.98, 24000, 1001),
+        (24.0, 24, 1),
+        (25.0, 25, 1),
+        (29.97, 30000, 1001),
+        (30.0, 30, 1),
+        (48.0, 48, 1),
+        (50.0, 50, 1),
+        (59.94, 60000, 1001),
+        (60.0, 60, 1),
+        (120.0, 120, 1),
+    ];
+    for (ref_fps, num, den) in known {
+        if (fps - ref_fps).abs() < 0.01 {
+            return (*num, *den);
+        }
+    }
+    // Default: round to nearest integer
+    let rounded = (fps + 0.5).floor() as u64;
+    if rounded > 0 { (rounded, 1) } else { (30, 1) }
 }
 
 async fn handle_video_data(

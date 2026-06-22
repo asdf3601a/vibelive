@@ -143,6 +143,10 @@ impl HlsStreamState {
         Ok(())
     }
 
+    pub fn set_video_framerate(&mut self, num: u64, den: u64) {
+        self.fmp4_muxer.set_video_framerate(num, den);
+    }
+
     pub async fn set_audio_config(
         &mut self,
         codec: fmp4::AudioCodec,
