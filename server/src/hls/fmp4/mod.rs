@@ -62,29 +62,11 @@ pub struct Fmp4Muxer {
     audio_samples: Vec<Sample>,
     video_sequence_number: u32,
     video_base_dts: u64,
+    video_dts_tick: u64,
     audio_base_dts: u64,
     audio_sample_rate: u32,
     video_fps_num: u64,
     video_fps_den: u64,
-}
-
-fn gcd(a: u64, b: u64) -> u64 {
-    if b == 0 { a } else { gcd(b, a % b) }
-}
-
-fn compute_video_timescale(fps_num: u64, fps_den: u64) -> u32 {
-    // Choose T = lcm(fps_num/gcd, 1000) so that:
-    //   1. frame_duration = T × fps_den / fps_num is an exact integer
-    //   2. DTS from RTMP ms converts exactly: scaled_dts = dts_ms × T / 1000
-    let g = gcd(fps_num, fps_den);
-    let t_min = fps_num / g;          // smallest T that satisfies #1
-    // lcm(t_min, 1000) — satisfies both #1 and #2
-    if t_min.is_multiple_of(1000) {
-        t_min as u32                  // already divisible by 1000
-    } else {
-        let d = gcd(t_min, 1000);
-        (t_min / d * 1000) as u32     // lcm = t_min / gcd(t_min, 1000) * 1000
-    }
 }
 
 impl Fmp4Muxer {
@@ -102,6 +84,7 @@ impl Fmp4Muxer {
             audio_samples: Vec::new(),
             video_sequence_number: 0,
             video_base_dts: 0,
+            video_dts_tick: 0,
             audio_base_dts: 0,
             audio_sample_rate: 44100,
             video_fps_num: 30,
@@ -177,18 +160,32 @@ impl Fmp4Muxer {
     }
 
     pub fn add_video_sample(&mut self, data: Cow<'_, [u8]>, dts: u64, pts: u64, is_keyframe: bool) {
-        if self.video_samples.is_empty() {
-            self.video_base_dts = dts;
+        let dur_ticks = self.video_fps_den;
+
+        // Detect frame drops via RTMP timestamp vs. expected tick-based timing
+        let expected_pts_ms = self.video_dts_tick * 1000 / self.video_fps_num;
+        if dts > expected_pts_ms && dur_ticks > 0 {
+            let missing = (dts - expected_pts_ms) * self.video_fps_num / (1000 * dur_ticks);
+            self.video_dts_tick += missing * dur_ticks;
         }
+
+        let dts_ts = self.video_dts_tick;
+        self.video_dts_tick += dur_ticks;
+
+        if self.video_samples.is_empty() {
+            self.video_base_dts = dts_ts;
+        }
+
         let size = data.len() as u32;
         let flags = if is_keyframe { 0x02000000 } else { 0x01010000 };
+        let cto_ts = ((pts as i64 - dts as i64) * self.video_fps_num as i64 / 1000) as i32;
         self.video_samples.push(Sample {
             data: data.into_owned(),
-            dts,
+            dts: dts_ts,
             size,
             duration: 0,
             flags,
-            composition_time_offset: (pts as i64 - dts as i64) as i32,
+            composition_time_offset: cto_ts,
         });
     }
 
@@ -213,7 +210,7 @@ impl Fmp4Muxer {
     pub fn last_video_sample_duration(&self) -> u64 {
         self.video_samples
             .last()
-            .map(|s| s.duration as u64 * 1000 / compute_video_timescale(self.video_fps_num, self.video_fps_den) as u64)
+            .map(|s| s.duration as u64 * 1000 / self.video_fps_num)
             .unwrap_or(33)
     }
 
@@ -230,8 +227,7 @@ impl Fmp4Muxer {
         // or even 30fps exactly, but using the declared framerate rational
         // produces perfectly uniform frame durations that match the stream's
         // declared timing.
-        let video_dur =
-            (compute_video_timescale(self.video_fps_num, self.video_fps_den) as u64 * self.video_fps_den / self.video_fps_num) as u32;
+        let video_dur = self.video_fps_den as u32;
         for s in &mut self.video_samples {
             s.duration = video_dur;
         }
@@ -439,7 +435,7 @@ impl Fmp4Muxer {
 
     fn write_mdia_video(&self, w: &mut Vec<u8>) {
         let mut data = Vec::new();
-        self.write_mdhd(&mut data, compute_video_timescale(self.video_fps_num, self.video_fps_den));
+        self.write_mdhd(&mut data, self.video_fps_num as u32);
         self.write_hdlr(&mut data, b"vide", b"VideoHandler\0");
         self.write_minf_video(&mut data);
         write_box(w, b"mdia", &data);
@@ -897,24 +893,24 @@ impl Fmp4Muxer {
     ) {
         let is_video = track_id == 1;
         let is_opus_audio = !is_video && self.audio_codec == Some(AudioCodec::Opus);
-        let (duration_scale, ts_scale) = if is_video {
-            (compute_video_timescale(self.video_fps_num, self.video_fps_den) as u64, 1000u64)
+        // Video DTS is already in media timescale (from tick counter).
+        // Audio DTS is in ms — convert using sample_rate.
+        let scaled_base_dts = if is_video {
+            base_dts
         } else {
-            (self.audio_sample_rate as u64, 1000u64)
+            base_dts * self.audio_sample_rate as u64 / 1000
         };
         let scaled_duration = if is_video {
             samples
                 .first()
                 .map(|s| s.duration as u64)
-                .unwrap_or(compute_video_timescale(self.video_fps_num, self.video_fps_den) as u64 * self.video_fps_den / self.video_fps_num)
-                as u32
+                .unwrap_or(self.video_fps_den) as u32
         } else {
             samples
                 .first()
                 .map(|s| s.duration as u64)
                 .unwrap_or(1024) as u32
         };
-        let scaled_base_dts = base_dts * duration_scale / ts_scale;
         let default_size = samples.first().map(|s| s.size).unwrap_or(0);
         let default_flags = if is_video { 0x01010000 } else { 0x02000000 };
 
@@ -1475,8 +1471,8 @@ mod tests {
         muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
         muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
 
-        // Sample with DTS=0, PTS=33  →  composition_time_offset=33
-        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 0, 33, true);
+        // Sample with DTS=0, PTS=100  →  composition_time_offset = 100*30/1000 = 3
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 0, 100, true);
 
         let frag = muxer.flush_combined_fragment().unwrap();
 
@@ -1508,13 +1504,14 @@ mod tests {
                         // trun data: version(1)+flags(3)+sample_count(4)+data_offset(4)+first_flags(4)+entries
                         // Each entry: sample_size(4)+composition_time_offset(4)
                         // CTO is at data_offset+20 for video
+                        // CTO is in media timescale: 100ms × 30 / 1000 = 3
                         let cto = i32::from_be_bytes([
                             frag[idata + 20],
                             frag[idata + 21],
                             frag[idata + 22],
                             frag[idata + 23],
                         ]);
-                        assert_eq!(cto, 33);
+                        assert_eq!(cto, 3);
                         return;
                     }
                     inner += _isize;
@@ -1563,21 +1560,5 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ]
         );
-    }
-}
-
-#[cfg(test)]
-mod timescale_tests {
-    use super::*;
-    #[test]
-    fn test_compute_video_timescale() {
-        assert_eq!(compute_video_timescale(30, 1), 3000);
-        assert_eq!(compute_video_timescale(24, 1), 3000);
-        assert_eq!(compute_video_timescale(25, 1), 1000);
-        assert_eq!(compute_video_timescale(50, 1), 1000);
-        assert_eq!(compute_video_timescale(60, 1), 3000);
-        assert_eq!(compute_video_timescale(24000, 1001), 24000);
-        assert_eq!(compute_video_timescale(30000, 1001), 30000);
-        assert_eq!(compute_video_timescale(60000, 1001), 60000);
     }
 }
