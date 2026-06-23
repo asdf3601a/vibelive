@@ -812,19 +812,23 @@ fn parse_enhanced_color_config(data: &[u8]) -> crate::hls::fmp4::ColorConfig {
 
 /// Try to parse HDR metadata from Enhanced RTMP video metadata remainder.
 pub fn parse_enhanced_hdr_metadata(data: &[u8]) -> Option<crate::hls::fmp4::HdrMetadata> {
-    // Try AMF0 first
+    // Try AMF0 first (OBS/veovera and FFmpeg)
     if let Some(hdr) = try_parse_amf_hdr_metadata(data) {
         return Some(hdr);
     }
-    // Fall back to binary format: u32 size prefix + CLLI(4) + MDCV(24)
+    // Fall back to binary format: 4-byte size prefix + 4-byte length + CLLI(4) + MDCV(24)
     // Data that starts with 0x02 (AMF string) is AMF0, not binary — bail out.
     if !data.is_empty() && data[0] == 0x02 { return None; }
     if data.len() < 36 { return None; }
     let hdr_data = &data[4..];
     if hdr_data.len() < 4 { return None; }
     let hdr_len = u32::from_be_bytes([hdr_data[0], hdr_data[1], hdr_data[2], hdr_data[3]]) as usize;
+    // Binary HDR payload is exactly 28 bytes: CLLI(4) + MDCV(24).
+    // Reject any other length — this prevents raw HEVC bitstream data
+    // from being misread as HDR metadata.
+    if hdr_len != 28 { return None; }
     let payload = hdr_data.get(4..)?;
-    if hdr_len < 28 || payload.len() < hdr_len.min(28) { return None; }
+    if payload.len() < 28 { return None; }
     let p = payload;
     let maxcll = u16::from_be_bytes([p[0], p[1]]);
     let maxfall = u16::from_be_bytes([p[2], p[3]]);
@@ -901,8 +905,14 @@ fn amf_next_value(data: &[u8]) -> Option<(u8, &[u8], usize)> {
                 if val_marker == 0x00 { off += 9; }
                 else if val_marker == 0x01 { off += 2; }
                 else if val_marker == 0x02 { let slen = u16::from_be_bytes([data[off+1], data[off+2]]) as usize; off += 3 + slen; }
-                else if val_marker == 0x03 || val_marker == 0x08 { off = skip_amf_object(data, off)?; }
-                else if val_marker == 0x0A { off = skip_amf_strict_array(data, off)?; }
+                else if val_marker == 0x03 || val_marker == 0x08 || val_marker == 0x0A {
+                    // skip_amf_object / skip_amf_strict_array expect
+                    // start at the first key/count after the marker, but
+                    // 'off' points at the marker byte — use amf_next_value
+                    // which starts from the marker correctly.
+                    let (_, _, n) = amf_next_value(&data[off..])?;
+                    off += n;
+                }
                 else if val_marker == 0x05 || val_marker == 0x06 { off += 1; }
                 else { return None; }
             }
@@ -947,6 +957,9 @@ fn skip_amf_object(data: &[u8], start: usize) -> Option<usize> {
 }
 
 /// Skip past an AMF0 Strict Array (0x0A).
+/// Note: not currently called — value skipping in amf_next_value
+/// now uses amf_next_value recursively instead.
+#[allow(dead_code)]
 fn skip_amf_strict_array(data: &[u8], start: usize) -> Option<usize> {
     if start + 4 >= data.len() { return None; }
     let count = u32::from_be_bytes([data[start], data[start+1], data[start+2], data[start+3]]) as usize;
@@ -1093,46 +1106,46 @@ fn try_parse_amf_hdr_metadata(data: &[u8]) -> Option<crate::hls::fmp4::HdrMetada
     // Chromaticity values arrive as raw f64 (e.g. 0.3127), must be scaled by MDCV_CHROMA_DEN
     // Luminance values arrive in nits (e.g. 1000.0), must be scaled by MDCV_LUMA_DEN
 
-    let read_primaries_x = |obj: &[u8]| -> Option<[u16; 3]> {
-        if let Some(v) = amf_lookup(obj, "displayPrimariesX") {
-            if !v.is_empty() && v[0] == 0x0A {
-                let mut arr = [0u16; 3];
-                arr[0] = (amf_read_number(&v[5..])?.0 * MDCV_CHROMA_DEN) as u16;
-                arr[1] = (amf_read_number(&v[14..])?.0 * MDCV_CHROMA_DEN) as u16;
-                arr[2] = (amf_read_number(&v[23..])?.0 * MDCV_CHROMA_DEN) as u16;
-                return Some(arr);
+        let read_primaries_x = |obj: &[u8]| -> Option<[u16; 3]> {
+            if let Some(v) = amf_lookup(obj, "displayPrimariesX") {
+                if !v.is_empty() && v[0] == 0x0A {
+                    let mut arr = [0u16; 3];
+                    arr[0] = (amf_read_number(&v[5..])?.0 * MDCV_CHROMA_DEN + 0.5) as u16;
+                    arr[1] = (amf_read_number(&v[14..])?.0 * MDCV_CHROMA_DEN + 0.5) as u16;
+                    arr[2] = (amf_read_number(&v[23..])?.0 * MDCV_CHROMA_DEN + 0.5) as u16;
+                    return Some(arr);
+                }
             }
-        }
-        // FFmpeg individual fields
-        let rx = (read_num(obj, "redX")? * MDCV_CHROMA_DEN) as u16;
-        let gx = (read_num(obj, "greenX")? * MDCV_CHROMA_DEN) as u16;
-        let bx = (read_num(obj, "blueX")? * MDCV_CHROMA_DEN) as u16;
-        Some([rx, gx, bx])
-    };
+            // FFmpeg individual fields
+            let rx = (read_num(obj, "redX")? * MDCV_CHROMA_DEN + 0.5) as u16;
+            let gx = (read_num(obj, "greenX")? * MDCV_CHROMA_DEN + 0.5) as u16;
+            let bx = (read_num(obj, "blueX")? * MDCV_CHROMA_DEN + 0.5) as u16;
+            Some([rx, gx, bx])
+        };
 
-    let read_primaries_y = |obj: &[u8]| -> Option<[u16; 3]> {
-        if let Some(v) = amf_lookup(obj, "displayPrimariesY") {
-            if !v.is_empty() && v[0] == 0x0A {
-                let mut arr = [0u16; 3];
-                arr[0] = (amf_read_number(&v[5..])?.0 * MDCV_CHROMA_DEN) as u16;
-                arr[1] = (amf_read_number(&v[14..])?.0 * MDCV_CHROMA_DEN) as u16;
-                arr[2] = (amf_read_number(&v[23..])?.0 * MDCV_CHROMA_DEN) as u16;
-                return Some(arr);
+        let read_primaries_y = |obj: &[u8]| -> Option<[u16; 3]> {
+            if let Some(v) = amf_lookup(obj, "displayPrimariesY") {
+                if !v.is_empty() && v[0] == 0x0A {
+                    let mut arr = [0u16; 3];
+                    arr[0] = (amf_read_number(&v[5..])?.0 * MDCV_CHROMA_DEN + 0.5) as u16;
+                    arr[1] = (amf_read_number(&v[14..])?.0 * MDCV_CHROMA_DEN + 0.5) as u16;
+                    arr[2] = (amf_read_number(&v[23..])?.0 * MDCV_CHROMA_DEN + 0.5) as u16;
+                    return Some(arr);
+                }
             }
-        }
-        // FFmpeg individual fields
-        let ry = (read_num(obj, "redY")? * MDCV_CHROMA_DEN) as u16;
-        let gy = (read_num(obj, "greenY")? * MDCV_CHROMA_DEN) as u16;
-        let by = (read_num(obj, "blueY")? * MDCV_CHROMA_DEN) as u16;
-        Some([ry, gy, by])
-    };
+            // FFmpeg individual fields
+            let ry = (read_num(obj, "redY")? * MDCV_CHROMA_DEN + 0.5) as u16;
+            let gy = (read_num(obj, "greenY")? * MDCV_CHROMA_DEN + 0.5) as u16;
+            let by = (read_num(obj, "blueY")? * MDCV_CHROMA_DEN + 0.5) as u16;
+            Some([ry, gy, by])
+        };
 
-    let display_primaries_x = read_primaries_x(mdcv)?;
-    let display_primaries_y = read_primaries_y(mdcv)?;
-    let white_point_x = (read_num(mdcv, "whitePointX")? * MDCV_CHROMA_DEN) as u16;
-    let white_point_y = (read_num(mdcv, "whitePointY")? * MDCV_CHROMA_DEN) as u16;
-    let max_luminance = (read_num(mdcv, "maxLuminance")? * MDCV_LUMA_DEN) as u32;
-    let min_luminance = (read_num(mdcv, "minLuminance")? * MDCV_LUMA_DEN) as u32;
+        let display_primaries_x = read_primaries_x(mdcv)?;
+        let display_primaries_y = read_primaries_y(mdcv)?;
+        let white_point_x = (read_num(mdcv, "whitePointX")? * MDCV_CHROMA_DEN + 0.5) as u16;
+        let white_point_y = (read_num(mdcv, "whitePointY")? * MDCV_CHROMA_DEN + 0.5) as u16;
+        let max_luminance = (read_num(mdcv, "maxLuminance")? * MDCV_LUMA_DEN + 0.5) as u32;
+        let min_luminance = (read_num(mdcv, "minLuminance")? * MDCV_LUMA_DEN + 0.5) as u32;
 
     Some(crate::hls::fmp4::HdrMetadata {
         max_content_light_level: maxcll,
@@ -1229,6 +1242,18 @@ async fn handle_video_data(
                                         ) => {
                                             let _ = hls.finalize_segment().await;
                                         }
+                                        Some(
+                                            crate::rtmp::enhanced::VideoPacketType::Metadata,
+                                        ) => {
+                                            hls.set_video_color_config(
+                                                parse_enhanced_color_config(track.payload),
+                                            );
+                                            if let Some(hdr) =
+                                                parse_enhanced_hdr_metadata(track.payload)
+                                            {
+                                                hls.set_hdr_metadata(hdr);
+                                            }
+                                        }
                                         _ => {
                                             let _ = hls
                                                 .write_video(
@@ -1258,6 +1283,18 @@ async fn handle_video_data(
                                     Some(crate::rtmp::enhanced::VideoPacketType::SequenceEnd) => {
                                         let _ = track_state.finalize_segment().await;
                                         ctx.closed_video_tracks.insert(track.track_id);
+                                    }
+                                    Some(
+                                        crate::rtmp::enhanced::VideoPacketType::Metadata,
+                                    ) => {
+                                        track_state.set_video_color_config(
+                                            parse_enhanced_color_config(track.payload),
+                                        );
+                                        if let Some(hdr) =
+                                            parse_enhanced_hdr_metadata(track.payload)
+                                        {
+                                            track_state.set_hdr_metadata(hdr);
+                                        }
                                     }
                                     _ => {
                                         let _ = track_state
@@ -1410,12 +1447,13 @@ async fn handle_video_data(
                     notify_track_discovered(app_state, stream_key, 0, video_codec, audio_codec)
                         .await;
                 }
-                if let Some(ref mut hls) = ctx.hls_state
-                    && let Err(e) = hls
+                if let Some(ref mut hls) = ctx.hls_state {
+                    if let Err(e) = hls
                         .write_video(remainder, ts, is_keyframe, composition_time_offset)
                         .await
-                {
-                    tracing::warn!("HLS write_video failed: {}", e);
+                    {
+                        tracing::warn!("HLS write_video failed: {}", e);
+                    }
                 }
             } else if avc_packet_type == 2 {
                 // AVC end of sequence
@@ -1770,5 +1808,75 @@ async fn handle_audio_data(
     for track_state in ctx.track_states.values_mut() {
         let _ = track_state.drain_init_data();
         let _ = track_state.drain_segment_data();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_amf0_colorinfo_hdr_parse_and_verify() {
+        let mut data = Vec::new();
+        // Outer: AMF string "colorInfo"
+        data.push(0x02u8);
+        data.extend_from_slice(&9u16.to_be_bytes());
+        data.extend_from_slice(b"colorInfo");
+        // colorInfo value: AMF0 Object (0x03)
+        data.push(0x03u8);
+        // colorConfig sub-object
+        data.extend_from_slice(&11u16.to_be_bytes());
+        data.extend_from_slice(b"colorConfig");
+        data.push(0x03u8);
+        data.extend_from_slice(&18u16.to_be_bytes());
+        data.extend_from_slice(b"matrixCoefficients");
+        data.push(0x00u8);
+        data.extend_from_slice(&f64::to_be_bytes(9.0));
+        data.extend_from_slice(&[0x00, 0x00, 0x09]);
+        // hdrCll sub-object
+        data.extend_from_slice(&6u16.to_be_bytes());
+        data.extend_from_slice(b"hdrCll");
+        data.push(0x03u8);
+        for (name, val) in [("maxFall", 1000.0), ("maxCLL", 1000.0)] {
+            data.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            data.extend_from_slice(name.as_bytes());
+            data.push(0x00u8);
+            data.extend_from_slice(&f64::to_be_bytes(val));
+        }
+        data.extend_from_slice(&[0x00, 0x00, 0x09]);
+        // hdrMdcv sub-object
+        data.extend_from_slice(&7u16.to_be_bytes());
+        data.extend_from_slice(b"hdrMdcv");
+        data.push(0x03u8);
+        for (name, val) in [
+            ("redX", 0.68), ("redY", 0.32),
+            ("greenX", 0.265), ("greenY", 0.69),
+            ("blueX", 0.15), ("blueY", 0.06),
+            ("whitePointX", 0.3127), ("whitePointY", 0.329),
+            ("maxLuminance", 1000.0), ("minLuminance", 0.005),
+        ] {
+            data.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            data.extend_from_slice(name.as_bytes());
+            data.push(0x00u8);
+            data.extend_from_slice(&f64::to_be_bytes(val));
+        }
+        data.extend_from_slice(&[0x00, 0x00, 0x09]);
+        data.extend_from_slice(&[0x00, 0x00, 0x09]);
+
+        let hdr = parse_enhanced_hdr_metadata(&data)
+            .expect("Should parse AMF0 colorInfo with hdrCll/hdrMdcv");
+
+        assert_eq!(hdr.max_content_light_level, 1000, "MaxCLL");
+        assert_eq!(hdr.max_frame_average_light_level, 1000, "MaxFALL");
+        assert_eq!(hdr.display_primaries_x[0], 34000, "RX");
+        assert_eq!(hdr.display_primaries_y[0], 16000, "RY");
+        assert_eq!(hdr.display_primaries_x[1], 13250, "GX");
+        assert_eq!(hdr.display_primaries_y[1], 34500, "GY");
+        assert_eq!(hdr.display_primaries_x[2], 7500, "BX");
+        assert_eq!(hdr.display_primaries_y[2], 3000, "BY");
+        assert_eq!(hdr.white_point_x, 15635, "WX");
+        assert_eq!(hdr.white_point_y, 16450, "WY");
+        assert_eq!(hdr.max_luminance, 10000000, "maxLum");
+        assert_eq!(hdr.min_luminance, 50, "minLum");
     }
 }

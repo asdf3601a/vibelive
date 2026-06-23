@@ -1781,4 +1781,123 @@ mod tests {
         // 1024 * 1000 / 44100 = 23 (truncated) but with rounding: (1024*1000 + 22050) / 44100 = 1024066.5 / 44100 = 23
         assert_eq!(ms, 23, "AAC duration at 44100Hz should round to 23ms");
     }
+
+    // ── HDR box validation ──────────────────────────────────────────
+
+    fn find_box_bytes<'a>(data: &'a [u8], target: &[u8; 4]) -> Option<(usize, &'a [u8])> {
+        let mut off = 0;
+        while off + 8 <= data.len() {
+            let size =
+                u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                    as usize;
+            if size == 0 || off + size > data.len() {
+                break;
+            }
+            if &data[off + 4..off + 8] == target {
+                return Some((size, &data[off + 8..off + size]));
+            }
+            let fourcc = match data.get(off + 4..off + 8) {
+                Some(s) if s.len() == 4 => {
+                    let mut a = [0u8; 4];
+                    a.copy_from_slice(s);
+                    a
+                }
+                _ => {
+                    off += size;
+                    continue;
+                }
+            };
+            match &fourcc {
+                b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" if size > 8 => {
+                    if let Some(r) = find_box_bytes(&data[off + 8..off + size], target) {
+                        return Some(r);
+                    }
+                }
+                b"stsd" if size > 16 => {
+                    if let Some(r) = find_box_bytes(&data[off + 16..off + size], target) {
+                        return Some(r);
+                    }
+                }
+                b"hvc1" | b"avc1" | b"av01" | b"hev1" if size > 8 => {
+                    if let Some(r) = find_box_bytes(&data[off + 86..off + size], target) {
+                        return Some(r);
+                    }
+                }
+                _ => {}
+            }
+            off += size;
+        }
+        None
+    }
+
+    #[test]
+    fn test_hdr_boxes_clli_mdcv_in_init_segment() {
+        let mut mux = Fmp4Muxer::new();
+        mux.set_video_codec(VideoCodec::H265, 1920, 1080);
+        mux.set_audio_codec(AudioCodec::Aac);
+        mux.set_video_config(vec![
+            0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78,
+            0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 0x03, 0x20, 0x00, 0x00,
+            0x03, 0x00, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xAC, 0x09,
+        ]);
+        mux.set_audio_config(vec![0x12, 0x10]);
+
+        mux.set_video_color_config(ColorConfig {
+            color_primaries: 9,
+            transfer_characteristics: 16,
+            matrix_coefficients: 9,
+            full_range: false,
+        });
+
+        // Mastering display: Display P3 primaries, 1000 nits peak, 0.005 nits black
+        mux.set_hdr_metadata(HdrMetadata {
+            max_content_light_level: 1000,
+            max_frame_average_light_level: 400,
+            display_primaries_x: [34000, 13250, 7500],
+            display_primaries_y: [16000, 34500, 3000],
+            white_point_x: 15635,
+            white_point_y: 16450,
+            max_luminance: 10_000_000,
+            min_luminance: 50,
+        });
+
+        let init = mux.init_segment();
+
+        let (clli_size, clli_data) =
+            find_box_bytes(&init, b"clli").expect("clli box missing from init segment");
+        assert_eq!(clli_size, 12, "clli box should be 12 bytes");
+        assert_eq!(
+            u16::from_be_bytes([clli_data[0], clli_data[1]]),
+            1000,
+            "MaxCLL"
+        );
+        assert_eq!(
+            u16::from_be_bytes([clli_data[2], clli_data[3]]),
+            400,
+            "MaxFALL"
+        );
+
+        let (mdcv_size, mdcv_data) =
+            find_box_bytes(&init, b"mdcv").expect("mdcv box missing from init segment");
+        assert_eq!(mdcv_size, 32, "mdcv box should be 32 bytes");
+
+        assert_eq!(u16::from_be_bytes([mdcv_data[0], mdcv_data[1]]), 13250, "GX");
+        assert_eq!(u16::from_be_bytes([mdcv_data[2], mdcv_data[3]]), 34500, "GY");
+        assert_eq!(u16::from_be_bytes([mdcv_data[4], mdcv_data[5]]), 7500, "BX");
+        assert_eq!(u16::from_be_bytes([mdcv_data[6], mdcv_data[7]]), 3000, "BY");
+        assert_eq!(u16::from_be_bytes([mdcv_data[8], mdcv_data[9]]), 34000, "RX");
+        assert_eq!(u16::from_be_bytes([mdcv_data[10], mdcv_data[11]]), 16000, "RY");
+        assert_eq!(u16::from_be_bytes([mdcv_data[12], mdcv_data[13]]), 15635, "WX");
+        assert_eq!(u16::from_be_bytes([mdcv_data[14], mdcv_data[15]]), 16450, "WY");
+        assert_eq!(
+            u32::from_be_bytes([mdcv_data[16], mdcv_data[17], mdcv_data[18], mdcv_data[19]]),
+            10_000_000,
+            "maxLum"
+        );
+        assert_eq!(
+            u32::from_be_bytes([mdcv_data[20], mdcv_data[21], mdcv_data[22], mdcv_data[23]]),
+            50,
+            "minLum"
+        );
+    }
 }
