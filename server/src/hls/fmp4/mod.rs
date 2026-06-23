@@ -225,9 +225,11 @@ impl Fmp4Muxer {
     }
 
     fn compute_and_set_durations(&mut self) {
-        // Video: use framerate rational for exact timescale duration.
+        // Video: use framerate rational for exact uniform timescale duration.
         // RTMP integer-millisecond DTS values cannot represent NTSC rates
-        // or even 30fps exactly, so averaging them introduces drift.
+        // or even 30fps exactly, but using the declared framerate rational
+        // produces perfectly uniform frame durations that match the stream's
+        // declared timing.
         let video_dur =
             (compute_video_timescale(self.video_fps_num, self.video_fps_den) as u64 * self.video_fps_den / self.video_fps_num) as u32;
         for s in &mut self.video_samples {
@@ -900,7 +902,6 @@ impl Fmp4Muxer {
         } else {
             (self.audio_sample_rate as u64, 1000u64)
         };
-        // Duration is stored in media timescale, no conversion needed
         let scaled_duration = if is_video {
             samples
                 .first()
@@ -1497,16 +1498,13 @@ mod tests {
                             "trun version should be 1 when composition_time_offset is non-zero"
                         );
                         // Check CTO flag is set (0x000800)
-                        let flags = u32::from_be_bytes([
+                        let trun_flags = u32::from_be_bytes([
                             0,
                             frag[idata + 1],
                             frag[idata + 2],
                             frag[idata + 3],
                         ]);
-                        assert!(
-                            flags & 0x000800 != 0,
-                            "trun should have sample_composition_time_offset flag"
-                        );
+                        assert!(trun_flags & 0x000800 != 0, "trun should have sample_composition_time_offset flag");
                         // trun data: version(1)+flags(3)+sample_count(4)+data_offset(4)+first_flags(4)+entries
                         // Each entry: sample_size(4)+composition_time_offset(4)
                         // CTO is at data_offset+20 for video

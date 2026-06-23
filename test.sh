@@ -1122,12 +1122,10 @@ run_fps_test() {
                 tb_den="${tb_den#*/}"
                 dom_sec=$(python3 -c "print($dom_dur / ${tb_den:-90000})")
 
-                echo -e "  frames=$total  dominant=${dom_dur}ticks (${dom_sec}s)  count=$dom_count/$total"
+                echo -e "  frames=$total  unique=$unique  dominant=${dom_dur}ticks (${dom_sec}s)  count=$dom_count/$total"
 
-                # Check frame-duration consistency: dominant duration covers ≥85% of frames.
-                # The muxer uses the stream's declared framerate rational to produce uniform
-                # frame durations in the media timescale — all frames within a segment share
-                # the same duration. Segments at keyframe boundaries may have one outlier.
+                # Frame durations are uniform (from framerate rational).
+                # Verify dominant covers ≥85% of frames (one outlier at segment boundary OK).
                 local ok
                 ok=$(python3 <<PY
 total = $total
