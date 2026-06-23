@@ -186,15 +186,19 @@ impl SessionContext {
         let stream_key = self.current_stream_key.as_ref().unwrap().clone();
         let segment_duration = self.hls_segment_duration;
         let segments_keep = self.hls_segments_keep;
+        let fps_num = self.video_fps_num;
+        let fps_den = self.video_fps_den;
         let state = self.track_states.entry(track_id).or_insert_with(|| {
-            HlsStreamState::new(
+            let mut s = HlsStreamState::new(
                 &media_dir,
                 &stream_key,
                 track_id,
                 is_audio_only,
                 segment_duration,
                 segments_keep,
-            )
+            );
+            s.set_video_framerate(fps_num, fps_den);
+            s
         });
         // If video data arrives for a track previously created as audio-only,
         // clear the flag so write_video doesn't drop video samples.
@@ -851,7 +855,7 @@ fn amf_read_number(data: &[u8]) -> Option<(f64, usize)> {
 
 /// AMF0 ECMA Array reader: returns fields as (key, value_bytes).
 /// ECMA Array marker (0x08) + u32 count + key-value pairs + 0x000009 terminator.
-fn amf_next_value<'a>(data: &'a [u8]) -> Option<(u8, &'a [u8], usize)> {
+fn amf_next_value(data: &[u8]) -> Option<(u8, &[u8], usize)> {
     if data.is_empty() { return None; }
     let marker = data[0];
     let _consumed = 1;
@@ -1057,7 +1061,7 @@ fn try_parse_amf_hdr_metadata(data: &[u8]) -> Option<crate::hls::fmp4::HdrMetada
     let read_primaries = |obj: &[u8], name: &str| -> Option<[u16; 3]> {
         let v = amf_lookup(obj, name)?;
         // Could be Strict Array (0x0A) of 3 numbers, or comma-separated string, or just 3 separate fields
-        if v.len() > 0 && v[0] == 0x0A {
+        if !v.is_empty() && v[0] == 0x0A {
             // Strict Array: 0x0A + u32 count + 3 Numbers
             let mut arr = [0u16; 3];
             arr[0] = amf_read_number(&v[5..]).map(|r| r.0 as u16)?;
@@ -1066,7 +1070,7 @@ fn try_parse_amf_hdr_metadata(data: &[u8]) -> Option<crate::hls::fmp4::HdrMetada
             Some(arr)
         } else {
             // Separate fields
-            let a = read_num(obj, &format!("{}", name))? as u16;
+            let a = read_num(obj, name)? as u16;
             Some([a, 0, 0])
         }
     };

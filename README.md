@@ -73,6 +73,7 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Supports H.264, H.265 (HEVC), AV1 video + AAC, Opus, FLAC audio
   - Generates `init_segment()` (ftyp + moov), `flush_combined_fragment()` (moof + mdat)
   - Uses Sample tables with duration computation, composition time offsets, and proper `trex` defaults
+  - **HDR metadata passthrough**: Writes `colr` (nclx with color_primaries / transfer_characteristics / matrix_coefficients / full_range), `clli` (maxCLL / maxFALL), and `mdcv` (display primaries, white point, luminance) boxes into the video sample entry when HDR metadata is present via Enhanced RTMP (AMF0 `colorInfo` or binary FFmpeg format). AV1 color config is also extracted from codec configuration OBU.
 
 ### 3.3 Recording (`recording/`)
 
@@ -314,6 +315,7 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
   - **Volume**: 6-stage icon (mute → 1–25% → 25–50% → 50–75% → 75–100% → 100–150% boost), inline horizontal slider, mouse-wheel control, capsule container. User's volume preference is persisted to `localStorage` and applied to the video element on every metadata load (`v.volume = Math.min(1, volume.value)`), preventing the browser default (1.0) from overwriting the saved value.
   - **Mute state**: The `isMuted` ref is synced with the `muted` prop on mount via `{ immediate: true }` watcher, ensuring the volume icon matches the video's actual muted state. `setVolume()` sets both `video.muted` and the `isMuted` ref atomically.
   - **Speed**: Discrete slider (0.25x–16x) with wheel control, pitch preservation, speed badge in control bar.
+  - **Aspect Ratio**: Original / Crop / Stretch toggle in settings. Persisted to `localStorage` under `player_aspect_fit`. Applies `object-fit: contain | cover | fill` to the video element with a fixed `aspect-ratio: 16/9` container.
   - **A-B Loop** (recordings only): Set point A / point B, then choose loop on/off. When enabled and A is set, playback seeks to A on play; when B is set, it stops/loops at B. Shareable via URL (`&loopA=&loopB=&loop=true`).
   - **Quality**: Multitrack track selector (right side, only visible when multiple tracks are available). Track switching emits `trackChange` to the parent, which updates `props.src`, triggering a single `loadSource` call via watcher — eliminating duplicate HLS initialization.
   - **Debug overlay**: Toggleable horizontal stats bar showing time, resolution, volume, speed, dropped frames, HLS bandwidth estimate, buffer length, live latency, and active track.
@@ -625,7 +627,8 @@ The project includes a unified test script `./test.sh` that covers codec compati
 | `reconnect` | Abnormal disconnect + reconnect grace period |
 | `hls` | Live HLS segment verification |
 | `multitrack` | Enhanced RTMP multitrack (2 video + 2 audio, mixed codecs) |
-| `all` | Every suite (default) |
+| `fps` | NTSC/PAL frame rate consistency test (NOT included in `all`) |
+| `all` | Every suite except `fps` |
 
 **Available options:**
 - `--video LIST` — `h264`, `hevc`, `av1`
@@ -653,40 +656,14 @@ ffmpeg -re \
   -f lavfi -i "testsrc=duration=30:size=640x360:rate=30" \
   -f lavfi -i "sine=frequency=440:duration=30" \
   -f lavfi -i "sine=frequency=880:duration=30" \
-  -map 0:v -c:v:0 libsvtav1 -preset:v:0 12 -pix_fmt:v:0 yuv420p -b:v:0 1500k -g:v:0 60 \
-  -map 1:v -c:v:1 libx264 -preset:v:1 ultrafast -pix_fmt:v:1 yuv420p -b:v:1 500k -g:v:1 60 \
+  -map 0:v -c:v:0 libsvtav1 -preset:v:0 12 -pix_fmt:v:0 yuv420p -b:v:0 1500k -g:v:0 60 -keyint_min:v:0 60 \
+  -map 1:v -c:v:1 libx264 -preset:v:1 ultrafast -pix_fmt:v:1 yuv420p -b:v:1 500k -g:v:1 60 -keyint_min:v:1 60 \
   -map 2:a -c:a:0 libopus -ar:a:0 48000 -b:a:0 128k \
   -map 3:a -c:a:1 aac -ar:a:1 44100 -b:a:1 128k \
   -f flv rtmp://localhost:1935/live/testkey
 ```
 
 Then open `http://localhost:8080/live/testkey` in a browser. Multitrack streams show a quality selector button (gear icon) in the player control bar to switch between Default and Track 1.
-
-### 9.4 Continuous Multitrack Generator
-
-The `generate_multitrack.sh` script launches a new multitrack test stream at regular intervals:
-
-```bash
-# Default: stream every 65s, each running for 60s
-./generate_multitrack.sh
-
-# Custom RTMP endpoint and stream key
-RTMP_URL=rtmp://localhost:1935/live STREAM_PREFIX=mytest ./generate_multitrack.sh
-```
-
-**What it does:**
-- Generates a 2-video + 2-audio multitrack stream using ffmpeg test sources
-- **Track 0**: AV1 video (854×480, 800kbps) + Opus audio (48kHz, 64kbps)
-- **Track 1**: H.264 video (640×360, 300kbps) + AAC audio (44.1kHz, 64kbps)
-- Each stream runs for 60 seconds, with a new one starting every 65 seconds
-- Press `Ctrl+C` to stop; cleanly kills all background ffmpeg processes
-
-**Environment variables:**
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RTMP_URL` | `rtmp://5.home.oktw.one:1935/live` | RTMP ingestion endpoint |
-| `STREAM_PREFIX` | `aislop_generator` | Stream key prefix |
 
 ## 10. Development Guidelines
 
@@ -736,7 +713,6 @@ vibe-livestream/
 │   ├── router/              # Vue Router config
 │   ├── utils/               # Utility functions (format, clipboard, deepEqual)
 │   └── types/               # TypeScript interfaces
-├── generate_multitrack.sh   # Continuous multitrack test stream generator
 ├── nginx.local.conf         # nginx reverse proxy config (local dev)
 ├── nginx.docker.conf        # nginx config for Docker Compose
 ├── Dockerfile.backend       # Rust backend image (CI + Docker Compose)

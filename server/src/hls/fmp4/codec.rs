@@ -468,21 +468,10 @@ pub fn ensure_av1_obu_size_fields(data: &[u8]) -> Vec<u8> {
     result
 }
 
-pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
-    if config.is_empty() {
-        return vec![0x81, 0x00, 0x00, 0x00];
-    }
-    if config[0] == 0x81 {
-        return config.to_vec();
-    }
-
+/// Scan an AV1 codec configuration blob for the sequence header OBU payload.
+fn find_av1_sequence_header(config: &[u8]) -> Option<&[u8]> {
     let mut offset = 0;
-    let mut seq_header_payload: Option<&[u8]> = None;
-
-    while offset < config.len() && seq_header_payload.is_none() {
-        if offset >= config.len() {
-            break;
-        }
+    while offset < config.len() {
         let obu_header = config[offset];
         offset += 1;
         let obu_type = (obu_header >> 3) & 0x0F;
@@ -513,14 +502,24 @@ pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
         }
 
         if obu_type == 1 && offset + obu_size <= config.len() {
-            seq_header_payload = Some(&config[offset..offset + obu_size]);
-            break;
+            return Some(&config[offset..offset + obu_size]);
         }
 
         offset += obu_size;
     }
+    None
+}
 
-    let h = seq_header_payload.and_then(parse_av1_sequence_header);
+pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
+    if config.is_empty() {
+        return vec![0x81, 0x00, 0x00, 0x00];
+    }
+    if config[0] == 0x81 {
+        return config.to_vec();
+    }
+
+    let config_with_sizes = ensure_av1_obu_size_fields(config);
+    let h = find_av1_sequence_header(&config_with_sizes).and_then(parse_av1_sequence_header);
 
     let profile_level = (h.as_ref().map(|s| s.seq_profile).unwrap_or(0) << 5)
         | (h.as_ref().map(|s| s.seq_level_idx_0).unwrap_or(0) & 0x1F);
@@ -533,7 +532,6 @@ pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
         | (h.as_ref().map(|s| s.chroma_sample_position).unwrap_or(0) & 0x03);
 
     let mut av1c = vec![0x81, profile_level, flags2, 0x00];
-    let config_with_sizes = ensure_av1_obu_size_fields(config);
     av1c.extend_from_slice(&config_with_sizes);
     av1c
 }
@@ -542,55 +540,8 @@ pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
 /// Scans for the sequence header OBU, parses it, and returns color info.
 /// Returns None if no color description is present.
 pub fn av1_color_config_from_config(config: &[u8]) -> Option<crate::hls::fmp4::ColorConfig> {
-    // Normalize OBU size fields first (same as av1c_box_from_config)
-    let config_with_sizes = crate::hls::fmp4::codec::ensure_av1_obu_size_fields(config);
-    let config = &config_with_sizes;
-
-    let mut offset = 0;
-    let mut seq_header_payload: Option<&[u8]> = None;
-
-    while offset < config.len() && seq_header_payload.is_none() {
-        if offset >= config.len() {
-            break;
-        }
-        let obu_header = config[offset];
-        offset += 1;
-        let obu_type = (obu_header >> 3) & 0x0F;
-        let obu_extension_flag = (obu_header >> 2) & 1;
-        let obu_has_size_field = (obu_header >> 1) & 1;
-
-        if obu_extension_flag == 1 && offset < config.len() {
-            offset += 1;
-        }
-
-        let mut obu_size = 0usize;
-        if obu_has_size_field == 1 {
-            let mut shift = 0;
-            loop {
-                if offset >= config.len() {
-                    break;
-                }
-                let byte = config[offset];
-                offset += 1;
-                obu_size |= ((byte & 0x7F) as usize) << shift;
-                if byte & 0x80 == 0 {
-                    break;
-                }
-                shift += 7;
-            }
-        } else {
-            obu_size = config.len().saturating_sub(offset);
-        }
-
-        if obu_type == 1 && offset + obu_size <= config.len() {
-            seq_header_payload = Some(&config[offset..offset + obu_size]);
-            break;
-        }
-
-        offset += obu_size;
-    }
-
-    let h = seq_header_payload.and_then(parse_av1_sequence_header)?;
+    let config_with_sizes = ensure_av1_obu_size_fields(config);
+    let h = find_av1_sequence_header(&config_with_sizes).and_then(parse_av1_sequence_header)?;
     // Return color info if any field is meaningful (encoder may set only matrix_coefficients)
     if h.color_primaries == 0 && h.transfer_characteristics == 0 && h.matrix_coefficients == 0 {
         return None;
