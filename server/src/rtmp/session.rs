@@ -372,10 +372,11 @@ async fn finalize_stream(
                     let stream_thumb_dir =
                         PathBuf::from(&media_dir).join("thumbnails").join("streams");
                     for &w in &sizes {
-                        let _ = tokio::fs::remove_file(
-                            stream_thumb_dir.join(format!("{}_w{}.webp", key, w)),
-                        )
-                        .await;
+                        for ext in &["jxl", "avif", "png"] {
+                            let _ = tokio::fs::remove_file(
+                                stream_thumb_dir.join(format!("{}_w{}.{}", key, w, ext)),
+                            ).await;
+                        }
                     }
                 }
             });

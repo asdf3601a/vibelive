@@ -296,7 +296,7 @@ pub async fn update_index_json(
 
     let mut thumbnails = HashMap::new();
     for width in thumbnail_sizes {
-        let thumb_filename = format!("{}_w{}.webp", filename, width);
+        let thumb_filename = format!("{}_w{}.png", filename, width);
         let thumb_path = PathBuf::from(media_dir)
             .join("thumbnails")
             .join("recordings")

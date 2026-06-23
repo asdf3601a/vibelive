@@ -2,13 +2,16 @@
   <div class="flex items-center gap-2 sm:gap-4 rounded-lg border border-border-default bg-bg-surface/60 px-4 py-3 hover:bg-bg-surface transition">
     <!-- Preview thumbnail -->
     <div class="shrink-0 w-24 h-14 rounded-md overflow-hidden bg-bg-base relative group cursor-pointer" @click="$emit('play', recording)">
-      <img
-        v-if="thumbnailSrc && !thumbnailError"
-        :src="thumbnailSrc"
-        class="w-full h-full object-cover"
-        loading="lazy"
-        @error="thumbnailError = true"
-      />
+      <picture v-if="thumbnailSrc && !thumbnailError" class="w-full h-full">
+        <source :srcset="jxlSrc" type="image/jxl">
+        <source :srcset="avifSrc" type="image/avif">
+        <img
+          :src="thumbnailSrc"
+          class="w-full h-full object-cover"
+          loading="lazy"
+          @error="thumbnailError = true"
+        />
+      </picture>
       <div v-else class="w-full h-full flex items-center justify-center bg-bg-elevated">
         <svg class="h-5 w-5 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
           <path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-4.553A1 1 0 0121 6.12V17.88a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
@@ -102,6 +105,9 @@ const thumbnailSrc = computed(() => {
     || props.recording.thumbnail_url
     || ''
 })
+
+const jxlSrc = computed(() => thumbnailSrc.value?.replace(/\.png$/, '.jxl'))
+const avifSrc = computed(() => thumbnailSrc.value?.replace(/\.png$/, '.avif'))
 
 async function shareLink() {
   const url = `${window.location.origin}/recordings?play=${encodeURIComponent(props.recording.filename)}`

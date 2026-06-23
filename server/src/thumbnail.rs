@@ -56,17 +56,20 @@ pub async fn generate_thumbnails_for_stream(
 
     let mut results = Vec::new();
     for &width in sizes {
-        let thumb_path = dir.join(format!("{}_w{}.webp", stream_key, width));
+        let png_path = dir.join(format!("{}_w{}.png", stream_key, width));
 
         // Remove stale 0-byte thumbnail files before deciding whether to regenerate
-        if let Ok(meta) = tokio::fs::metadata(&thumb_path).await
-            && meta.len() == 0
-        {
-            let _ = tokio::fs::remove_file(&thumb_path).await;
+        for fmt in THUMBNAIL_FORMATS {
+            let p = dir.join(format!("{}_w{}.{}", stream_key, width, fmt));
+            if let Ok(meta) = tokio::fs::metadata(&p).await
+                && meta.len() == 0
+            {
+                let _ = tokio::fs::remove_file(&p).await;
+            }
         }
 
-        // Check if existing thumbnail is fresh enough
-        let should_generate = if let Ok(meta) = tokio::fs::metadata(&thumb_path).await {
+        // Check if existing PNG thumbnail is fresh enough (PNG is the canonical indicator)
+        let should_generate = if let Ok(meta) = tokio::fs::metadata(&png_path).await {
             if let Ok(modified) = meta.modified() {
                 modified.elapsed().unwrap_or(Duration::MAX)
                     >= Duration::from_secs(interval_seconds as u64)
@@ -78,18 +81,25 @@ pub async fn generate_thumbnails_for_stream(
         };
 
         if should_generate {
-            if let Err(e) = run_ffmpeg_thumbnail(&tmp_path, &thumb_path, Some(width)).await {
-                tracing::warn!(
-                    "Thumbnail generation failed for {} w={}: {}",
-                    stream_key,
-                    width,
-                    e
-                );
-            } else {
-                results.push(thumb_path);
+            let mut all_ok = true;
+            for &fmt in THUMBNAIL_FORMATS {
+                let thumb_path = dir.join(format!("{}_w{}.{}", stream_key, width, fmt));
+                if let Err(e) = run_ffmpeg_thumbnail_fmt(&tmp_path, &thumb_path, Some(width), fmt).await {
+                    tracing::warn!(
+                        "Thumbnail generation failed for {} w={} fmt={}: {}",
+                        stream_key,
+                        width,
+                        fmt,
+                        e
+                    );
+                    all_ok = false;
+                }
+            }
+            if all_ok {
+                results.push(png_path);
             }
         } else {
-            results.push(thumb_path);
+            results.push(png_path);
         }
     }
 
@@ -113,22 +123,25 @@ pub async fn generate_thumbnails_for_file(
 
     let mut results = Vec::new();
     for &width in sizes {
-        let thumb_path = output_dir.join(format!("{}_w{}.webp", filename, width));
-        run_ffmpeg_thumbnail(video_path, &thumb_path, Some(width)).await?;
-        results.push(thumb_path);
+        for &fmt in THUMBNAIL_FORMATS {
+            let thumb_path = output_dir.join(format!("{}_w{}.{}", filename, width, fmt));
+            run_ffmpeg_thumbnail_fmt(video_path, &thumb_path, Some(width), fmt).await?;
+            if fmt == "png" {
+                results.push(thumb_path);
+            }
+        }
     }
 
     Ok(results)
 }
 
-async fn run_ffmpeg_thumbnail(
+async fn run_ffmpeg_thumbnail_fmt(
     input: &std::path::Path,
     output: &std::path::Path,
     width: Option<u32>,
+    fmt: &str,
 ) -> anyhow::Result<PathBuf> {
-    // Atomic write: write to a temp file, then rename to final path.
-    // This ensures nginx never serves a partially-written thumbnail.
-    let tmp_output = output.with_extension("webp.tmp");
+    let tmp_output = output.with_extension(format!("{}.tmp", fmt));
 
     let mut args = vec![
         "-y".to_string(),
@@ -141,9 +154,25 @@ async fn run_ffmpeg_thumbnail(
         input.to_str().unwrap().to_string(),
         "-vframes".to_string(),
         "1".to_string(),
-        "-q:v".to_string(),
-        "75".to_string(),
     ];
+
+    match fmt {
+        "jxl" => {
+            args.push("-c:v".to_string());
+            args.push("libjxl".to_string());
+            args.push("-q:v".to_string());
+            args.push("90".to_string());
+        }
+        "avif" => {
+            args.push("-c:v".to_string());
+            args.push("libaom-av1".to_string());
+            args.push("-crf".to_string());
+            args.push("30".to_string());
+            args.push("-still-picture".to_string());
+            args.push("1".to_string());
+        }
+        _ => {} // PNG: no extra codec flags needed
+    }
 
     if let Some(w) = width {
         args.push("-vf".to_string());
@@ -151,7 +180,11 @@ async fn run_ffmpeg_thumbnail(
     }
 
     args.push("-f".to_string());
-    args.push("webp".to_string());
+    args.push(match fmt {
+        "jxl" => "image2",
+        "avif" => "avif",
+        _ => "apng",
+    }.to_string());
     args.push(tmp_output.to_str().unwrap().to_string());
 
     let cmd_output = Command::new("ffmpeg").args(&args).output().await?;
@@ -159,17 +192,18 @@ async fn run_ffmpeg_thumbnail(
     if !cmd_output.status.success() {
         let stderr = String::from_utf8_lossy(&cmd_output.stderr);
         let _ = tokio::fs::remove_file(&tmp_output).await;
-        return Err(anyhow::anyhow!("ffmpeg failed: {}", stderr));
+        return Err(anyhow::anyhow!("ffmpeg failed for {}: {}", fmt, stderr));
     }
 
     let meta = tokio::fs::metadata(&tmp_output).await?;
     if meta.len() == 0 {
         let _ = tokio::fs::remove_file(&tmp_output).await;
-        return Err(anyhow::anyhow!("ffmpeg produced empty output"));
+        return Err(anyhow::anyhow!("ffmpeg produced empty output for {}", fmt));
     }
 
-    // Atomic rename: readers see either the old file or the complete new file
     tokio::fs::rename(&tmp_output, output).await?;
 
     Ok(output.to_path_buf())
 }
+
+const THUMBNAIL_FORMATS: &[&str] = &["jxl", "avif", "png"];

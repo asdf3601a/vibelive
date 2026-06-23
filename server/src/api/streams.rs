@@ -34,12 +34,12 @@ fn build_stream_response(
     for &width in thumbnail_sizes {
         thumbnails.insert(
             width.to_string(),
-            format!("/thumbnails/streams/{}_w{}.webp", info.stream_key, width),
+            format!("/thumbnails/streams/{}_w{}.png", info.stream_key, width),
         );
     }
     let thumbnail_url = thumbnail_sizes
         .first()
-        .map(|w| format!("/thumbnails/streams/{}_w{}.webp", info.stream_key, w))
+        .map(|w| format!("/thumbnails/streams/{}_w{}.png", info.stream_key, w))
         .unwrap_or_default();
 
     StreamResponse {

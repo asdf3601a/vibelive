@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-LiveStream Platform is a self-hosted live streaming server that ingests RTMP streams, transmuxes them into HLS (fMP4/CMAF) for browser playback, records sessions as MP4 files, and generates WebP thumbnails. It consists of:
+LiveStream Platform is a self-hosted live streaming server that ingests RTMP streams, transmuxes them into HLS (fMP4/CMAF) for browser playback, records sessions as MP4 files, and generates JPEG XL, AVIF, and PNG thumbnails. It consists of:
 
 - **Rust backend** — RTMP ingestion, HLS generation, recording, REST API
 - **Vue 3 frontend** — Stream dashboard, live player, recordings library
@@ -90,12 +90,13 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
 
 ### 3.4 Thumbnails (`thumbnail.rs`)
 
-Top-level module at `server/src/thumbnail.rs`, using ffmpeg for WebP thumbnail generation:
+Top-level module at `server/src/thumbnail.rs`, using ffmpeg for multi-format thumbnail generation:
 - **Live thumbnails**: Concatenates `init.mp4` + latest `segment*.m4s` into a temp MP4, then runs ffmpeg
 - **Recording thumbnails**: Directly from the finalized MP4
-- **Atomic writes**: ffmpeg writes to `{output}.webp.tmp`, then renames to `{output}.webp` only after success. nginx never serves a partially-written file.
+- **Atomic writes**: ffmpeg writes to `{output}.{fmt}.tmp`, then renames to `{output}.{fmt}` only after success. nginx never serves a partially-written file.
 - Uses `scale={width}:-1` maintaining aspect ratio
-- Output format: **WebP** (`-q:v 75`)
+- Output formats: **JPEG XL** (`-c:v libjxl -q:v 90`), **AVIF** (`-c:v libaom-av1 -crf 30 -still-picture 1`), **PNG** (fallback, always generated)
+- **Priority**: JXL → AVIF → PNG (browser picks first supported format via `<picture>`)
 - **Cleanup**: Live stream thumbnails are deleted when the stream ends; recording thumbnails persist indefinitely.
 
 ### 3.5 API (`api/`)
@@ -153,10 +154,10 @@ List all currently active (live) streams.
     },
     "hls_url": "/hls/testkey/index.m3u8",
     "player_url": "/live/testkey",
-    "thumbnail_url": "/thumbnails/streams/testkey_w320.webp",
+    "thumbnail_url": "/thumbnails/streams/testkey_w320.png",
     "thumbnails": {
-      "320": "/thumbnails/streams/testkey_w320.webp",
-      "480": "/thumbnails/streams/testkey_w480.webp"
+      "320": "/thumbnails/streams/testkey_w320.png",
+      "480": "/thumbnails/streams/testkey_w480.png"
     },
     "tracks": [
       {
@@ -241,10 +242,10 @@ List all finalized recordings.
     "size_bytes": 12345678,
     "duration_seconds": 120,
     "url": "/recordings/testkey_20260527_063000.mp4",
-    "thumbnail_url": "/thumbnails/recordings/testkey_20260527_063000.mp4_w320.webp",
+    "thumbnail_url": "/thumbnails/recordings/testkey_20260527_063000.mp4_w320.png",
     "thumbnails": {
-      "320": "/thumbnails/recordings/testkey_20260527_063000.mp4_w320.webp",
-      "480": "/thumbnails/recordings/testkey_20260527_063000.mp4_w480.webp"
+      "320": "/thumbnails/recordings/testkey_20260527_063000.mp4_w320.png",
+      "480": "/thumbnails/recordings/testkey_20260527_063000.mp4_w480.png"
     }
   }
 ]
@@ -323,6 +324,7 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
   - **Seek indicator**: Floating `+N`/`−N` badge on seek via keyboard/touch.
   - **Settings menu**: Speed, A-B loop, live lag threshold, volume boost toggle, debug toggle — unified row layout.
 - **Thumbnail loading**: `ThumbnailImg.vue` handles the fact that thumbnails are generated asynchronously by ffmpeg:
+  - Uses `<picture>` with `<source type="image/jxl">`, `<source type="image/avif">`, and `<img>` PNG fallback for browser-side format negotiation.
   - Displays a loading spinner placeholder (gray background + animated spinner) while the image is not yet available.
   - If the image fails to load, auto-retries every 5 seconds up to 12 retries.
   - Uses `?_retry={tick}` cache-busting query parameter so the browser does not cache the 404 response.
@@ -361,7 +363,7 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
 
 1. **Recording**: `Fmp4Recorder` collects init + segments from the **default track only** (track_id == 0). Additional tracks are not recorded.
 2. **Finalize on stop**: `close()` concatenates all data into `{key}_{timestamp}.mp4`
-3. **Thumbnail**: ffmpeg generates `thumbnails/recordings/{filename}_w{size}.webp` thumbnails
+3. **Thumbnail**: ffmpeg generates `thumbnails/recordings/{filename}_w{size}.png` thumbnails (plus JXL and AVIF if available)
 4. **Index**: `write_index_json()` updates `recordings/index.json`
 
 ### Grace Period Flow
@@ -451,7 +453,7 @@ Host:1935 ───RTMP──────▶│  │              │  │  HLS/
 | `/api/`        | `http://backend:8080` | REST API proxy |
 | `/hls/`        | `http://backend:8080` | HLS segment proxy (no-cache) |
 | `/recordings/` | `/data/recordings/` (static alias) | MP4 recordings |
-| `/thumbnails/` | `/data/thumbnails/` (static alias) | WebP thumbnails |
+| `/thumbnails/` | `/data/thumbnails/` (static alias) | JXL/AVIF/PNG thumbnails |
 
 **Port mapping (Docker):**
 
@@ -469,8 +471,8 @@ Note: The backend's API port (8080) is **not** exposed to the host in Docker Com
 ├── hls/           # HLS segments & playlists (auto-cleaned)
 ├── recordings/    # MP4 files + index.json
 └── thumbnails/
-    ├── recordings/  # Recording WebP thumbnails
-    └── streams/     # Live stream WebP thumbnails
+    ├── recordings/  # Recording JXL/AVIF/PNG thumbnails
+    └── streams/     # Live stream JXL/AVIF/PNG thumbnails
 ```
 
 Both `backend` and `nginx` mount the same `./data` volume — `backend` writes to it (read-write), `nginx` reads from it (read-only).
@@ -533,8 +535,8 @@ nginx -s reload -c $(pwd)/nginx.local.conf
 Recorded content accumulates in `MEDIA_DIR/`:
 - `MEDIA_DIR/hls/{stream_key}/` — HLS segments and playlists (cleaned up after recording)
 - `MEDIA_DIR/recordings/` — MP4 files + `index.json`
-- `MEDIA_DIR/thumbnails/recordings/` — Recording WebP thumbnails
-- `MEDIA_DIR/thumbnails/streams/` — Live stream WebP thumbnails
+- `MEDIA_DIR/thumbnails/recordings/` — Recording JXL/AVIF/PNG thumbnails
+- `MEDIA_DIR/thumbnails/streams/` — Live stream JXL/AVIF/PNG thumbnails
 
 Implement a retention policy (e.g., cron job) to delete old recordings:
 ```bash
@@ -552,7 +554,7 @@ THUMBNAIL_SIZES=320,480,640,1280
 
 Control how often live stream thumbnails are regenerated via `THUMBNAIL_INTERVAL_SECONDS` (default 10s). Lower values increase thumbnail freshness but use more CPU.
 
-Existing `.jpg` thumbnails are **not** auto-migrated after the WebP switch. They will simply be ignored by the new code.
+Thumbnails are generated in three formats: **JPEG XL** (`.jxl`), **AVIF** (`.avif`), and **PNG** (`.png`). The frontend uses `<picture>` elements to let the browser pick the first supported format: JXL → AVIF → PNG. PNG is always generated (built-in ffmpeg encoder, no external libs needed). If ffmpeg lacks `libjxl` or `libaom-av1`, the corresponding format is silently skipped and the browser falls through to the next.
 
 ### 8.4 Monitoring
 

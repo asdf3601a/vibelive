@@ -1,18 +1,21 @@
 <template>
   <div class="group relative overflow-hidden rounded-xl bg-bg-base border border-border-default">
     <div class="w-full relative" :style="{ paddingBottom: aspectRatioPadding }">
-      <img
-        v-if="src && !error"
-        :key="retryKey"
-        :src="src"
-        alt="Stream thumbnail"
-        class="absolute inset-0 h-full w-full object-cover transition group-hover:scale-105"
-        loading="lazy"
-        @load="handleLoad"
-        @error="handleError"
-      />
+      <picture v-if="pngSrc && !error">
+        <source :srcset="jxlSrc" type="image/jxl">
+        <source :srcset="avifSrc" type="image/avif">
+        <img
+          :key="retryKey"
+          :src="pngSrc"
+          alt="Stream thumbnail"
+          class="absolute inset-0 h-full w-full object-cover transition group-hover:scale-105"
+          loading="lazy"
+          @load="handleLoad"
+          @error="handleError"
+        />
+      </picture>
       <!-- Loading / Placeholder state -->
-      <div v-if="!src || error || loading" class="absolute inset-0 flex items-center justify-center bg-bg-base">
+      <div v-if="!pngSrc || error || loading" class="absolute inset-0 flex items-center justify-center bg-bg-base">
         <div class="text-center px-4">
           <div class="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full bg-bg-elevated">
             <svg v-if="loading && src" class="h-5 w-5 text-text-muted animate-spin" fill="none" viewBox="0 0 24 24">
@@ -53,6 +56,10 @@ const error = ref(false)
 const retryCount = ref(0)
 const retryKey = ref(0)
 let retryTimer: ReturnType<typeof setInterval> | null = null
+
+const pngSrc = computed(() => props.src)
+const jxlSrc = computed(() => pngSrc.value?.replace(/\.png$/, '.jxl'))
+const avifSrc = computed(() => pngSrc.value?.replace(/\.png$/, '.avif'))
 
 const displayText = computed(() => {
   if (loading.value && props.src) return 'Generating preview...'

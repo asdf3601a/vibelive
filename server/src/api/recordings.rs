@@ -77,7 +77,7 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
             let mut thumbnails = HashMap::new();
             for width in &state.config.thumbnail_sizes {
-                let thumb_filename = format!("{}_w{}.webp", name, width);
+                let thumb_filename = format!("{}_w{}.png", name, width);
                 let thumb_path = PathBuf::from(&state.config.media_dir)
                     .join("thumbnails")
                     .join("recordings")
