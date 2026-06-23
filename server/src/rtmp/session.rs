@@ -968,9 +968,9 @@ fn amf_lookup<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
             if off >= body.len() { return None; }
             let _val_marker = body[off];
             if key == Some(name) {
-                // Return value payload (starting from marker byte to end of value)
-                let (_, vdata, _vlen) = amf_next_value(&body[off..])?;
-                return Some(vdata);
+                // Return value including its type marker
+                let (_, _, vlen) = amf_next_value(&body[off..])?;
+                return Some(&body[off..off + vlen]);
             }
             // Skip value
             let (_, _, vlen) = amf_next_value(&body[off..])?;
@@ -989,9 +989,11 @@ fn amf_lookup<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
             off += 2 + klen;
             if off >= body.len() { return None; }
             if key == Some(name) {
-                let (_, vdata, _vlen) = amf_next_value(&body[off..])?;
-                return Some(vdata);
+                // Return value including its type marker
+                let (_, _, vlen) = amf_next_value(&body[off..])?;
+                return Some(&body[off..off + vlen]);
             }
+            // Skip value
             let (_, _, vlen) = amf_next_value(&body[off..])?;
             off += vlen;
         }
@@ -1000,7 +1002,6 @@ fn amf_lookup<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
 }
 
 fn try_parse_amf_color_config(data: &[u8]) -> Option<crate::hls::fmp4::ColorConfig> {
-    // The remainder is: String("colorInfo") + Object/ECMA Array with fields
     let (first_marker, _, consumed) = amf_next_value(data)?;
     if first_marker != 0x02 { return None; }
     let obj = &data[consumed..];
@@ -1011,13 +1012,16 @@ fn try_parse_amf_color_config(data: &[u8]) -> Option<crate::hls::fmp4::ColorConf
         let v = amf_lookup(cc, name)?;
         amf_read_number(v).map(|r| r.0)
     };
+    // FFmpeg sends only matrixCoefficients; colorPrimaries and transferCharacteristics
+    // may be absent — make them optional.
     let cp = read_num_field("colorPrimaries")
         .or_else(|| read_num_field("ColorPrimaries"))
-        .or_else(|| read_num_field("color_primaries"))? as u16;
+        .or_else(|| read_num_field("color_primaries"))
+        .unwrap_or(0.0) as u16;
     let tc = read_num_field("transferCharacteristics")
         .or_else(|| read_num_field("TransferCharacteristics"))
         .or_else(|| read_num_field("transfer_characteristics"))
-        .or_else(|| read_num_field("transferCharacteristics"))? as u16;
+        .unwrap_or(0.0) as u16;
     let mc = read_num_field("matrixCoefficients")
         .or_else(|| read_num_field("MatrixCoefficients"))
         .or_else(|| read_num_field("matrix_coefficients"))? as u16;
@@ -1264,7 +1268,6 @@ async fn handle_video_data(
                     }
                 }
                 crate::rtmp::enhanced::VideoPacketType::Metadata => {
-                    let color_cfg = parse_enhanced_color_config(remainder);
                     if let Some(ref mut hls) = ctx.hls_state {
                         hls.set_video_color_config(parse_enhanced_color_config(remainder));
                         if let Some(hdr) = parse_enhanced_hdr_metadata(remainder) {
