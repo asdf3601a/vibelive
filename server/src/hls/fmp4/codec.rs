@@ -542,6 +542,10 @@ pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
 /// Scans for the sequence header OBU, parses it, and returns color info.
 /// Returns None if no color description is present.
 pub fn av1_color_config_from_config(config: &[u8]) -> Option<crate::hls::fmp4::ColorConfig> {
+    // Normalize OBU size fields first (same as av1c_box_from_config)
+    let config_with_sizes = crate::hls::fmp4::codec::ensure_av1_obu_size_fields(config);
+    let config = &config_with_sizes;
+
     let mut offset = 0;
     let mut seq_header_payload: Option<&[u8]> = None;
 
@@ -587,7 +591,7 @@ pub fn av1_color_config_from_config(config: &[u8]) -> Option<crate::hls::fmp4::C
     }
 
     let h = seq_header_payload.and_then(parse_av1_sequence_header)?;
-    // color_description_present_flag must have been set for color info to be meaningful
+    // Return color info if any field is meaningful (encoder may set only matrix_coefficients)
     if h.color_primaries == 0 && h.transfer_characteristics == 0 && h.matrix_coefficients == 0 {
         return None;
     }

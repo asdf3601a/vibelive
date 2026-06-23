@@ -558,7 +558,7 @@ run_color_test() {
                 result="WARN"
                 result_color="$YELLOW"
                 if [ "$hdr" = "hdr" ]; then
-                    details="Records correctly; test encoder does not send Enhanced RTMP Metadata (HDR colr/clli/mdcv support via Metadata packet is implemented)"
+                    details="Records correctly; test encoder sends Enhanced RTMP Metadata (colr/clli/mdcv via colorInfo AMF object)"
                 else
                     details="Records correctly; may not play in browser (expected)"
                 fi

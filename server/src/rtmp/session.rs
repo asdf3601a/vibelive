@@ -777,9 +777,19 @@ fn fps_to_rational(fps: f64) -> (u64, u64) {
 }
 
 /// Parse color config from Enhanced RTMP video metadata remainder.
-/// Format (after fourcc): color_primaries(u8) transfer_characteristics(u8)
-///     matrix_coefficients(u8) video_full_range_flag(u8)
+/// Supports two wire formats:
+///
+/// **Binary** (FFmpeg): after fourcc → color_primaries(u8)
+///   transfer_characteristics(u8) matrix_coefficients(u8) full_range(u8)
+///
+/// **AMF0** (OBS/veovera spec): after fourcc → AMF0 `colorInfo` object
+///   with nested `colorConfig` / `hdrCll` / `hdrMdcv` objects.
 fn parse_enhanced_color_config(data: &[u8]) -> crate::hls::fmp4::ColorConfig {
+    // Try AMF0 parsing first
+    if let Some(cfg) = try_parse_amf_color_config(data) {
+        return cfg;
+    }
+    // Fall back to binary (FFmpeg) format
     let cp = data.first().copied().unwrap_or(1) as u16;
     let tc = data.get(1).copied().unwrap_or(1) as u16;
     let mc = data.get(2).copied().unwrap_or(1) as u16;
@@ -792,61 +802,277 @@ fn parse_enhanced_color_config(data: &[u8]) -> crate::hls::fmp4::ColorConfig {
     }
 }
 
-/// Parse optional HDR metadata from Enhanced RTMP video metadata remainder.
-/// Present when data has >= 8 bytes after the 4-byte color config,
-/// with a u32 size prefix followed by CLLI (4 bytes) + MDCV (24 bytes).
-fn parse_enhanced_hdr_metadata(data: &[u8]) -> Option<crate::hls::fmp4::HdrMetadata> {
-    // Need at least 4 bytes of color config + 4 bytes size prefix + 28 bytes HDR data
-    if data.len() < 36 {
-        return None;
+/// Try to parse HDR metadata from Enhanced RTMP video metadata remainder.
+pub fn parse_enhanced_hdr_metadata(data: &[u8]) -> Option<crate::hls::fmp4::HdrMetadata> {
+    // Try AMF0 first
+    if let Some(hdr) = try_parse_amf_hdr_metadata(data) {
+        return Some(hdr);
     }
-    let hdr_offset = 4;
-    let hdr_data = &data[hdr_offset..];
-
-    // Size prefix is u32 big-endian
-    if hdr_data.len() < 4 {
-        return None;
-    }
+    // Fall back to binary format: u32 size prefix + CLLI(4) + MDCV(24)
+    if data.len() < 36 { return None; }
+    let hdr_data = &data[4..];
+    if hdr_data.len() < 4 { return None; }
     let hdr_len = u32::from_be_bytes([hdr_data[0], hdr_data[1], hdr_data[2], hdr_data[3]]) as usize;
     let payload = hdr_data.get(4..)?;
-
-    // Minimum HDR payload: CLLI(4) + MDCV(24) = 28 bytes
-    if hdr_len < 28 || payload.len() < hdr_len.min(28) {
-        return None;
-    }
+    if hdr_len < 28 || payload.len() < hdr_len.min(28) { return None; }
     let p = payload;
-
     let maxcll = u16::from_be_bytes([p[0], p[1]]) as u32;
     let maxfall = u16::from_be_bytes([p[2], p[3]]) as u32;
-
-    // MDCV: 3 display primaries (x,y each u16) + white point (x,y u16) + max/min luminance (u32 each)
-    // Total: 3*2*2 + 2*2 + 4 + 4 = 12 + 4 + 4 + 4 = 24
     let mdcv_data = &p[4..];
-    if mdcv_data.len() < 24 {
-        return None;
+    if mdcv_data.len() < 24 { return None; }
+    Some(crate::hls::fmp4::HdrMetadata {
+        max_content_light_level: maxcll,
+        max_frame_average_light_level: maxfall,
+        display_primaries_x: [
+            u16::from_be_bytes([mdcv_data[0], mdcv_data[1]]),
+            u16::from_be_bytes([mdcv_data[2], mdcv_data[3]]),
+            u16::from_be_bytes([mdcv_data[4], mdcv_data[5]]),
+        ],
+        display_primaries_y: [
+            u16::from_be_bytes([mdcv_data[6], mdcv_data[7]]),
+            u16::from_be_bytes([mdcv_data[8], mdcv_data[9]]),
+            u16::from_be_bytes([mdcv_data[10], mdcv_data[11]]),
+        ],
+        white_point_x: u16::from_be_bytes([mdcv_data[12], mdcv_data[13]]),
+        white_point_y: u16::from_be_bytes([mdcv_data[14], mdcv_data[15]]),
+        max_luminance: u32::from_be_bytes([mdcv_data[16], mdcv_data[17], mdcv_data[18], mdcv_data[19]]),
+        min_luminance: u32::from_be_bytes([mdcv_data[20], mdcv_data[21], mdcv_data[22], mdcv_data[23]]),
+    })
+}
+
+// ── AMF0 helpers for Enhanced RTMP colorInfo ──────────────────────
+
+/// Minimal AMF0 number reader: returns Some(value, bytes_consumed).
+fn amf_read_number(data: &[u8]) -> Option<(f64, usize)> {
+    if data.len() < 9 || data[0] != 0x00 { return None; }
+    let bits = u64::from_be_bytes(data[1..9].try_into().ok()?);
+    Some((f64::from_bits(bits), 9))
+}
+
+/// AMF0 ECMA Array reader: returns fields as (key, value_bytes).
+/// ECMA Array marker (0x08) + u32 count + key-value pairs + 0x000009 terminator.
+fn amf_next_value<'a>(data: &'a [u8]) -> Option<(u8, &'a [u8], usize)> {
+    if data.is_empty() { return None; }
+    let marker = data[0];
+    let _consumed = 1;
+    match marker {
+        0x00 => { // Number
+            let (_, n) = amf_read_number(data)?;
+            Some((marker, &data[1..9], n))
+        }
+        0x01 => { // Boolean
+            Some((marker, &data[1..2], 2))
+        }
+        0x02 => { // String
+            if data.len() < 3 { return None; }
+            let len = u16::from_be_bytes([data[1], data[2]]) as usize;
+            if data.len() < 3 + len { return None; }
+            Some((marker, &data[3..3+len], 3 + len))
+        }
+        0x05 | 0x06 => { // Null / Undefined
+            Some((marker, &[], 1))
+        }
+        0x08 => { // ECMA Array
+            if data.len() < 5 { return None; }
+            let _count = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+            // Consume key-value pairs until empty string + 0x09 terminator
+            let mut off = 5;
+            loop {
+                if off + 3 > data.len() { return None; }
+                let klen = u16::from_be_bytes([data[off], data[off+1]]) as usize;
+                if klen == 0 && off + 2 < data.len() && data[off+2] == 0x09 {
+                    off += 3; break; // 0x0009 terminator
+                }
+                if off + 2 + klen >= data.len() { return None; }
+                off += 2 + klen;
+                // value
+                let val_marker = data[off];
+                if val_marker == 0x00 { off += 9; }
+                else if val_marker == 0x01 { off += 2; }
+                else if val_marker == 0x02 { let slen = u16::from_be_bytes([data[off+1], data[off+2]]) as usize; off += 3 + slen; }
+                else if val_marker == 0x03 || val_marker == 0x08 { off = skip_amf_object(data, off)?; }
+                else if val_marker == 0x0A { off = skip_amf_strict_array(data, off)?; }
+                else if val_marker == 0x05 || val_marker == 0x06 { off += 1; }
+                else { return None; }
+            }
+            Some((marker, &data[5..off], off))
+        }
+        0x03 => { // Object
+            let mut off = 1;
+            off = skip_amf_object(data, off)?;
+            Some((marker, &data[1..off], off))
+        }
+        0x0A => { // Strict Array
+            if data.len() < 5 { return None; }
+            let _count = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+            let mut off = 5;
+            let mut remaining = _count as usize;
+            while remaining > 0 && off < data.len() {
+                let (_, _, n) = amf_next_value(&data[off..])?;
+                off += n;
+                remaining -= 1;
+            }
+            Some((marker, &data[5..off], off))
+        }
+        _ => None,
     }
+}
 
-    let read_u16 = |d: &[u8], i: usize| -> u16 {
-        u16::from_be_bytes([d[i], d[i + 1]])
+/// Skip past an AMF0 Object (0x03): key-value pairs terminated by 0x0009.
+fn skip_amf_object(data: &[u8], start: usize) -> Option<usize> {
+    let mut off = start;
+    loop {
+        if off + 3 > data.len() { return None; }
+        let klen = u16::from_be_bytes([data[off], data[off+1]]) as usize;
+        if klen == 0 && off + 2 < data.len() && data[off+2] == 0x09 {
+            off += 3; break;
+        }
+        if off + 2 + klen >= data.len() { return None; }
+        off += 2 + klen;
+        let (_, _, n) = amf_next_value(&data[off..])?;
+        off += n;
+    }
+    Some(off)
+}
+
+/// Skip past an AMF0 Strict Array (0x0A).
+fn skip_amf_strict_array(data: &[u8], start: usize) -> Option<usize> {
+    if start + 4 >= data.len() { return None; }
+    let count = u32::from_be_bytes([data[start], data[start+1], data[start+2], data[start+3]]) as usize;
+    let mut off = start + 4;
+    for _ in 0..count {
+        if off >= data.len() { return None; }
+        let (_, _, n) = amf_next_value(&data[off..])?;
+        off += n;
+    }
+    Some(off)
+}
+
+/// Look up a field by name inside an AMF0 ECMA Array or Object at the given offset.
+fn amf_lookup<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let (_, _, total) = amf_next_value(data)?;
+    let marker = data[0];
+    let body = &data[1..total]; // skip the marker byte
+    if marker != 0x03 && marker != 0x08 { return None; }
+    if marker == 0x08 {
+        // ECMA Array: skip 4-byte count at start of body
+        if body.len() < 4 { return None; }
+        let mut off = 4;
+        loop {
+            if off + 2 > body.len() { return None; }
+            let klen = u16::from_be_bytes([body[off], body[off+1]]) as usize;
+            if klen == 0 && off + 2 < body.len() && body[off+2] == 0x09 { break; }
+            if off + 2 + klen > body.len() { return None; }
+            let key = std::str::from_utf8(&body[off+2..off+2+klen]).ok();
+            off += 2 + klen;
+            if off >= body.len() { return None; }
+            let _val_marker = body[off];
+            if key == Some(name) {
+                // Return value payload (starting from marker byte to end of value)
+                let (_, vdata, _vlen) = amf_next_value(&body[off..])?;
+                return Some(vdata);
+            }
+            // Skip value
+            let (_, _, vlen) = amf_next_value(&body[off..])?;
+            off += vlen;
+        }
+        None
+    } else {
+        // Object: no count prefix
+        let mut off = 0;
+        loop {
+            if off + 2 > body.len() { return None; }
+            let klen = u16::from_be_bytes([body[off], body[off+1]]) as usize;
+            if klen == 0 && off + 2 < body.len() && body[off+2] == 0x09 { break; }
+            if off + 2 + klen > body.len() { return None; }
+            let key = std::str::from_utf8(&body[off+2..off+2+klen]).ok();
+            off += 2 + klen;
+            if off >= body.len() { return None; }
+            if key == Some(name) {
+                let (_, vdata, _vlen) = amf_next_value(&body[off..])?;
+                return Some(vdata);
+            }
+            let (_, _, vlen) = amf_next_value(&body[off..])?;
+            off += vlen;
+        }
+        None
+    }
+}
+
+fn try_parse_amf_color_config(data: &[u8]) -> Option<crate::hls::fmp4::ColorConfig> {
+    // The remainder is: String("colorInfo") + Object/ECMA Array with fields
+    let (first_marker, _, consumed) = amf_next_value(data)?;
+    if first_marker != 0x02 { return None; }
+    let obj = &data[consumed..];
+    let (omarker, _, _) = amf_next_value(obj)?;
+    if omarker != 0x03 && omarker != 0x08 { return None; }
+    let cc = amf_lookup(obj, "colorConfig")?;
+    let read_num_field = |name: &str| -> Option<f64> {
+        let v = amf_lookup(cc, name)?;
+        amf_read_number(v).map(|r| r.0)
     };
-    let read_u32 = |d: &[u8], i: usize| -> u32 {
-        u32::from_be_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]])
+    let cp = read_num_field("colorPrimaries")
+        .or_else(|| read_num_field("ColorPrimaries"))
+        .or_else(|| read_num_field("color_primaries"))? as u16;
+    let tc = read_num_field("transferCharacteristics")
+        .or_else(|| read_num_field("TransferCharacteristics"))
+        .or_else(|| read_num_field("transfer_characteristics"))
+        .or_else(|| read_num_field("transferCharacteristics"))? as u16;
+    let mc = read_num_field("matrixCoefficients")
+        .or_else(|| read_num_field("MatrixCoefficients"))
+        .or_else(|| read_num_field("matrix_coefficients"))? as u16;
+    let fr = read_num_field("fullRange")
+        .or_else(|| read_num_field("FullRange"))
+        .or_else(|| read_num_field("full_range"))
+        .unwrap_or(0.0) as u8 != 0;
+    Some(crate::hls::fmp4::ColorConfig {
+        color_primaries: cp,
+        transfer_characteristics: tc,
+        matrix_coefficients: mc,
+        full_range: fr,
+    })
+}
+
+fn try_parse_amf_hdr_metadata(data: &[u8]) -> Option<crate::hls::fmp4::HdrMetadata> {
+    let (first_marker, _, consumed) = amf_next_value(data)?;
+    if first_marker != 0x02 { return None; }
+    let obj = &data[consumed..];
+    let cll = amf_lookup(obj, "hdrCll")?;
+    let mdcv = amf_lookup(obj, "hdrMdcv")?;
+
+    let read_num = |obj: &[u8], name: &str| -> Option<f64> {
+        let v = amf_lookup(obj, name)?;
+        amf_read_number(v).map(|r| r.0)
+    };
+    // hdrCll: maxCll, maxFall
+    let maxcll = read_num(cll, "maxCll")? as u32;
+    let maxfall = read_num(cll, "maxFall")? as u32;
+
+    // hdrMdcv: displayPrimariesX[3], displayPrimariesY[3], whitePointX, whitePointY, maxLuminance, minLuminance
+    // Fields are AMF0 Number scalars (or Arrays in some implementations — handle both)
+    let read_primaries = |obj: &[u8], name: &str| -> Option<[u16; 3]> {
+        let v = amf_lookup(obj, name)?;
+        // Could be Strict Array (0x0A) of 3 numbers, or comma-separated string, or just 3 separate fields
+        if v.len() > 0 && v[0] == 0x0A {
+            // Strict Array: 0x0A + u32 count + 3 Numbers
+            let mut arr = [0u16; 3];
+            arr[0] = amf_read_number(&v[5..]).map(|r| r.0 as u16)?;
+            arr[1] = amf_read_number(&v[14..]).map(|r| r.0 as u16)?;
+            arr[2] = amf_read_number(&v[23..]).map(|r| r.0 as u16)?;
+            Some(arr)
+        } else {
+            // Separate fields
+            let a = read_num(obj, &format!("{}", name))? as u16;
+            Some([a, 0, 0])
+        }
     };
 
-    let display_primaries_x = [
-        read_u16(mdcv_data, 0),
-        read_u16(mdcv_data, 2),
-        read_u16(mdcv_data, 4),
-    ];
-    let display_primaries_y = [
-        read_u16(mdcv_data, 6),
-        read_u16(mdcv_data, 8),
-        read_u16(mdcv_data, 10),
-    ];
-    let white_point_x = read_u16(mdcv_data, 12);
-    let white_point_y = read_u16(mdcv_data, 14);
-    let max_luminance = read_u32(mdcv_data, 16);
-    let min_luminance = read_u32(mdcv_data, 20);
+    let display_primaries_x = read_primaries(mdcv, "displayPrimariesX")?;
+    let display_primaries_y = read_primaries(mdcv, "displayPrimariesY")?;
+    let white_point_x = read_num(mdcv, "whitePointX")? as u16;
+    let white_point_y = read_num(mdcv, "whitePointY")? as u16;
+    let max_luminance = read_num(mdcv, "maxLuminance")? as u32;
+    let min_luminance = read_num(mdcv, "minLuminance")? as u32;
 
     Some(crate::hls::fmp4::HdrMetadata {
         max_content_light_level: maxcll,
@@ -1038,6 +1264,7 @@ async fn handle_video_data(
                     }
                 }
                 crate::rtmp::enhanced::VideoPacketType::Metadata => {
+                    let color_cfg = parse_enhanced_color_config(remainder);
                     if let Some(ref mut hls) = ctx.hls_state {
                         hls.set_video_color_config(parse_enhanced_color_config(remainder));
                         if let Some(hdr) = parse_enhanced_hdr_metadata(remainder) {
