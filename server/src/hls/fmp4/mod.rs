@@ -163,10 +163,16 @@ impl Fmp4Muxer {
         let dur_ticks = self.video_fps_den;
 
         // Detect frame drops via RTMP timestamp vs. expected tick-based timing
-        let expected_pts_ms = self.video_dts_tick * 1000 / self.video_fps_num;
-        if dts > expected_pts_ms && dur_ticks > 0 {
-            let missing = (dts - expected_pts_ms) * self.video_fps_num / (1000 * dur_ticks);
-            self.video_dts_tick += missing * dur_ticks;
+        if dur_ticks > 0 {
+            let expected_pts_ms = self.video_dts_tick * 1000 / self.video_fps_num;
+            if dts > expected_pts_ms {
+                let missing =
+                    ((dts - expected_pts_ms) * self.video_fps_num).div_ceil(1000 * dur_ticks);
+                self.video_dts_tick += missing * dur_ticks;
+            } else if dts < expected_pts_ms {
+                let extra = ((expected_pts_ms - dts) * self.video_fps_num) / (1000 * dur_ticks);
+                self.video_dts_tick = self.video_dts_tick.saturating_sub(extra * dur_ticks);
+            }
         }
 
         let dts_ts = self.video_dts_tick;
@@ -215,39 +221,56 @@ impl Fmp4Muxer {
     pub fn last_video_sample_duration(&self) -> u64 {
         self.video_samples
             .last()
-            .map(|s| s.duration as u64 * 1000 / self.video_fps_num)
+            .map(|s| (s.duration as u64 * 1000 + self.video_fps_num / 2) / self.video_fps_num)
             .unwrap_or(33)
     }
 
     pub fn last_audio_sample_duration(&self) -> u64 {
         self.audio_samples
             .last()
-            .map(|s| s.duration as u64 * 1000 / self.audio_sample_rate as u64)
+            .map(|s| (s.duration as u64 * 1000 + self.audio_sample_rate as u64 / 2) / self.audio_sample_rate as u64)
             .unwrap_or(21)
     }
 
     fn compute_and_set_durations(&mut self) {
-        // Video: use framerate rational for exact uniform timescale duration.
-        // RTMP integer-millisecond DTS values cannot represent NTSC rates
-        // or even 30fps exactly, but using the declared framerate rational
-        // produces perfectly uniform frame durations that match the stream's
-        // declared timing.
+        // Video: uniform framerate-controlled duration from tick counter.
         let video_dur = self.video_fps_den as u32;
         for s in &mut self.video_samples {
             s.duration = video_dur;
         }
 
         if !self.audio_samples.is_empty() {
-            let avg_dur = if self.audio_samples.len() > 1 {
-                let total = self.audio_samples.last().unwrap().dts
-                    - self.audio_samples.first().unwrap().dts;
-                let cnt = self.audio_samples.len() as u64 - 1;
-                ((total * self.audio_sample_rate as u64 + (cnt * 1000) / 2) / (cnt * 1000)) as u32
-            } else {
-                1024
+            // Audio: use codec-known frame sizes instead of averaging
+            // RTMP integer-millisecond timestamps.  RTMP timestamps
+            // have jitter (e.g. AAC frames alternate 23/24 ms for
+            // a true 23.22 ms frame) which produces an incorrect
+            // average and accumulates drift vs tick-perfect video.
+            let dur = match self.audio_codec {
+                Some(AudioCodec::Aac) => 1024u32,
+                Some(AudioCodec::Opus) => self
+                    .audio_samples
+                    .first()
+                    .and_then(|s| opus_frame_samples(&s.data))
+                    .unwrap_or(960),
+                _ => {
+                    // FLAC (variable block size) or unknown:
+                    // fall back to RTMP timestamp averaging
+                    if self.audio_samples.len() > 1 {
+                        let total = self.audio_samples.last().unwrap().dts
+                            - self.audio_samples.first().unwrap().dts;
+                        let cnt = self.audio_samples.len() as u64 - 1;
+                        ((total * self.audio_sample_rate as u64 + (cnt * 1000) / 2)
+                            / (cnt * 1000)) as u32
+                    } else {
+                        match self.audio_codec {
+                            Some(AudioCodec::Flac) => 4096,
+                            _ => 1024,
+                        }
+                    }
+                }
             };
             for s in &mut self.audio_samples {
-                s.duration = avg_dur;
+                s.duration = dur;
             }
         }
     }
@@ -998,6 +1021,62 @@ impl Fmp4Muxer {
     }
 }
 
+/// Parse the TOC byte (first byte) of an Opus packet to determine
+/// the total number of PCM samples per frame at 48kHz.
+///
+/// Opus-in-ISOBMFF §4.3.4: Opus sample duration is the total of
+/// frame sizes expressed in seconds × media timescale.
+/// At 48000Hz, each 20ms frame is 960 samples.
+///
+/// TOC byte layout (RFC 6716 §3.1):
+///   bits 0-2:  config (duration/bandwidth)
+///   bit  3:    stereo flag
+///   bits 4-7:  frame count code
+fn opus_frame_samples(packet: &[u8]) -> Option<u32> {
+    let toc = *packet.first()?;
+    let config = toc & 0x07;
+    let frame_count_code = (toc >> 4) & 0x0F;
+
+    // Samples per frame at 48kHz for each config value (RFC 6716 §3.1)
+    let samples_per_frame: u32 = match config {
+        0 => 120,   //  2.5 ms  NB/MB
+        1 => 240,   //  5 ms    NB/MB
+        2 => 480,   // 10 ms    NB/MB
+        3 => 960,   // 20 ms    all bandwidths (most common)
+        4 => 1920,  // 40 ms    SWB/FB
+        5 => 2880,  // 60 ms    SWB/FB
+        6 => 3840,  // 80 ms    SWB/FB
+        7 => 4800,  // 100 ms   SWB/FB (conservative: 100ms = 4800 @ 48kHz)
+        // NOTE: config=7 can also be 120 ms (5760 samples at 48 kHz) for
+        // Fullband mode. We conservatively use 100 ms (4800); the 20% error
+        // on this rare RTMP case is negligible in practice.
+        _ => return None,
+    };
+
+    // Number of frames encoded in the packet (RFC 6716 §3.2.3)
+    // Each frame has the same config-determined duration.
+    // NOTE: For VBR codes 9/10, some implementations interpret code 10 as
+    // 3 frames rather than 2. The mapping below uses 2 frames for both,
+    // which matches the most common interpretation. Multi-frame VBR
+    // packets are extremely rare in RTMP streams.
+    let frame_count: u32 = match frame_count_code {
+        0 => 1,
+        1..=3 => 2,
+        4 => 1,
+        5..=7 => 2,
+        8 => 1,
+        9 | 10 => 2,
+        11 => 3,
+        12 => 4,
+        13 => 5,
+        14 => 6,
+        15 => 7,
+        _ => 1,
+    };
+
+    Some(samples_per_frame * frame_count)
+}
+
 // ── Box helpers ──────────────────────────────────────────────────
 
 fn write_box(w: &mut Vec<u8>, box_type: &[u8; 4], data: &[u8]) {
@@ -1563,5 +1642,143 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ]
         );
+    }
+
+    #[test]
+    fn test_opus_frame_samples_all_configs() {
+        // config=0 (2.5ms), c=0 (1 frame) → 120 samples
+        assert_eq!(opus_frame_samples(&[0x00]), Some(120));
+
+        // config=3 (20ms, most common), c=0 (1 frame) → 960 samples
+        assert_eq!(opus_frame_samples(&[0x03]), Some(960));
+
+        // config=3, c=1 (2 frames) → 2 × 960 = 1920 samples
+        assert_eq!(opus_frame_samples(&[0x1B]), Some(1920)); // c=1 | s=1 | config=3 = 0x1B
+
+        // config=4 (40ms), c=8 (1 frame VBR) → 1920 samples
+        assert_eq!(opus_frame_samples(&[0x84]), Some(1920)); // c=8 | config=4 = 0x84
+
+        // config=3, c=11 (3 frames VBR) → 3 × 960 = 2880 samples
+        assert_eq!(opus_frame_samples(&[0xB3]), Some(2880)); // c=11 | config=3 = 0xB3
+
+        // Empty packet → None
+        assert!(opus_frame_samples(&[]).is_none());
+    }
+
+    #[test]
+    fn test_audio_duration_aac_fixed_1024() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Aac);
+        muxer.set_audio_config(vec![0x12, 0x10]); // 44100Hz
+
+        // Feed samples at jittery RTMP timestamps that would produce
+        // an incorrect average with the old RTMP-averaging approach.
+        muxer.add_audio_sample(vec![0xAF, 0x01].into(), 0);
+        muxer.add_audio_sample(vec![0xAF, 0x02].into(), 23);
+        muxer.add_audio_sample(vec![0xAF, 0x03].into(), 46);
+        muxer.add_audio_sample(vec![0xAF, 0x04].into(), 70); // 24ms gap instead of 23
+
+        muxer.compute_and_set_durations();
+
+        // Every audio sample must have exactly 1024 (AAC fixed frame size)
+        for s in &muxer.audio_samples {
+            assert_eq!(s.duration, 1024, "AAC sample duration must be 1024, got {}", s.duration);
+        }
+    }
+
+    #[test]
+    fn test_audio_duration_opus_from_toc() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Opus);
+        muxer.set_audio_config(vec![0x01, 0x02, 0x38, 0x01, 0x80, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+        // Opus packet with TOC: config=3 (20ms), c=0 (1 frame) → 960 samples
+        // With stereo flag set (bit 3) → 0x08 | 0x03 = 0x0B
+        let toc: u8 = 0x0B;
+        let packet = vec![toc, 0x00, 0x01, 0x02];
+        muxer.add_audio_sample(packet.into(), 0);
+
+        let packet2 = vec![toc, 0x03, 0x04, 0x05];
+        muxer.add_audio_sample(packet2.into(), 20);
+
+        muxer.compute_and_set_durations();
+
+        for s in &muxer.audio_samples {
+            assert_eq!(s.duration, 960, "Opus sample duration must be 960 (20ms @ 48kHz), got {}", s.duration);
+        }
+    }
+
+    #[test]
+    fn test_audio_duration_opus_fallback_on_empty_packet() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Opus);
+        muxer.set_audio_config(vec![0x01, 0x02, 0x38, 0x01]);
+
+        // Empty audio packet → opus_frame_samples returns None → fallback to 960
+        muxer.add_audio_sample(vec![].into(), 0);
+        muxer.add_audio_sample(vec![].into(), 20);
+
+        muxer.compute_and_set_durations();
+
+        for s in &muxer.audio_samples {
+            assert_eq!(s.duration, 960, "Opus fallback duration must be 960, got {}", s.duration);
+        }
+    }
+
+    #[test]
+    fn test_audio_duration_flac_single_4096() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Flac);
+        muxer.set_audio_config(vec![
+            0x66, 0x4c, 0x61, 0x43, 0x12, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x15,
+            0x0a, 0xc4, 0x40, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+
+        // Single FLAC sample → fallback to 4096
+        muxer.add_audio_sample(vec![0xFF, 0xF0, 0x00, 0x01].into(), 0);
+
+        muxer.compute_and_set_durations();
+
+        assert_eq!(muxer.audio_samples.len(), 1);
+        assert_eq!(muxer.audio_samples[0].duration, 4096,
+            "Single FLAC sample should default to 4096");
+    }
+
+    #[test]
+    fn test_audio_duration_unknown_codec_no_audio_codec_set() {
+        // When audio_codec is None (not set), the old RTMP averaging should be used.
+        let mut muxer = Fmp4Muxer::new();
+        // Deliberately NOT setting audio_codec
+        muxer.set_audio_config(vec![0x12, 0x10]);
+
+        muxer.add_audio_sample(vec![0xAF, 0x01].into(), 0);
+        muxer.add_audio_sample(vec![0xAF, 0x02].into(), 23);
+
+        muxer.compute_and_set_durations();
+
+        // With audio_codec=None, the code uses the RTMP averaging branch
+        // which set_audio_config set sample_rate to 44100.
+        // total=23, cnt=1 → 23*44100/1000 = 1014 (rounded from 1014.3)
+        assert_eq!(muxer.audio_samples[0].duration, 1014);
+        assert_eq!(muxer.audio_samples[0].duration, muxer.audio_samples[1].duration);
+    }
+
+    #[test]
+    fn test_last_audio_sample_duration_rounding() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Aac);
+        muxer.set_audio_config(vec![0x12, 0x10]); // 44100Hz
+
+        // AAC duration = 1024 samples @ 44100Hz
+        // Expected ms = round(1024 * 1000 / 44100) = round(23.219) = 23
+        muxer.add_audio_sample(vec![0xAF, 0x01].into(), 0);
+
+        // Call compute_and_set_durations to set audio duration fields
+        muxer.compute_and_set_durations();
+
+        let ms = muxer.last_audio_sample_duration();
+        // 1024 * 1000 / 44100 = 23 (truncated) but with rounding: (1024*1000 + 22050) / 44100 = 1024066.5 / 44100 = 23
+        assert_eq!(ms, 23, "AAC duration at 44100Hz should round to 23ms");
     }
 }

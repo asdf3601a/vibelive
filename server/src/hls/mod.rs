@@ -282,7 +282,7 @@ impl HlsStreamState {
         let pts = (dts as i64 + composition_time_offset as i64) as u64;
         self.fmp4_muxer
             .add_video_sample(sample_data, dts, pts, is_keyframe);
-        self.last_video_pts = pts;
+        self.last_video_pts = self.last_video_pts.max(pts);
 
         // Update codec string cache when available
         if self.codec_string.is_none() {
