@@ -39,16 +39,17 @@
           {{ relativeTime }}
         </span>
 
-        <router-link
+        <BaseButton
           v-if="stream.hls_url"
           :to="`/live/${stream.stream_key}`"
-          class="inline-flex shrink-0 items-center gap-1 rounded-lg bg-accent-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-accent-primary/90 transition"
+          variant="primary"
+          class="!text-xs"
         >
           <svg class="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24">
             <path d="M8 5v14l11-7z" />
           </svg>
           Watch
-        </router-link>
+        </BaseButton>
       </div>
     </div>
   </BaseCard>
@@ -60,6 +61,7 @@ import type { Stream } from '@/types'
 import BaseCard from '@/components/ui/BaseCard.vue'
 import BaseBadge from '@/components/ui/BaseBadge.vue'
 import BaseTag from '@/components/ui/BaseTag.vue'
+import BaseButton from '@/components/ui/BaseButton.vue'
 import ThumbnailImg from '@/components/ThumbnailImg.vue'
 import { useRelativeTime } from '@/composables/useRelativeTime'
 import { formatDateTime } from '@/utils/format'

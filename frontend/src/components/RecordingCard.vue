@@ -22,7 +22,7 @@
           <path d="M8 5v14l11-7z" />
         </svg>
       </div>
-      <div v-if="recording.duration_seconds" class="absolute bottom-1 right-1 bg-black/70 text-white text-[10px] px-1 rounded">
+      <div v-if="recording.duration_seconds" class="absolute bottom-1 right-1 bg-black/70 text-white text-[10px] px-1 rounded-md">
         {{ formatDuration(recording.duration_seconds) }}
       </div>
     </div>
@@ -43,15 +43,16 @@
 
     <!-- Actions -->
     <div class="flex items-center gap-2 shrink-0">
-      <button
-        class="inline-flex items-center gap-1 rounded-lg bg-accent-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-accent-primary/90 transition"
+      <BaseButton
+        variant="primary"
+        class="!text-xs"
         @click="$emit('play', recording)"
       >
         <svg class="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24">
           <path d="M8 5v14l11-7z" />
         </svg>
         Play
-      </button>
+      </BaseButton>
       <button
         class="hidden sm:inline-flex items-center gap-1 rounded-lg bg-bg-elevated px-2.5 py-1.5 text-xs font-medium border border-border-default transition shrink-0"
         :class="shareCopied
@@ -85,7 +86,7 @@ import { computed, ref } from 'vue'
 import type { Recording } from '@/types'
 import { formatDateTime, formatDuration, formatFileSize } from '@/utils/format'
 import { copyToClipboard } from '@/utils/clipboard'
-
+import BaseButton from '@/components/ui/BaseButton.vue'
 interface Props {
   recording: Recording
 }

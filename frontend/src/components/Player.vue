@@ -1,9 +1,9 @@
 <template>
   <div
     ref="containerRef"
-    class="relative w-full rounded-xl bg-black border border-border-default select-none"
-    :class="{ 'cursor-none': !controlsVisible && isPlaying }"
-    style="aspect-ratio: 16 / 9;"
+    class="relative w-full bg-black select-none overflow-hidden"
+    :class="[isFullscreen ? '' : 'rounded-xl border border-border-default', { 'cursor-none': !controlsVisible && isPlaying }]"
+    :style="isFullscreen ? {} : { aspectRatio: '16 / 9' }"
     @mouseenter="onMouseMove"
     @mousemove="onMouseMove"
     @mouseleave="hideControls"
@@ -414,6 +414,12 @@ watch([loopA, loopB, loopEnabled], () => {
   })
 })
 
+const isFullscreen = ref(false)
+
+function onFullscreenChange() {
+  isFullscreen.value = !!document.fullscreenElement
+}
+
 const SPEED_STEPS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4, 8, 16]
 
 function getSpeedIndex(rate: number): number {
@@ -446,6 +452,8 @@ onMounted(() => {
   }
   containerRef.value?.focus()
 
+  document.addEventListener('fullscreenchange', onFullscreenChange)
+
   // First user interaction → proactively request autoplay permission
   function onInteraction() {
     requestAutoplayPermission()
@@ -454,6 +462,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
   destroy()
 })
 </script>

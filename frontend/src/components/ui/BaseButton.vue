@@ -1,12 +1,14 @@
 <template>
-  <button
+  <component
+    :is="to ? 'router-link' : 'button'"
+    :to="to"
     class="inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-primary focus-visible:ring-offset-2 focus-visible:ring-offset-bg-base disabled:opacity-50 disabled:cursor-not-allowed"
     :class="variantClasses[variant]"
-    :disabled="disabled"
+    :disabled="to ? undefined : disabled"
     @click="$emit('click', $event)"
   >
     <slot />
-  </button>
+  </component>
 </template>
 
 <script setup lang="ts">
@@ -15,10 +17,12 @@ type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger'
 interface Props {
   variant?: ButtonVariant
   disabled?: boolean
+  to?: string
 }
 
 withDefaults(defineProps<Props>(), {
   variant: 'primary',
+  disabled: false,
 })
 
 defineEmits<{

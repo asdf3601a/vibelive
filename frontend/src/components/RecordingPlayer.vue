@@ -4,7 +4,7 @@
       class="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
       @click.self="$emit('close')"
     >
-      <div class="w-full max-w-5xl rounded-xl border border-border-default bg-bg-surface shadow-2xl">
+      <div class="w-full max-w-5xl bg-bg-surface shadow-2xl" :class="isFullscreen ? '' : 'rounded-xl border border-border-default'">
         <!-- Header -->
         <div class="flex items-center justify-between px-4 py-3">
           <div class="flex items-center gap-2 min-w-0">
@@ -94,7 +94,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import type { Recording } from '@/types'
 import { formatDateTime, formatDuration } from '@/utils/format'
 import { copyToClipboard } from '@/utils/clipboard'
@@ -119,6 +119,20 @@ defineEmits<{
 
 const copiedStatus = ref(false)
 const includeLoopInLink = ref(false)
+
+const isFullscreen = ref(false)
+
+function onFullscreenChange() {
+  isFullscreen.value = !!document.fullscreenElement
+}
+
+onMounted(() => {
+  document.addEventListener('fullscreenchange', onFullscreenChange)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
+})
 
 // Current loop state from Player (live, not just initial)
 const currentLoopA = ref<number | null>(props.initialLoopA)

@@ -32,6 +32,8 @@
       </div>
     </div>
 
+  <!-- Stream grid -->
+
     <!-- Error state -->
     <BaseErrorState
       v-else-if="error"
@@ -41,7 +43,7 @@
     />
 
     <!-- Stream setup info -->
-    <div class="mb-6 rounded-xl border border-border-default bg-bg-surface/60 p-4">
+    <BaseCard padding :hoverable="false" class="mb-6">
       <div class="flex items-center justify-between cursor-pointer" @click="showSetup = !showSetup">
         <div class="flex items-center gap-2">
           <svg class="h-4 w-4 text-accent-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -72,9 +74,7 @@
           <BaseCodeBlock :text="exampleFfmpegMultitrack" :multiline="true" />
         </div>
       </div>
-    </div>
-
-    <!-- Stream grid -->
+    </BaseCard>
     <TransitionGroup
       v-if="displayedData?.length"
       name="stream-list"

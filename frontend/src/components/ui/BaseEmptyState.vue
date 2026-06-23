@@ -1,5 +1,5 @@
 <template>
-  <div class="flex flex-col items-center justify-center rounded-xl border border-dashed border-border-default bg-bg-surface/50 p-12 text-center">
+  <div     class="flex flex-col items-center justify-center rounded-xl border border-dashed border-border-default bg-bg-surface/60 p-12 text-center">
     <div class="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-bg-elevated">
       <slot name="icon">
         <svg class="h-6 w-6 text-text-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">

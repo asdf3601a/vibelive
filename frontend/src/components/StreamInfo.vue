@@ -1,5 +1,5 @@
 <template>
-  <div class="rounded-xl border border-border-default bg-bg-surface/60 p-4">
+  <BaseCard padding :hoverable="false">
     <h3 class="text-sm font-semibold text-text-primary mb-3">Stream Info</h3>
     <dl class="space-y-2 text-sm">
       <div class="flex justify-between gap-2">
@@ -87,7 +87,7 @@
         </div>
       </div>
     </dl>
-  </div>
+  </BaseCard>
 </template>
 
 <script setup lang="ts">
@@ -95,6 +95,7 @@ import { computed, ref } from 'vue'
 import type { Stream, TrackInfo } from '@/types'
 import { formatDateTime } from '@/utils/format'
 import { copyToClipboard } from '@/utils/clipboard'
+import BaseCard from '@/components/ui/BaseCard.vue'
 
 interface Props {
   stream: Stream

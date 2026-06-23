@@ -28,7 +28,7 @@
       </div>
 
       <!-- Duration badge -->
-      <div v-if="recording.duration_seconds" class="absolute bottom-2 right-2 bg-black/70 text-white text-[11px] px-1.5 py-0.5 rounded font-mono">
+      <div v-if="recording.duration_seconds" class="absolute bottom-2 right-2 bg-black/70 text-white text-[11px] px-1.5 py-0.5 rounded-md font-mono">
         {{ formatDuration(recording.duration_seconds) }}
       </div>
     </div>
@@ -42,15 +42,16 @@
       <div class="mt-2 flex items-center justify-between">
         <span class="text-xs text-text-muted">{{ formatFileSize(recording.size_bytes) }}</span>
         <div class="flex items-center gap-1.5">
-          <button
-            class="inline-flex items-center gap-1 rounded-lg bg-accent-primary px-2.5 py-1 text-[11px] font-medium text-white hover:bg-accent-primary/90 transition"
+          <BaseButton
+            variant="primary"
+            class="!text-[11px] !px-2.5 !py-1"
             @click="$emit('play', recording)"
           >
-            <svg class="h-3 w-3" fill="currentColor" viewBox="0 0 24 24">
+            <svg class="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24">
               <path d="M8 5v14l11-7z" />
             </svg>
             Play
-          </button>
+          </BaseButton>
           <button
             class="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium border border-border-default transition"
             :class="shareCopied
@@ -58,10 +59,10 @@
               : 'text-text-secondary bg-bg-elevated hover:bg-bg-overlay hover:text-text-primary'"
             @click="shareLink"
           >
-            <svg v-if="shareCopied" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <svg v-if="shareCopied" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
               <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
             </svg>
-            <svg v-else class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <svg v-else class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
               <path stroke-linecap="round" stroke-linejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
             </svg>
             {{ shareCopied ? 'Copied' : 'Share' }}
@@ -85,6 +86,7 @@
 import { computed, ref } from 'vue'
 import type { Recording } from '@/types'
 import BaseCard from '@/components/ui/BaseCard.vue'
+import BaseButton from '@/components/ui/BaseButton.vue'
 import { formatDateTime, formatDuration, formatFileSize } from '@/utils/format'
 import { copyToClipboard } from '@/utils/clipboard'
 

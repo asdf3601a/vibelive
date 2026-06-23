@@ -42,7 +42,7 @@
           @track-change="activeTrackId = $event"
         />
 
-        <div class="rounded-xl border border-border-default bg-bg-surface/60 p-4">
+        <BaseCard padding :hoverable="false">
           <div class="flex items-start justify-between gap-4">
             <div class="min-w-0">
               <h1 class="text-xl font-bold text-text-primary truncate">{{ stream.stream_key }}</h1>
@@ -59,17 +59,17 @@
             <BaseTag v-if="activeTrackTags.audio_codec">{{ activeTrackTags.audio_codec }}</BaseTag>
             <BaseTag v-if="activeTrackTags.framerate">{{ activeTrackTags.framerate }} fps</BaseTag>
           </div>
-        </div>
+        </BaseCard>
       </div>
 
       <!-- Sidebar -->
       <div class="space-y-4 min-w-0">
         <StreamInfo :stream="stream" :active-track="activeTrack" />
 
-        <div v-if="recordings.length" class="rounded-xl border border-border-default bg-bg-surface/60 p-4">
+        <BaseCard v-if="recordings.length" padding :hoverable="false">
           <h3 class="text-sm font-semibold text-text-primary mb-3">Recordings</h3>
           <RecordingsList :recordings="recordings" view="list" @play="activeRecording = $event" />
-        </div>
+        </BaseCard>
       </div>
     </div>
 
@@ -77,24 +77,24 @@
     <div v-else-if="loading" class="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div class="lg:col-span-2 space-y-4 min-w-0">
         <BaseSkeleton variant="video" />
-        <div class="rounded-xl border border-border-default bg-bg-surface/60 p-4 space-y-3">
+        <BaseCard padding :hoverable="false" class="space-y-3">
           <BaseSkeleton variant="text" class="w-48" />
           <BaseSkeleton variant="text" class="w-32" />
           <div class="flex gap-2">
             <BaseSkeleton variant="text" class="w-20" />
             <BaseSkeleton variant="text" class="w-20" />
           </div>
-        </div>
+        </BaseCard>
       </div>
       <div class="space-y-4 min-w-0">
-        <div class="rounded-xl border border-border-default bg-bg-surface/60 p-4 space-y-3">
+        <BaseCard padding :hoverable="false" class="space-y-3">
           <BaseSkeleton variant="text" class="w-24" />
           <div class="space-y-2">
             <BaseSkeleton variant="text" />
             <BaseSkeleton variant="text" />
             <BaseSkeleton variant="text" class="w-3/4" />
           </div>
-        </div>
+        </BaseCard>
       </div>
     </div>
 
@@ -131,6 +131,7 @@ import BaseTag from '@/components/ui/BaseTag.vue'
 import BaseSkeleton from '@/components/ui/BaseSkeleton.vue'
 import BaseEmptyState from '@/components/ui/BaseEmptyState.vue'
 import BaseErrorState from '@/components/ui/BaseErrorState.vue'
+import BaseCard from '@/components/ui/BaseCard.vue'
 import { useStream } from '@/composables/useStream'
 import { formatDateTime } from '@/utils/format'
 import type { Recording } from '@/types'

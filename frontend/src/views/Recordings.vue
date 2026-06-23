@@ -103,9 +103,11 @@
 
     <!-- Loading -->
     <div v-if="loading && !displayedData.length" class="space-y-3">
-      <div v-for="i in 4" :key="i" class="rounded-lg border border-border-default bg-bg-surface/60 px-4 py-3 space-y-2">
-        <BaseSkeleton variant="text" class="w-48" />
-        <BaseSkeleton variant="text" class="w-32" />
+      <div v-for="i in 4" :key="i">
+        <BaseCard padding :hoverable="false" class="rounded-xl space-y-2">
+          <BaseSkeleton variant="text" class="w-48" />
+          <BaseSkeleton variant="text" class="w-32" />
+        </BaseCard>
       </div>
     </div>
 
@@ -169,6 +171,7 @@ import { useRoute, useRouter } from 'vue-router'
 import RecordingsList from '@/components/RecordingsList.vue'
 import RecordingPlayer from '@/components/RecordingPlayer.vue'
 import BaseSkeleton from '@/components/ui/BaseSkeleton.vue'
+import BaseCard from '@/components/ui/BaseCard.vue'
 import BaseErrorState from '@/components/ui/BaseErrorState.vue'
 import BaseEmptyState from '@/components/ui/BaseEmptyState.vue'
 import { listRecordings } from '@/api/streams'

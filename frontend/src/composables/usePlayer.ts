@@ -620,6 +620,12 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       case 'f':
         toggleFullscreen()
         break
+      case 'Escape':
+        if (document.fullscreenElement) {
+          document.exitFullscreen()
+          showControls()
+        }
+        break
       case ',':
         if (state.value === 'paused') {
           seekRelative(-1 / 24)
