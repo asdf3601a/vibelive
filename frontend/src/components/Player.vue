@@ -13,7 +13,7 @@
     tabindex="0"
   >
     <!-- Video element (clipped to rounded corners) -->
-    <div class="absolute inset-0 overflow-hidden rounded-[inherit]">
+    <div class="absolute inset-0 overflow-hidden rounded-[inherit]" @click="togglePlay">
       <video
         ref="videoRef"
         class="absolute inset-0 w-full h-full"
@@ -30,6 +30,7 @@
       <div
         v-if="state === 'loading' || state === 'buffering'"
         class="absolute inset-0 flex items-center justify-center bg-black/40"
+        @click.stop
       >
         <svg class="h-10 w-10 text-white/60 animate-spin" fill="none" viewBox="0 0 24 24">
           <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" />
@@ -48,7 +49,7 @@
         <span class="text-sm text-white/80 mb-3">Playback error</span>
         <button
           class="inline-flex items-center gap-1.5 rounded-lg bg-white/20 px-3 py-1.5 text-sm font-medium text-white hover:bg-white/30 transition"
-          @click="loadSource(src, isLive)"
+          @click.stop="loadSource(src, isLive)"
         >
           <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
             <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
@@ -64,7 +65,7 @@
       >
         <button
           class="h-16 w-16 rounded-full bg-white/90 flex items-center justify-center hover:bg-white transition shadow-xl hover:scale-105 active:scale-95"
-          @click="togglePlay"
+          @click.stop="togglePlay"
         >
           <svg class="h-7 w-7 text-bg-base ml-1" fill="currentColor" viewBox="0 0 24 24">
             <path d="M8 5v14l11-7z" />
@@ -77,7 +78,7 @@
         <div
           v-if="!isPlaying && state !== 'loading' && state !== 'buffering' && state !== 'ended' && state !== 'error'"
           class="absolute inset-0 flex items-center justify-center cursor-pointer"
-          @click="togglePlay"
+          @click.stop="togglePlay"
           @touchend.stop
         >
           <div class="h-16 w-16 rounded-full bg-accent-primary/90 flex items-center justify-center hover:bg-accent-primary transition shadow-xl hover:scale-105 active:scale-95">
@@ -167,7 +168,7 @@
             <button
               class="p-1.5 rounded-lg text-white/80 hover:text-white hover:bg-white/10 transition cursor-pointer"
               :title="isPlaying ? 'Pause (Space)' : 'Play (Space)'"
-              @click="togglePlay"
+          @click.stop="togglePlay"
             >
               <svg v-if="isPlaying" class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24">
                 <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
