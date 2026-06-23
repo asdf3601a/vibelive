@@ -4,7 +4,7 @@
       class="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
       @click.self="$emit('close')"
     >
-      <div class="w-full max-w-5xl rounded-xl border border-border-default bg-bg-surface overflow-hidden shadow-2xl">
+      <div class="w-full max-w-5xl rounded-xl border border-border-default bg-bg-surface shadow-2xl">
         <!-- Header -->
         <div class="flex items-center justify-between px-4 py-3">
           <div class="flex items-center gap-2 min-w-0">

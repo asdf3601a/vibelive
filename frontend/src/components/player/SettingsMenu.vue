@@ -1,5 +1,5 @@
 <template>
-  <div class="relative">
+  <div class="relative" data-no-gesture>
     <button
       class="p-1.5 rounded-lg text-white/80 hover:text-white hover:bg-white/10 transition cursor-pointer"
       title="Settings"
@@ -154,7 +154,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 
 interface Props {
   playbackRate: number
@@ -180,9 +180,14 @@ const emit = defineEmits<{
   toggleDebug: []
   setLiveThreshold: [seconds: number]
   toggleVolumeBoost: []
+  toggleSettings: [open: boolean]
 }>()
 
 const showMenu = ref(false)
+
+watch(showMenu, (val) => {
+  emit('toggleSettings', val)
+})
 
 const speeds = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4, 8, 16]
 const aspectOptions = [

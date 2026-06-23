@@ -813,7 +813,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
 
   function handleTouchStart(e: TouchEvent) {
     touchHandled = false
-    if ((e.target as HTMLElement).closest('button, a, input, [role="button"]')) return
+    if ((e.target as HTMLElement).closest('button, a, input, [role="button"], [data-no-gesture]')) return
     if (e.touches.length !== 1) return
     touchStartX = e.touches[0].clientX
     touchStartY = e.touches[0].clientY

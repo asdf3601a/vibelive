@@ -247,6 +247,7 @@
               @toggle-debug="showDebug = !showDebug"
               @set-live-threshold="setLiveThreshold"
               @toggle-volume-boost="toggleVolumeBoost"
+              @toggle-settings="showSettings = $event"
             />
 
             <!-- Fullscreen -->
@@ -361,6 +362,7 @@ currentHlsLevel,
   clearLoop,
   aspectFit,
   setAspectFit,
+  showSettings,
   toggleFullscreen,
   onMouseMove,
   hideControls,
