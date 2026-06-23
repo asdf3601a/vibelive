@@ -558,7 +558,7 @@ run_color_test() {
                 result="WARN"
                 result_color="$YELLOW"
                 if [ "$hdr" = "hdr" ]; then
-                    details="Records correctly; HDR metadata lost in output (expected with current muxer)"
+                    details="Records correctly; test encoder does not send Enhanced RTMP Metadata (HDR colr/clli/mdcv support via Metadata packet is implemented)"
                 else
                     details="Records correctly; may not play in browser (expected)"
                 fi
@@ -1117,14 +1117,17 @@ run_fps_test() {
                 local dom_count
                 dom_count=$(echo "$frame_durations" | sort -n | uniq -c | sort -rn | head -1 | awk '{print $1}')
                 local dom_sec
-                dom_sec=$(python3 -c "print($dom_dur / 90000)")
+                local tb_den
+                tb_den=$(ffprobe -v error -select_streams v:0 -show_entries stream=time_base -of default=noprint_wrappers=1:nokey=1 "$rec_file" 2>/dev/null | tail -1)
+                tb_den="${tb_den#*/}"
+                dom_sec=$(python3 -c "print($dom_dur / ${tb_den:-90000})")
 
                 echo -e "  frames=$total  dominant=${dom_dur}ticks (${dom_sec}s)  count=$dom_count/$total"
 
                 # Check frame-duration consistency: dominant duration covers ≥85% of frames.
-                # RTMP timestamps use integer milliseconds, so the actual frame spacing
-                # is round(1000*den/num)ms rather than ideal 1000*den/num. The muxer
-                # faithfully records the received spacing — what matters is consistency.
+                # The muxer uses the stream's declared framerate rational to produce uniform
+                # frame durations in the media timescale — all frames within a segment share
+                # the same duration. Segments at keyframe boundaries may have one outlier.
                 local ok
                 ok=$(python3 <<PY
 total = $total

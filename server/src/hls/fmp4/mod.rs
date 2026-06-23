@@ -29,6 +29,26 @@ pub struct Sample {
     pub composition_time_offset: i32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ColorConfig {
+    pub color_primaries: u16,
+    pub transfer_characteristics: u16,
+    pub matrix_coefficients: u16,
+    pub full_range: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct HdrMetadata {
+    pub max_content_light_level: u32,
+    pub max_frame_average_light_level: u32,
+    pub display_primaries_x: [u16; 3],
+    pub display_primaries_y: [u16; 3],
+    pub white_point_x: u16,
+    pub white_point_y: u16,
+    pub max_luminance: u32,
+    pub min_luminance: u32,
+}
+
 pub struct Fmp4Muxer {
     video_codec: Option<VideoCodec>,
     audio_codec: Option<AudioCodec>,
@@ -36,15 +56,35 @@ pub struct Fmp4Muxer {
     video_height: u16,
     video_config: Option<Vec<u8>>,
     audio_config: Option<Vec<u8>>,
+    video_color_config: Option<ColorConfig>,
+    hdr_metadata: Option<HdrMetadata>,
     video_samples: Vec<Sample>,
     audio_samples: Vec<Sample>,
     video_sequence_number: u32,
     video_base_dts: u64,
     audio_base_dts: u64,
     audio_sample_rate: u32,
-    video_timescale: u32,
     video_fps_num: u64,
     video_fps_den: u64,
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+fn compute_video_timescale(fps_num: u64, fps_den: u64) -> u32 {
+    // Choose T = lcm(fps_num/gcd, 1000) so that:
+    //   1. frame_duration = T × fps_den / fps_num is an exact integer
+    //   2. DTS from RTMP ms converts exactly: scaled_dts = dts_ms × T / 1000
+    let g = gcd(fps_num, fps_den);
+    let t_min = fps_num / g;          // smallest T that satisfies #1
+    // lcm(t_min, 1000) — satisfies both #1 and #2
+    if t_min.is_multiple_of(1000) {
+        t_min as u32                  // already divisible by 1000
+    } else {
+        let d = gcd(t_min, 1000);
+        (t_min / d * 1000) as u32     // lcm = t_min / gcd(t_min, 1000) * 1000
+    }
 }
 
 impl Fmp4Muxer {
@@ -56,13 +96,14 @@ impl Fmp4Muxer {
             video_height: 1080,
             video_config: None,
             audio_config: None,
+            video_color_config: None,
+            hdr_metadata: None,
             video_samples: Vec::new(),
             audio_samples: Vec::new(),
             video_sequence_number: 0,
             video_base_dts: 0,
             audio_base_dts: 0,
             audio_sample_rate: 44100,
-            video_timescale: 90000,
             video_fps_num: 30,
             video_fps_den: 1,
         }
@@ -71,6 +112,14 @@ impl Fmp4Muxer {
     pub fn set_video_framerate(&mut self, num: u64, den: u64) {
         self.video_fps_num = num;
         self.video_fps_den = den;
+    }
+
+    pub fn set_video_color_config(&mut self, cfg: ColorConfig) {
+        self.video_color_config = Some(cfg);
+    }
+
+    pub fn set_hdr_metadata(&mut self, hdr: HdrMetadata) {
+        self.hdr_metadata = Some(hdr);
     }
 
     pub fn video_codec(&self) -> Option<VideoCodec> {
@@ -164,30 +213,25 @@ impl Fmp4Muxer {
     pub fn last_video_sample_duration(&self) -> u64 {
         self.video_samples
             .last()
-            .map(|s| s.duration as u64)
+            .map(|s| s.duration as u64 * 1000 / compute_video_timescale(self.video_fps_num, self.video_fps_den) as u64)
             .unwrap_or(33)
     }
 
     pub fn last_audio_sample_duration(&self) -> u64 {
         self.audio_samples
             .last()
-            .map(|s| s.duration as u64)
+            .map(|s| s.duration as u64 * 1000 / self.audio_sample_rate as u64)
             .unwrap_or(21)
     }
 
     fn compute_and_set_durations(&mut self) {
-        if !self.video_samples.is_empty() {
-            let avg_dur = if self.video_samples.len() > 1 {
-                let total = self.video_samples.last().unwrap().dts
-                    - self.video_samples.first().unwrap().dts;
-                let cnt = self.video_samples.len() as u64 - 1;
-                ((total + cnt / 2) / cnt) as u32
-            } else {
-                (1000 * self.video_fps_den / self.video_fps_num) as u32
-            };
-            for s in &mut self.video_samples {
-                s.duration = avg_dur;
-            }
+        // Video: use framerate rational for exact timescale duration.
+        // RTMP integer-millisecond DTS values cannot represent NTSC rates
+        // or even 30fps exactly, so averaging them introduces drift.
+        let video_dur =
+            (compute_video_timescale(self.video_fps_num, self.video_fps_den) as u64 * self.video_fps_den / self.video_fps_num) as u32;
+        for s in &mut self.video_samples {
+            s.duration = video_dur;
         }
 
         if !self.audio_samples.is_empty() {
@@ -195,9 +239,9 @@ impl Fmp4Muxer {
                 let total = self.audio_samples.last().unwrap().dts
                     - self.audio_samples.first().unwrap().dts;
                 let cnt = self.audio_samples.len() as u64 - 1;
-                ((total + cnt / 2) / cnt) as u32
+                ((total * self.audio_sample_rate as u64 + (cnt * 1000) / 2) / (cnt * 1000)) as u32
             } else {
-                (1024u64 * 1000 / self.audio_sample_rate as u64) as u32
+                1024
             };
             for s in &mut self.audio_samples {
                 s.duration = avg_dur;
@@ -393,7 +437,7 @@ impl Fmp4Muxer {
 
     fn write_mdia_video(&self, w: &mut Vec<u8>) {
         let mut data = Vec::new();
-        self.write_mdhd(&mut data, self.video_timescale);
+        self.write_mdhd(&mut data, compute_video_timescale(self.video_fps_num, self.video_fps_den));
         self.write_hdlr(&mut data, b"vide", b"VideoHandler\0");
         self.write_minf_video(&mut data);
         write_box(w, b"mdia", &data);
@@ -556,6 +600,49 @@ impl Fmp4Muxer {
         write_fullbox(w, b"stsd", 0, 0, &data);
     }
 
+    // ── HDR metadata box writers ───────────────────────────────────
+
+    fn write_colr(&self, w: &mut Vec<u8>) {
+        let Some(ref cfg) = self.video_color_config else {
+            return;
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(b"nclx");
+        data.extend_from_slice(&cfg.color_primaries.to_be_bytes());
+        data.extend_from_slice(&cfg.transfer_characteristics.to_be_bytes());
+        data.extend_from_slice(&cfg.matrix_coefficients.to_be_bytes());
+        data.push(if cfg.full_range { 0x80 } else { 0x00 });
+        write_box(w, b"colr", &data);
+    }
+
+    fn write_clli(&self, w: &mut Vec<u8>) {
+        let Some(ref hdr) = self.hdr_metadata else {
+            return;
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(&hdr.max_content_light_level.to_be_bytes());
+        data.extend_from_slice(&hdr.max_frame_average_light_level.to_be_bytes());
+        write_box(w, b"clli", &data);
+    }
+
+    fn write_mdcv(&self, w: &mut Vec<u8>) {
+        let Some(ref hdr) = self.hdr_metadata else {
+            return;
+        };
+        let mut data = Vec::new();
+        for &x in &hdr.display_primaries_x {
+            data.extend_from_slice(&x.to_be_bytes());
+        }
+        for &y in &hdr.display_primaries_y {
+            data.extend_from_slice(&y.to_be_bytes());
+        }
+        data.extend_from_slice(&hdr.white_point_x.to_be_bytes());
+        data.extend_from_slice(&hdr.white_point_y.to_be_bytes());
+        data.extend_from_slice(&hdr.max_luminance.to_be_bytes());
+        data.extend_from_slice(&hdr.min_luminance.to_be_bytes());
+        write_box(w, b"mdcv", &data);
+    }
+
     // ── Consolidated visual sample entry ─────────────────────────
 
     fn write_visual_sample_entry(
@@ -605,6 +692,11 @@ impl Fmp4Muxer {
         pasp_data.extend_from_slice(&1u32.to_be_bytes());
         pasp_data.extend_from_slice(&1u32.to_be_bytes());
         write_box(&mut data, b"pasp", &pasp_data);
+
+        // HDR metadata boxes (colr, clli, mdcv) — required for correct PQ/HLG playback
+        self.write_colr(&mut data);
+        self.write_clli(&mut data);
+        self.write_mdcv(&mut data);
 
         write_box(w, codec_fourcc, &data);
     }
@@ -804,20 +896,21 @@ impl Fmp4Muxer {
         let is_video = track_id == 1;
         let is_opus_audio = !is_video && self.audio_codec == Some(AudioCodec::Opus);
         let (duration_scale, ts_scale) = if is_video {
-            (self.video_timescale as u64, 1000u64)
+            (compute_video_timescale(self.video_fps_num, self.video_fps_den) as u64, 1000u64)
         } else {
             (self.audio_sample_rate as u64, 1000u64)
         };
+        // Duration is stored in media timescale, no conversion needed
         let scaled_duration = if is_video {
             samples
                 .first()
-                .map(|s| s.duration as u64 * duration_scale / ts_scale)
-                .unwrap_or(self.video_timescale as u64 * self.video_fps_den / self.video_fps_num)
+                .map(|s| s.duration as u64)
+                .unwrap_or(compute_video_timescale(self.video_fps_num, self.video_fps_den) as u64 * self.video_fps_den / self.video_fps_num)
                 as u32
         } else {
             samples
                 .first()
-                .map(|s| s.duration as u64 * duration_scale / ts_scale)
+                .map(|s| s.duration as u64)
                 .unwrap_or(1024) as u32
         };
         let scaled_base_dts = base_dts * duration_scale / ts_scale;
@@ -1472,5 +1565,21 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod timescale_tests {
+    use super::*;
+    #[test]
+    fn test_compute_video_timescale() {
+        assert_eq!(compute_video_timescale(30, 1), 3000);
+        assert_eq!(compute_video_timescale(24, 1), 3000);
+        assert_eq!(compute_video_timescale(25, 1), 1000);
+        assert_eq!(compute_video_timescale(50, 1), 1000);
+        assert_eq!(compute_video_timescale(60, 1), 3000);
+        assert_eq!(compute_video_timescale(24000, 1001), 24000);
+        assert_eq!(compute_video_timescale(30000, 1001), 30000);
+        assert_eq!(compute_video_timescale(60000, 1001), 60000);
     }
 }

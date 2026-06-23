@@ -160,6 +160,10 @@ struct Av1SeqHeader {
     chroma_subsampling_x: u8,
     chroma_subsampling_y: u8,
     chroma_sample_position: u8,
+    color_primaries: u16,
+    transfer_characteristics: u16,
+    matrix_coefficients: u16,
+    full_range: bool,
 }
 
 fn parse_av1_sequence_header(payload: &[u8]) -> Option<Av1SeqHeader> {
@@ -307,26 +311,30 @@ fn parse_av1_sequence_header(payload: &[u8]) -> Option<Av1SeqHeader> {
     }
 
     let color_description_present_flag = r.read_bit();
-    let mut color_primaries = 0u8;
-    let mut transfer_characteristics = 0u8;
-    let mut matrix_coefficients = 0u8;
+    let mut color_primaries = 0u16;
+    let mut transfer_characteristics = 0u16;
+    let mut matrix_coefficients = 0u16;
     if color_description_present_flag == 1 {
-        color_primaries = r.read_bits(8) as u8;
-        transfer_characteristics = r.read_bits(8) as u8;
-        matrix_coefficients = r.read_bits(8) as u8;
+        color_primaries = r.read_bits(8) as u16;
+        transfer_characteristics = r.read_bits(8) as u16;
+        matrix_coefficients = r.read_bits(8) as u16;
     }
+    h.color_primaries = color_primaries;
+    h.transfer_characteristics = transfer_characteristics;
+    h.matrix_coefficients = matrix_coefficients;
 
     if h.monochrome == 1 {
-        let _ = r.read_bit();
+        h.full_range = r.read_bit() == 1;
         h.chroma_subsampling_x = 1;
         h.chroma_subsampling_y = 1;
         h.chroma_sample_position = 0;
     } else if color_primaries == 1 && transfer_characteristics == 13 && matrix_coefficients == 0 {
+        h.full_range = true;
         h.chroma_subsampling_x = 0;
         h.chroma_subsampling_y = 0;
         h.chroma_sample_position = 0;
     } else {
-        let _ = r.read_bit();
+        h.full_range = r.read_bit() == 1;
         if h.seq_profile == 0 {
             h.chroma_subsampling_x = 1;
             h.chroma_subsampling_y = 1;
@@ -528,6 +536,67 @@ pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
     let config_with_sizes = ensure_av1_obu_size_fields(config);
     av1c.extend_from_slice(&config_with_sizes);
     av1c
+}
+
+/// Extract color config from an AV1 codec configuration blob.
+/// Scans for the sequence header OBU, parses it, and returns color info.
+/// Returns None if no color description is present.
+pub fn av1_color_config_from_config(config: &[u8]) -> Option<crate::hls::fmp4::ColorConfig> {
+    let mut offset = 0;
+    let mut seq_header_payload: Option<&[u8]> = None;
+
+    while offset < config.len() && seq_header_payload.is_none() {
+        if offset >= config.len() {
+            break;
+        }
+        let obu_header = config[offset];
+        offset += 1;
+        let obu_type = (obu_header >> 3) & 0x0F;
+        let obu_extension_flag = (obu_header >> 2) & 1;
+        let obu_has_size_field = (obu_header >> 1) & 1;
+
+        if obu_extension_flag == 1 && offset < config.len() {
+            offset += 1;
+        }
+
+        let mut obu_size = 0usize;
+        if obu_has_size_field == 1 {
+            let mut shift = 0;
+            loop {
+                if offset >= config.len() {
+                    break;
+                }
+                let byte = config[offset];
+                offset += 1;
+                obu_size |= ((byte & 0x7F) as usize) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+        } else {
+            obu_size = config.len().saturating_sub(offset);
+        }
+
+        if obu_type == 1 && offset + obu_size <= config.len() {
+            seq_header_payload = Some(&config[offset..offset + obu_size]);
+            break;
+        }
+
+        offset += obu_size;
+    }
+
+    let h = seq_header_payload.and_then(parse_av1_sequence_header)?;
+    // color_description_present_flag must have been set for color info to be meaningful
+    if h.color_primaries == 0 && h.transfer_characteristics == 0 && h.matrix_coefficients == 0 {
+        return None;
+    }
+    Some(crate::hls::fmp4::ColorConfig {
+        color_primaries: h.color_primaries,
+        transfer_characteristics: h.transfer_characteristics,
+        matrix_coefficients: h.matrix_coefficients,
+        full_range: h.full_range,
+    })
 }
 
 // ── Audio config builders ────────────────────────────────────────

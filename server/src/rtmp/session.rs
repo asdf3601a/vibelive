@@ -776,6 +776,90 @@ fn fps_to_rational(fps: f64) -> (u64, u64) {
     if rounded > 0 { (rounded, 1) } else { (30, 1) }
 }
 
+/// Parse color config from Enhanced RTMP video metadata remainder.
+/// Format (after fourcc): color_primaries(u8) transfer_characteristics(u8)
+///     matrix_coefficients(u8) video_full_range_flag(u8)
+fn parse_enhanced_color_config(data: &[u8]) -> crate::hls::fmp4::ColorConfig {
+    let cp = data.first().copied().unwrap_or(1) as u16;
+    let tc = data.get(1).copied().unwrap_or(1) as u16;
+    let mc = data.get(2).copied().unwrap_or(1) as u16;
+    let full_range = data.get(3).copied().unwrap_or(0) != 0;
+    crate::hls::fmp4::ColorConfig {
+        color_primaries: cp,
+        transfer_characteristics: tc,
+        matrix_coefficients: mc,
+        full_range,
+    }
+}
+
+/// Parse optional HDR metadata from Enhanced RTMP video metadata remainder.
+/// Present when data has >= 8 bytes after the 4-byte color config,
+/// with a u32 size prefix followed by CLLI (4 bytes) + MDCV (24 bytes).
+fn parse_enhanced_hdr_metadata(data: &[u8]) -> Option<crate::hls::fmp4::HdrMetadata> {
+    // Need at least 4 bytes of color config + 4 bytes size prefix + 28 bytes HDR data
+    if data.len() < 36 {
+        return None;
+    }
+    let hdr_offset = 4;
+    let hdr_data = &data[hdr_offset..];
+
+    // Size prefix is u32 big-endian
+    if hdr_data.len() < 4 {
+        return None;
+    }
+    let hdr_len = u32::from_be_bytes([hdr_data[0], hdr_data[1], hdr_data[2], hdr_data[3]]) as usize;
+    let payload = hdr_data.get(4..)?;
+
+    // Minimum HDR payload: CLLI(4) + MDCV(24) = 28 bytes
+    if hdr_len < 28 || payload.len() < hdr_len.min(28) {
+        return None;
+    }
+    let p = payload;
+
+    let maxcll = u16::from_be_bytes([p[0], p[1]]) as u32;
+    let maxfall = u16::from_be_bytes([p[2], p[3]]) as u32;
+
+    // MDCV: 3 display primaries (x,y each u16) + white point (x,y u16) + max/min luminance (u32 each)
+    // Total: 3*2*2 + 2*2 + 4 + 4 = 12 + 4 + 4 + 4 = 24
+    let mdcv_data = &p[4..];
+    if mdcv_data.len() < 24 {
+        return None;
+    }
+
+    let read_u16 = |d: &[u8], i: usize| -> u16 {
+        u16::from_be_bytes([d[i], d[i + 1]])
+    };
+    let read_u32 = |d: &[u8], i: usize| -> u32 {
+        u32::from_be_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]])
+    };
+
+    let display_primaries_x = [
+        read_u16(mdcv_data, 0),
+        read_u16(mdcv_data, 2),
+        read_u16(mdcv_data, 4),
+    ];
+    let display_primaries_y = [
+        read_u16(mdcv_data, 6),
+        read_u16(mdcv_data, 8),
+        read_u16(mdcv_data, 10),
+    ];
+    let white_point_x = read_u16(mdcv_data, 12);
+    let white_point_y = read_u16(mdcv_data, 14);
+    let max_luminance = read_u32(mdcv_data, 16);
+    let min_luminance = read_u32(mdcv_data, 20);
+
+    Some(crate::hls::fmp4::HdrMetadata {
+        max_content_light_level: maxcll,
+        max_frame_average_light_level: maxfall,
+        display_primaries_x,
+        display_primaries_y,
+        white_point_x,
+        white_point_y,
+        max_luminance,
+        min_luminance,
+    })
+}
+
 async fn handle_video_data(
     data: &[u8],
     ts: u32,
@@ -954,9 +1038,18 @@ async fn handle_video_data(
                     }
                 }
                 crate::rtmp::enhanced::VideoPacketType::Metadata => {
-                    tracing::debug!(
-                        "Received Enhanced RTMP video metadata (HDR); not yet processed"
-                    );
+                    if let Some(ref mut hls) = ctx.hls_state {
+                        hls.set_video_color_config(parse_enhanced_color_config(remainder));
+                        if let Some(hdr) = parse_enhanced_hdr_metadata(remainder) {
+                            hls.set_hdr_metadata(hdr);
+                        }
+                    }
+                    for track_state in ctx.track_states.values_mut() {
+                        track_state.set_video_color_config(parse_enhanced_color_config(remainder));
+                        if let Some(hdr) = parse_enhanced_hdr_metadata(remainder) {
+                            track_state.set_hdr_metadata(hdr);
+                        }
+                    }
                 }
                 _ => {}
             }

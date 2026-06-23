@@ -142,12 +142,28 @@ impl HlsStreamState {
     ) -> anyhow::Result<()> {
         self.fmp4_muxer.set_video_codec(codec, width, height);
         self.fmp4_muxer.set_video_config(config.to_vec());
+        // For AV1, extract color info from the sequence header OBU
+        if codec == fmp4::VideoCodec::AV1
+            && let Some(color_cfg) = fmp4::codec::av1_color_config_from_config(config)
+        {
+            self.fmp4_muxer.set_video_color_config(color_cfg);
+        }
         self.init_written = false;
         Ok(())
     }
 
     pub fn set_video_framerate(&mut self, num: u64, den: u64) {
         self.fmp4_muxer.set_video_framerate(num, den);
+    }
+
+    pub fn set_video_color_config(&mut self, cfg: fmp4::ColorConfig) {
+        self.fmp4_muxer.set_video_color_config(cfg);
+        self.init_written = false;
+    }
+
+    pub fn set_hdr_metadata(&mut self, hdr: fmp4::HdrMetadata) {
+        self.fmp4_muxer.set_hdr_metadata(hdr);
+        self.init_written = false;
     }
 
     pub async fn set_audio_config(
