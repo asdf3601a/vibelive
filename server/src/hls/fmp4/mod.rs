@@ -178,7 +178,12 @@ impl Fmp4Muxer {
 
         let size = data.len() as u32;
         let flags = if is_keyframe { 0x02000000 } else { 0x01010000 };
-        let cto_ts = ((pts as i64 - dts as i64) * self.video_fps_num as i64 / 1000) as i32;
+        let diff = pts as i64 - dts as i64;
+        let cto_ts = if diff >= 0 {
+            (diff * self.video_fps_num as i64 + 500) / 1000
+        } else {
+            (diff * self.video_fps_num as i64 - 500) / 1000
+        } as i32;
         self.video_samples.push(Sample {
             data: data.into_owned(),
             dts: dts_ts,
