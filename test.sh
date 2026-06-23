@@ -73,6 +73,7 @@ Options:
                     reconnect  – abnormal disconnect + reconnect
                     hls        – live HLS segment verification
                     multitrack – Enhanced RTMP multitrack (2 video + 2 audio)
+                    hdr-validate – HDR box validation (HEVC & AV1, 15s streams)
                     fps        – NTSC/PAL frame rate consistency (NOT included in 'all')
                     all        – run every suite EXCEPT fps
   --full          Run full Cartesian product for codec/res matrices.
@@ -517,6 +518,9 @@ run_color_test() {
         ffmpeg_args+=(-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc)
     fi
 
+    if [ "$encoder" = "libx265" ]; then
+        ffmpeg_args+=(-preset ultrafast)
+    fi
     if [ "$encoder" = "libsvtav1" ]; then
         ffmpeg_args+=(-svtav1-params preset=12:crf=35)
     fi
@@ -600,9 +604,173 @@ run_color_matrix() {
     run_color_test "H.264 4:4:4 8-bit SDR"      libx264  yuv444p     high444 sdr  WARN
     run_color_test "H.264 NV12 8-bit SDR"       libx264  nv12        ""      sdr  PASS
     run_color_test "H.264 4:2:0 10-bit SDR"     libx264  yuv420p10le ""      sdr  WARN
-    run_color_test "H.264 4:2:0 10-bit HDR"     libx264  yuv420p10le ""      hdr  WARN
+    run_color_test "HEVC 4:2:0 10-bit SDR"      libx265  yuv420p10le  ""      sdr  PASS
+    run_color_test "HEVC 4:2:0 10-bit HDR"      libx265  yuv420p10le  ""      hdr  WARN
     run_color_test "AV1 4:2:0 10-bit SDR"       libsvtav1 yuv420p10le ""     sdr  PASS
     run_color_test "AV1 4:2:0 10-bit HDR"       libsvtav1 yuv420p10le ""     hdr  WARN
+}
+
+# ── HDR box validation test ────────────────────────────────────────
+run_hdr_box_validation() {
+    echo ""
+    echo "========== HDR BOX VALIDATION =========="
+
+    for encoder in libx265 libsvtav1; do
+        local enc_name=""
+        case "$encoder" in
+            libx265) enc_name="HEVC" ;;
+            libsvtav1) enc_name="AV1" ;;
+        esac
+        local key="hdrbox_${enc_name}_$(date +%s)"
+        local duration=15
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "HDR Box Validation: ${enc_name}"
+        echo "Key:  $key"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        local encoder_args=(-c:v "$encoder")
+        if [ "$encoder" = "libx265" ]; then
+            encoder_args+=(-preset ultrafast)
+        elif [ "$encoder" = "libsvtav1" ]; then
+            encoder_args+=(-svtav1-params preset=12:crf=35)
+        fi
+
+        echo "  Starting ffmpeg stream (${duration}s)..."
+        ffmpeg -y -re -f lavfi -i "testsrc=duration=${duration}:size=1280x720:rate=30" \
+            -f lavfi -i "sine=frequency=440:duration=${duration}" \
+            "${encoder_args[@]}" \
+            -pix_fmt yuv420p10le \
+            -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
+            -g 60 -keyint_min 60 \
+            -c:a aac \
+            -t "$duration" -f flv \
+            "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+        local ffmpeg_pid=$!
+        echo "  ffmpeg PID: $ffmpeg_pid"
+
+        local hls_dir="$MEDIA_DIR/hls/$key"
+        local waited=0
+        while [ ! -f "$hls_dir/init.mp4" ] && [ "$waited" -lt 12 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+
+        local result="FAIL"
+        local result_color="$RED"
+
+        if [ -f "$hls_dir/init.mp4" ]; then
+            local box_ok=1
+            # Copy first to avoid HLS cleanup race
+            local tmp_init
+            tmp_init=$(mktemp)
+            cp "$hls_dir/init.mp4" "$tmp_init"
+            local py_output py_exit
+            py_output=$(python3 -c "
+import struct, sys
+
+def fb(data, target):
+    offset = 0
+    while offset + 8 <= len(data):
+        sz = struct.unpack('>I', data[offset:offset+4])[0]
+        if sz == 0 or offset + sz > len(data): break
+        bt = data[offset+4:offset+8].decode('ascii', errors='replace')
+        if bt == target:
+            return (sz, data[offset+8:offset+sz])
+        if bt in ('moov','trak','mdia','minf','stbl') and sz > 8:
+            r = fb(data[offset+8:offset+sz], target)
+            if r: return r
+        elif bt == 'stsd' and sz > 16:
+            r = fb(data[offset+16:offset+sz], target)
+            if r: return r
+        elif bt in ('hvc1','avc1','av01') and sz > 8:
+            r = fb(data[offset+86:offset+sz], target)
+            if r: return r
+        offset += sz
+    return None
+
+d = open('${tmp_init}', 'rb').read()
+ok = True
+
+colr = fb(d, 'colr')
+if colr:
+    sz, pl = colr
+    print('colr: size=%d' % sz)
+    if pl[:4] == b'nclx':
+        print('  nclx: cp=%d tc=%d mc=%d full=%d' % (
+            struct.unpack('>H', pl[4:6])[0],
+            struct.unpack('>H', pl[6:8])[0],
+            struct.unpack('>H', pl[8:10])[0], pl[10]))
+else:
+    print('colr: MISSING')
+    ok = False
+
+clli = fb(d, 'clli')
+if clli:
+    sz, pl = clli
+    print('clli: size=%d' % sz)
+    if sz == 12:
+        maxcll = struct.unpack('>H', pl[0:2])[0]
+        maxfall = struct.unpack('>H', pl[2:4])[0]
+        print('  MaxCLL=%d MaxFALL=%d' % (maxcll, maxfall))
+else:
+    print('clli: absent')
+
+mdcv = fb(d, 'mdcv')
+if mdcv:
+    sz, pl = mdcv
+    print('mdcv: size=%d' % sz)
+    if sz == 32:
+        print('  G=(%d,%d) B=(%d,%d) R=(%d,%d)' % (
+            struct.unpack('>H', pl[0:2])[0],
+            struct.unpack('>H', pl[2:4])[0],
+            struct.unpack('>H', pl[4:6])[0],
+            struct.unpack('>H', pl[6:8])[0],
+            struct.unpack('>H', pl[8:10])[0],
+            struct.unpack('>H', pl[10:12])[0]))
+else:
+    print('mdcv: absent')
+
+if ok:
+    print('PASS')
+else:
+    sys.exit(1)
+" 2>&1)
+            py_exit=$?
+            rm -f "$tmp_init"
+            if [ "$py_exit" -ne 0 ]; then
+                box_ok=0
+            fi
+
+            echo "$py_output" | sed 's/^/    /'
+
+            if echo "$py_output" | grep -q "^PASS$"; then
+                echo -e "${GREEN}  ✓ HDR boxes valid${NC}"
+                result="PASS"
+                result_color="$GREEN"
+            else
+                echo -e "${RED}  ✗ HDR box validation failed${NC}"
+            fi
+        else
+            echo -e "${RED}  ✗ init.mp4 not found after ${waited}s${NC}"
+        fi
+
+        if kill -0 "$ffmpeg_pid" 2>/dev/null; then
+            kill "$ffmpeg_pid" 2>/dev/null || true
+            wait "$ffmpeg_pid" 2>/dev/null || true
+        fi
+        sleep 1
+
+        echo -e "${result_color}  ● Result: $result${NC}"
+        echo "hdr_validate_${enc_name}|$result" >> "$RESULTS_FILE"
+
+        if [ "$result" = "PASS" ]; then
+            PASS=$((PASS+1))
+        else
+            FAIL=$((FAIL+1))
+        fi
+    done
 }
 
 # ── Graceful stop test ─────────────────────────────────────────────
@@ -1258,7 +1426,7 @@ api_call "/api/health" || { echo "Health check failed, is the server running?"; 
 
 # Expand "all" in TESTS
 if echo "$TESTS" | grep -qw "all"; then
-    TESTS="codec res color graceful reconnect hls multitrack"
+    TESTS="codec res color graceful reconnect hls multitrack hdr-validate"
 fi
 
 # Run selected test suites
@@ -1287,6 +1455,9 @@ for t in $TESTS; do
             ;;
         fps)
             run_fps_matrix
+            ;;
+        hdr-validate)
+            run_hdr_box_validation
             ;;
         *)
             echo "Unknown test suite: $t"

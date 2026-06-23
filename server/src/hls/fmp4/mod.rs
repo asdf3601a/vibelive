@@ -39,8 +39,8 @@ pub struct ColorConfig {
 
 #[derive(Clone, Debug)]
 pub struct HdrMetadata {
-    pub max_content_light_level: u32,
-    pub max_frame_average_light_level: u32,
+    pub max_content_light_level: u16,
+    pub max_frame_average_light_level: u16,
     pub display_primaries_x: [u16; 3],
     pub display_primaries_y: [u16; 3],
     pub white_point_x: u16,
@@ -633,11 +633,9 @@ impl Fmp4Muxer {
             return;
         };
         let mut data = Vec::new();
-        for &x in &hdr.display_primaries_x {
-            data.extend_from_slice(&x.to_be_bytes());
-        }
-        for &y in &hdr.display_primaries_y {
-            data.extend_from_slice(&y.to_be_bytes());
+        for &i in &[1, 2, 0] {
+            data.extend_from_slice(&hdr.display_primaries_x[i].to_be_bytes());
+            data.extend_from_slice(&hdr.display_primaries_y[i].to_be_bytes());
         }
         data.extend_from_slice(&hdr.white_point_x.to_be_bytes());
         data.extend_from_slice(&hdr.white_point_y.to_be_bytes());

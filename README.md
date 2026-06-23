@@ -624,11 +624,12 @@ The project includes a unified test script `./test.sh` that covers codec compati
 |-------|-------------|
 | `codec` | Video + audio codec matrix (quick: 480p & 720p; full: all resolutions) |
 | `res` | Resolution matrix across all specified aspect ratios |
-| `color` | Color-space / HDR compatibility (H.264 & AV1, SDR & HDR) |
+| `color` | Color-space / HDR compatibility (HEVC & AV1, SDR & HDR) |
 | `graceful` | Graceful stop & HLS cleanup verification |
 | `reconnect` | Abnormal disconnect + reconnect grace period |
 | `hls` | Live HLS segment verification |
 | `multitrack` | Enhanced RTMP multitrack (2 video + 2 audio, mixed codecs) |
+| `hdr-validate` | HDR box validation (HEVC & AV1, 15s streams, ISOBMFF box structure) |
 | `fps` | NTSC/PAL frame rate consistency test (NOT included in `all`) |
 | `all` | Every suite except `fps` |
 
