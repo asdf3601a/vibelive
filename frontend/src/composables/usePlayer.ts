@@ -32,6 +32,9 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   const displayVolume = ref(volume.value)
   const volumeBoostEnabled = ref(localStorage.getItem('player_volume_boost') === 'true')
   const autoplayAllowed = ref(sessionStorage.getItem('player_autoplay_allowed') === 'true')
+  const aspectFit = ref<'contain' | 'cover' | 'fill'>(
+    (localStorage.getItem('player_aspect_fit') as 'contain' | 'cover' | 'fill') || 'contain'
+  )
 
   let audioCtx: AudioContext | null = null
   let gainNode: GainNode | null = null
@@ -74,6 +77,10 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   const showDebug = ref(localStorage.getItem('player_show_debug') === 'true')
   watch(showDebug, (val) => {
     localStorage.setItem('player_show_debug', String(val))
+  })
+
+  watch(aspectFit, (val) => {
+    localStorage.setItem('player_aspect_fit', val)
   })
 
   // Controls visibility
@@ -483,6 +490,10 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
     playbackRate.value = rate
   }
 
+  function setAspectFit(val: 'contain' | 'cover' | 'fill') {
+    aspectFit.value = val
+  }
+
   // A-B loop
   function setLoopA() {
     loopA.value = currentTime.value
@@ -890,6 +901,7 @@ currentHlsLevel,
     seekToLiveEdge,
     setLiveThreshold,
     toggleVolumeBoost,
+    aspectFit,
 
     // methods
     loadSource,
@@ -902,6 +914,7 @@ currentHlsLevel,
     setVolume,
     toggleMute,
     setPlaybackRate,
+    setAspectFit,
     setLoopA,
     setLoopB,
     setLoopEnabled,

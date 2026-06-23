@@ -3,6 +3,7 @@
     ref="containerRef"
     class="relative w-full rounded-xl bg-black border border-border-default select-none"
     :class="{ 'cursor-none': !controlsVisible && isPlaying }"
+    style="aspect-ratio: 16 / 9;"
     @mouseenter="onMouseMove"
     @mousemove="onMouseMove"
     @mouseleave="hideControls"
@@ -12,10 +13,11 @@
     tabindex="0"
   >
     <!-- Video element (clipped to rounded corners) -->
-    <div class="w-full relative overflow-hidden rounded-[inherit]" style="padding-bottom: 56.25%;">
+    <div class="absolute inset-0 overflow-hidden rounded-[inherit]">
       <video
         ref="videoRef"
-        class="absolute inset-0 w-full h-full object-contain bg-black"
+        class="absolute inset-0 w-full h-full"
+        :style="{ objectFit: aspectFit, objectPosition: 'center' }"
         :autoplay="autoplay"
         :poster="poster"
         playsinline
@@ -228,6 +230,7 @@
             <!-- Settings (right side) -->
             <SettingsMenu
               :playback-rate="playbackRate"
+              :aspect-fit="aspectFit"
               :loop-a="loopA"
               :loop-b="loopB"
               :loop-enabled="loopEnabled"
@@ -236,6 +239,7 @@
               :live-threshold="liveThreshold"
               :volume-boost-enabled="volumeBoostEnabled"
               @set-playback-rate="setPlaybackRate"
+              @set-aspect-fit="setAspectFit"
               @set-loop-a="setLoopA"
               @set-loop-b="setLoopB"
               @set-loop-enabled="setLoopEnabled"
@@ -355,6 +359,8 @@ currentHlsLevel,
   setLoopA,
   setLoopB,
   clearLoop,
+  aspectFit,
+  setAspectFit,
   toggleFullscreen,
   onMouseMove,
   hideControls,

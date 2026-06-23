@@ -35,6 +35,24 @@
             </div>
           </div>
 
+          <div class="border-t border-border-default" />
+
+          <!-- Aspect Ratio -->
+          <div class="px-3 py-2">
+            <div class="text-xs text-text-secondary mb-2">Aspect Ratio</div>
+            <div class="flex items-center gap-1.5">
+              <button
+                v-for="opt in aspectOptions"
+                :key="opt.value"
+                class="flex-1 px-2 py-1 text-xs rounded-md font-medium transition"
+                :class="aspectFit === opt.value
+                  ? 'bg-accent-primary/15 text-accent-primary border border-accent-primary/30'
+                  : 'text-text-secondary/70 bg-bg-elevated border border-transparent hover:bg-bg-surface hover:text-text-primary'"
+                @click="$emit('setAspectFit', opt.value)"
+              >{{ opt.label }}</button>
+            </div>
+          </div>
+
           <div v-if="!isLive" class="border-t border-border-default" />
 
           <!-- A-B Loop (recordings only) -->
@@ -140,6 +158,7 @@ import { ref, computed } from 'vue'
 
 interface Props {
   playbackRate: number
+  aspectFit: 'contain' | 'cover' | 'fill'
   loopA: number | null
   loopB: number | null
   loopEnabled: boolean
@@ -153,6 +172,7 @@ const props = defineProps<Props>()
 
 const emit = defineEmits<{
   setPlaybackRate: [rate: number]
+  setAspectFit: [val: 'contain' | 'cover' | 'fill']
   setLoopA: []
   setLoopB: []
   setLoopEnabled: [val: boolean]
@@ -165,6 +185,11 @@ const emit = defineEmits<{
 const showMenu = ref(false)
 
 const speeds = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4, 8, 16]
+const aspectOptions = [
+  { label: 'Original', value: 'contain' as const },
+  { label: 'Crop', value: 'cover' as const },
+  { label: 'Stretch', value: 'fill' as const },
+]
 
 const speedIndex = computed(() => {
   const idx = speeds.indexOf(props.playbackRate)
