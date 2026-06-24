@@ -926,15 +926,9 @@ impl Fmp4Muxer {
             (base_dts * self.audio_sample_rate as u64 + 500) / 1000
         };
         let scaled_duration = if is_video {
-            samples
-                .first()
-                .map(|s| s.duration as u64)
-                .unwrap_or(self.video_fps_den) as u32
+            self.video_fps_den as u32
         } else {
-            samples
-                .first()
-                .map(|s| s.duration as u64)
-                .unwrap_or(1024) as u32
+            self.audio_frame_duration_ticks()
         };
         let default_size = samples.first().map(|s| s.size).unwrap_or(0);
         let default_flags = if is_video { 0x01010000 } else { 0x02000000 };
