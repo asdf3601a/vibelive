@@ -147,6 +147,7 @@ impl HlsStreamState {
             self.fmp4_muxer.set_video_color_config(color_cfg);
         }
         self.init_written = false;
+        self.refresh_init_if_segment_open().await?;
         Ok(())
     }
 
@@ -154,14 +155,16 @@ impl HlsStreamState {
         self.fmp4_muxer.set_video_framerate(num, den);
     }
 
-    pub fn set_video_color_config(&mut self, cfg: fmp4::ColorConfig) {
+    pub async fn set_video_color_config(&mut self, cfg: fmp4::ColorConfig) -> anyhow::Result<()> {
         self.fmp4_muxer.set_video_color_config(cfg);
         self.init_written = false;
+        self.refresh_init_if_segment_open().await
     }
 
-    pub fn set_hdr_metadata(&mut self, hdr: fmp4::HdrMetadata) {
+    pub async fn set_hdr_metadata(&mut self, hdr: fmp4::HdrMetadata) -> anyhow::Result<()> {
         self.fmp4_muxer.set_hdr_metadata(hdr);
         self.init_written = false;
+        self.refresh_init_if_segment_open().await
     }
 
     pub async fn set_audio_config(
@@ -173,6 +176,7 @@ impl HlsStreamState {
         self.fmp4_muxer.set_audio_codec(codec);
         self.fmp4_muxer.set_audio_config(config.to_vec());
         self.init_written = false;
+        self.refresh_init_if_segment_open().await?;
         Ok(())
     }
 
@@ -347,6 +351,18 @@ impl HlsStreamState {
             }
         }
 
+        Ok(())
+    }
+
+    async fn refresh_init_if_segment_open(&mut self) -> anyhow::Result<()> {
+        // Codec/color/HDR config changes affect only init.mp4.  If a segment is
+        // already open, write the updated init immediately so the current
+        // segment is advertised with matching sample-entry metadata instead of
+        // waiting for a later rotation.
+        if self.current_file.is_some() {
+            self.write_init_segment().await?;
+            self.update_playlist().await?;
+        }
         Ok(())
     }
 

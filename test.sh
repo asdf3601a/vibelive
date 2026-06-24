@@ -252,7 +252,14 @@ run_color_test() {
     local args=(-y -re -f lavfi -i "testsrc=duration=10:size=640x360:rate=30" -f lavfi -i "sine=frequency=440:duration=10")
     args+=(-c:v "$encoder" -pix_fmt "$pix_fmt" -g 60 -keyint_min 60 -c:a aac -t 6 -f flv)
     [ -n "$profile" ] && args+=(-profile:v "$profile")
-    [ "$hdr" = "hdr" ] && args+=(-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc)
+    if [ "$hdr" = "hdr" ]; then
+        args+=(-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc)
+        if [ "$encoder" = "libx265" ]; then
+            # FFmpeg's Enhanced RTMP muxer emits hdrCll/hdrMdcv only when the
+            # encoder exposes content-light/mastering-display side data.
+            args+=(-x265-params "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400")
+        fi
+    fi
     [ "$encoder" = "libx265" ] && args+=(-preset ultrafast)
     [ "$encoder" = "libsvtav1" ] && args+=(-svtav1-params "preset=12:crf=35")
 
@@ -280,14 +287,36 @@ run_color_test() {
             local box_out
             box_out=$(python3 <<PYEOF
 import struct
+
 d = open("$tmp_init", 'rb').read()
-def fb(data, target, off=0):
-    while off + 8 <= len(data):
-        sz = struct.unpack('>I', data[off:off+4])[0]; tp = data[off+4:off+8]
-        if sz == 0 or off+sz > len(data): break
-        if tp == target: return (sz, data[off+8:off+sz])
-        if tp in (b'moov',b'trak',b'mdia',b'minf',b'stbl',b'stsd') and sz > 8:
-            r = fb(data, target, off+8); global __ret; __ret = r; if r: return r
+CONTAINERS = {b'moov', b'trak', b'mdia', b'minf', b'stbl'}
+SAMPLE_ENTRIES = {b'avc1', b'hvc1', b'hev1', b'av01'}
+
+def children_payload(data, off, size, typ):
+    if typ == b'stsd':
+        return off + 16, off + size  # skip FullBox header + entry_count
+    if typ in SAMPLE_ENTRIES:
+        return off + 86, off + size  # visual sample entry header
+    if typ in CONTAINERS:
+        return off + 8, off + size
+    return None
+
+def fb(data, target, start=0, end=None):
+    if end is None:
+        end = len(data)
+    off = start
+    while off + 8 <= end:
+        sz = struct.unpack('>I', data[off:off+4])[0]
+        typ = data[off+4:off+8]
+        if sz < 8 or off + sz > end:
+            break
+        if typ == target:
+            return (sz, data[off+8:off+sz])
+        child_range = children_payload(data, off, sz, typ)
+        if child_range:
+            r = fb(data, target, *child_range)
+            if r:
+                return r
         off += sz
     return None
 

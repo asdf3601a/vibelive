@@ -67,12 +67,12 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Writes `.m4s` segments (moof + mdat)
   - Maintains `index.m3u8` playlist
   - **Multitrack**: Each additional video track gets its own `track_N/` subdirectory with independent `init.mp4`, segments, and playlist. A `master.m3u8` references all available tracks.
-  - **init.mp4 timing**: `write_init_segment()` is called inside `rotate_segment()`, ensuring init.mp4 is written when the first segment is created (after both video and audio configs have typically arrived). Init is atomically written via `init.mp4.tmp` → `rename()`.
+  - **init.mp4 timing**: `write_init_segment()` is called inside `rotate_segment()`, ensuring init.mp4 is written when the first segment is created (after both video and audio configs have typically arrived). Codec, audio, color, and HDR config changes while a segment is open refresh the init file immediately so the active playlist map stays compatible with the current samples. Init is atomically written via `init.mp4.tmp` → `rename()`.
   - **Resolution**: `set_video_config()` receives actual width/height from RTMP metadata (defaults 1920×1080). `update_video_resolution()` updates the muxer dimensions only; resolution-only changes do not trigger an init rewrite.
 - **`hls/fmp4/mod.rs`** — Low-level fMP4 (CMAF) muxer:
   - Supports H.264, H.265 (HEVC), AV1 video + AAC, Opus, FLAC audio
   - Generates `init_segment()` (ftyp + moov), `flush_combined_fragment()` (moof + mdat)
-  - Uses Sample tables with duration computation, composition time offsets, and proper `trex` defaults
+  - Uses Sample tables with duration computation, composition time offsets, and proper `trex` defaults. Audio decode time is tracked in the codec media timescale for known fixed-frame codecs (AAC 1024-sample frames, Opus 960, FLAC 4096) so audio `tfdt.baseMediaDecodeTime` stays on the same sample grid as `tfhd.default_sample_duration` instead of being derived from rounded RTMP millisecond timestamps.
   - **HDR metadata passthrough**: Writes `colr` (nclx with color_primaries / transfer_characteristics / matrix_coefficients / full_range), `clli` (maxCLL / maxFALL), and `mdcv` (display primaries, white point, luminance) boxes into the video sample entry when HDR metadata is present via Enhanced RTMP (AMF0 `colorInfo` or binary FFmpeg format). AV1 color config is also extracted from codec configuration OBU.
 
 ### 3.3 Recording (`recording/`)
@@ -625,7 +625,7 @@ The project includes a unified test script `./test.sh` that covers codec compati
 |-------|-------------|
 | `codec` | Video + audio codec matrix (quick: 480p & 720p; full: all resolutions) |
 | `res` | Resolution matrix across all specified aspect ratios |
-| `color` | Color-space / HDR compatibility (HEVC & AV1, SDR & HDR) |
+| `color` | Color-space / HDR compatibility (HEVC & AV1, SDR & HDR). HEVC HDR test streams include x265 `master-display`/`max-cll` metadata so FFmpeg's Enhanced RTMP muxer can emit `hdrCll`/`hdrMdcv` for `clli`/`mdcv` validation. |
 | `graceful` | Graceful stop & HLS cleanup verification |
 | `reconnect` | Abnormal disconnect + reconnect grace period |
 | `hls` | Live HLS segment verification |

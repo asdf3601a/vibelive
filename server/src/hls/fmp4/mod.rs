@@ -62,7 +62,12 @@ pub struct Fmp4Muxer {
     audio_samples: Vec<Sample>,
     video_sequence_number: u32,
     video_base_dts: u64,
+    // For audio codecs with fixed frame durations, keep decode time in the
+    // audio media timescale (samples), not in RTMP milliseconds. AAC tfdt
+    // values must land on the 1024-sample grid; converting rounded RTMP ms
+    // back to samples produces offsets such as 29520432 % 1024 != 0.
     audio_base_dts: u64,
+    audio_next_dts: u64,
     audio_sample_rate: u32,
     video_fps_num: u64,
     video_fps_den: u64,
@@ -84,6 +89,7 @@ impl Fmp4Muxer {
             video_sequence_number: 0,
             video_base_dts: 0,
             audio_base_dts: 0,
+            audio_next_dts: 0,
             audio_sample_rate: 44100,
             video_fps_num: 30,
             video_fps_den: 1,
@@ -186,18 +192,30 @@ impl Fmp4Muxer {
         if data.is_empty() {
             return;
         }
+        let dts_ts = if self.audio_codec.is_some() {
+            self.audio_next_dts
+        } else {
+            // Unknown/legacy fallback keeps the old RTMP-ms based timeline so
+            // duration inference can still use timestamp deltas.
+            pts
+        };
         if self.audio_samples.is_empty() {
-            self.audio_base_dts = pts;
+            self.audio_base_dts = dts_ts;
         }
         let size = data.len() as u32;
         self.audio_samples.push(Sample {
             data: data.into_owned(),
-            dts: pts,
+            dts: dts_ts,
             size,
             duration: 0,
             flags: 0,
             composition_time_offset: 0,
         });
+        if self.audio_codec.is_some() {
+            self.audio_next_dts = self
+                .audio_next_dts
+                .saturating_add(self.audio_frame_duration_ticks() as u64);
+        }
     }
 
     pub fn last_video_sample_duration(&self) -> u64 {
@@ -233,18 +251,16 @@ impl Fmp4Muxer {
                 // misreading FFmpeg's TOC bytes.
                 960
             }
+            Some(AudioCodec::Flac) => 4096,
             _ => {
                 if self.audio_samples.len() > 1 {
                     let total = self.audio_samples.last().unwrap().dts
                         - self.audio_samples.first().unwrap().dts;
                     let cnt = self.audio_samples.len() as u64 - 1;
-                    ((total * self.audio_sample_rate as u64 + (cnt * 1000) / 2)
-                        / (cnt * 1000)) as u32
+                    ((total * self.audio_sample_rate as u64 + (cnt * 1000) / 2) / (cnt * 1000))
+                        as u32
                 } else {
-                    match self.audio_codec {
-                        Some(AudioCodec::Flac) => 4096,
-                        _ => 1024,
-                    }
+                    1024
                 }
             }
         }
@@ -919,9 +935,12 @@ impl Fmp4Muxer {
     ) {
         let is_video = track_id == 1;
         let is_opus_audio = !is_video && self.audio_codec == Some(AudioCodec::Opus);
-        // Video and audio DTS are both in ms — convert to respective timescales.
+        // Video DTS is stored in ms. Known audio codecs store DTS directly in
+        // the audio media timescale so tfdt stays on the codec frame grid.
         let scaled_base_dts = if is_video {
             (base_dts * self.video_fps_num + 500) / 1000
+        } else if self.audio_codec.is_some() {
+            base_dts
         } else {
             (base_dts * self.audio_sample_rate as u64 + 500) / 1000
         };
@@ -1227,9 +1246,12 @@ mod tests {
         ))
     }
 
-    /// Walk ISOBMFF box hierarchy to find a trun within a traf within a moof,
-    /// and return the `sample_count` field.
-    fn get_trun_sample_count(frag: &[u8], traf_index: usize) -> u32 {
+    /// Walk ISOBMFF box hierarchy to find a child box within a traf within a moof.
+    fn find_traf_child<'a>(
+        frag: &'a [u8],
+        traf_index: usize,
+        child: &[u8; 4],
+    ) -> (usize, usize, usize, &'a [u8]) {
         let (_type, moof_size, moof_data, _) = parse_box(frag, 0).unwrap();
         assert_eq!(_type, b"moof");
         let moof_end = moof_size;
@@ -1242,14 +1264,9 @@ mod tests {
                     let traf_end = off + bsize;
                     let mut inner = bdata;
                     while inner < traf_end {
-                        let (it, isize, idata, _) = parse_box(frag, inner).unwrap();
-                        if it == b"trun" {
-                            return u32::from_be_bytes([
-                                frag[idata + 4],
-                                frag[idata + 5],
-                                frag[idata + 6],
-                                frag[idata + 7],
-                            ]);
+                        let (it, isize, idata, idata_len) = parse_box(frag, inner).unwrap();
+                        if it == child {
+                            return (inner, isize, idata, &frag[idata..idata + idata_len]);
                         }
                         inner += isize;
                     }
@@ -1258,7 +1275,33 @@ mod tests {
             }
             off += bsize;
         }
-        panic!("trun not found in traf[{}]", traf_index);
+        panic!(
+            "{} not found in traf[{}]",
+            String::from_utf8_lossy(child),
+            traf_index
+        );
+    }
+
+    /// Walk ISOBMFF box hierarchy to find a trun within a traf within a moof,
+    /// and return the `sample_count` field.
+    fn get_trun_sample_count(frag: &[u8], traf_index: usize) -> u32 {
+        let (_, _, _, trun_data) = find_traf_child(frag, traf_index, b"trun");
+        u32::from_be_bytes([trun_data[4], trun_data[5], trun_data[6], trun_data[7]])
+    }
+
+    fn get_tfdt_base(frag: &[u8], traf_index: usize) -> u64 {
+        let (_, _, _, tfdt_data) = find_traf_child(frag, traf_index, b"tfdt");
+        assert_eq!(tfdt_data[0], 1, "tfdt should be version 1");
+        u64::from_be_bytes([
+            tfdt_data[4],
+            tfdt_data[5],
+            tfdt_data[6],
+            tfdt_data[7],
+            tfdt_data[8],
+            tfdt_data[9],
+            tfdt_data[10],
+            tfdt_data[11],
+        ])
     }
 
     #[test]
@@ -1518,6 +1561,29 @@ mod tests {
         let frag = muxer.flush_combined_fragment().unwrap();
         assert!(frag.windows(4).any(|w| w == b"moof"));
         assert!(frag.windows(4).any(|w| w == b"mdat"));
+    }
+
+    #[test]
+    fn test_aac_tfdt_stays_on_1024_sample_grid_across_fragments() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Aac);
+        muxer.set_audio_config(vec![0x11, 0x90]); // AAC-LC, 48kHz, stereo
+
+        // These are typical RTMP millisecond timestamps for exact 1024-sample
+        // AAC frames at 48kHz.  Converting each ms timestamp back to samples
+        // would produce 1008, 2064, ... and eventually non-1024-aligned tfdt.
+        muxer.add_audio_sample(vec![0xAF, 0x01].into(), 0);
+        muxer.add_audio_sample(vec![0xAF, 0x02].into(), 21);
+        muxer.add_audio_sample(vec![0xAF, 0x03].into(), 43);
+        let frag0 = muxer.flush_combined_fragment().unwrap();
+        assert_eq!(get_tfdt_base(&frag0, 0), 0);
+
+        muxer.add_audio_sample(vec![0xAF, 0x04].into(), 64);
+        muxer.add_audio_sample(vec![0xAF, 0x05].into(), 85);
+        let frag1 = muxer.flush_combined_fragment().unwrap();
+        let base = get_tfdt_base(&frag1, 0);
+        assert_eq!(base, 3 * 1024);
+        assert_eq!(base % 1024, 0);
     }
 
     #[test]

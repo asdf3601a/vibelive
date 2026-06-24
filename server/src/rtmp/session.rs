@@ -1264,13 +1264,15 @@ async fn handle_video_data(
                                         Some(
                                             crate::rtmp::enhanced::VideoPacketType::Metadata,
                                         ) => {
-                                            hls.set_video_color_config(
-                                                parse_enhanced_color_config(track.payload),
-                                            );
+                                            let _ = hls
+                                                .set_video_color_config(
+                                                    parse_enhanced_color_config(track.payload),
+                                                )
+                                                .await;
                                             if let Some(hdr) =
                                                 parse_enhanced_hdr_metadata(track.payload)
                                             {
-                                                hls.set_hdr_metadata(hdr);
+                                                let _ = hls.set_hdr_metadata(hdr).await;
                                             }
                                         }
                                         _ => {
@@ -1307,13 +1309,15 @@ async fn handle_video_data(
                                         Some(
                                             crate::rtmp::enhanced::VideoPacketType::Metadata,
                                         ) => {
-                                            track_state.set_video_color_config(
-                                                parse_enhanced_color_config(track.payload),
-                                            );
+                                            let _ = track_state
+                                                .set_video_color_config(
+                                                    parse_enhanced_color_config(track.payload),
+                                                )
+                                                .await;
                                             if let Some(hdr) =
                                                 parse_enhanced_hdr_metadata(track.payload)
                                             {
-                                                track_state.set_hdr_metadata(hdr);
+                                                let _ = track_state.set_hdr_metadata(hdr).await;
                                             }
                                         }
                                         _ => {
@@ -1383,15 +1387,19 @@ async fn handle_video_data(
                 }
                 crate::rtmp::enhanced::VideoPacketType::Metadata => {
                     if let Some(ref mut hls) = ctx.hls_state {
-                        hls.set_video_color_config(parse_enhanced_color_config(remainder));
+                        let _ = hls
+                            .set_video_color_config(parse_enhanced_color_config(remainder))
+                            .await;
                         if let Some(hdr) = parse_enhanced_hdr_metadata(remainder) {
-                            hls.set_hdr_metadata(hdr);
+                            let _ = hls.set_hdr_metadata(hdr).await;
                         }
                     }
                     for track_state in ctx.track_states.values_mut() {
-                        track_state.set_video_color_config(parse_enhanced_color_config(remainder));
+                        let _ = track_state
+                            .set_video_color_config(parse_enhanced_color_config(remainder))
+                            .await;
                         if let Some(hdr) = parse_enhanced_hdr_metadata(remainder) {
-                            track_state.set_hdr_metadata(hdr);
+                            let _ = track_state.set_hdr_metadata(hdr).await;
                         }
                     }
                 }
