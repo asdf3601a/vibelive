@@ -62,12 +62,7 @@ pub struct Fmp4Muxer {
     audio_samples: Vec<Sample>,
     video_sequence_number: u32,
     video_base_dts: u64,
-    // For audio codecs with fixed frame durations, keep decode time in the
-    // audio media timescale (samples), not in RTMP milliseconds. AAC tfdt
-    // values must land on the 1024-sample grid; converting rounded RTMP ms
-    // back to samples produces offsets such as 29520432 % 1024 != 0.
     audio_base_dts: u64,
-    audio_next_dts: u64,
     audio_sample_rate: u32,
     video_fps_num: u64,
     video_fps_den: u64,
@@ -89,7 +84,6 @@ impl Fmp4Muxer {
             video_sequence_number: 0,
             video_base_dts: 0,
             audio_base_dts: 0,
-            audio_next_dts: 0,
             audio_sample_rate: 44100,
             video_fps_num: 30,
             video_fps_den: 1,
@@ -192,30 +186,18 @@ impl Fmp4Muxer {
         if data.is_empty() {
             return;
         }
-        let dts_ts = if self.audio_codec.is_some() {
-            self.audio_next_dts
-        } else {
-            // Unknown/legacy fallback keeps the old RTMP-ms based timeline so
-            // duration inference can still use timestamp deltas.
-            pts
-        };
         if self.audio_samples.is_empty() {
-            self.audio_base_dts = dts_ts;
+            self.audio_base_dts = pts;
         }
         let size = data.len() as u32;
         self.audio_samples.push(Sample {
             data: data.into_owned(),
-            dts: dts_ts,
+            dts: pts,
             size,
             duration: 0,
             flags: 0,
             composition_time_offset: 0,
         });
-        if self.audio_codec.is_some() {
-            self.audio_next_dts = self
-                .audio_next_dts
-                .saturating_add(self.audio_frame_duration_ticks() as u64);
-        }
     }
 
     pub fn last_video_sample_duration(&self) -> u64 {
@@ -935,14 +917,24 @@ impl Fmp4Muxer {
     ) {
         let is_video = track_id == 1;
         let is_opus_audio = !is_video && self.audio_codec == Some(AudioCodec::Opus);
-        // Video DTS is stored in ms. Known audio codecs store DTS directly in
-        // the audio media timescale so tfdt stays on the codec frame grid.
+        // Video and audio DTS are stored in ms. Convert to each track's media
+        // timescale; for fixed-frame audio, snap tfdt onto the codec frame grid
+        // so a rounded RTMP timestamp cannot produce e.g. AAC tfdt % 1024 != 0.
         let scaled_base_dts = if is_video {
             (base_dts * self.video_fps_num + 500) / 1000
-        } else if self.audio_codec.is_some() {
-            base_dts
         } else {
-            (base_dts * self.audio_sample_rate as u64 + 500) / 1000
+            let scaled = (base_dts * self.audio_sample_rate as u64 + 500) / 1000;
+            match self.audio_codec {
+                Some(AudioCodec::Aac) | Some(AudioCodec::Opus) => {
+                    let frame = self.audio_frame_duration_ticks() as u64;
+                    if frame > 0 {
+                        ((scaled + frame / 2) / frame) * frame
+                    } else {
+                        scaled
+                    }
+                }
+                _ => scaled,
+            }
         };
         let scaled_duration = if is_video {
             self.video_fps_den as u32

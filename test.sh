@@ -7,7 +7,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 PASS=0; WARN=0; FAIL=0
 
 MEDIA_DIR="./data"
-REPORT_DIR="$MEDIA_DIR/test_reports"
+REPORT_DIR="${TEST_REPORT_DIR:-/tmp/livestream_test_reports}"
 API_BASE="http://localhost:8080"
 RTMP_BASE="rtmp://localhost:1935/live"
 
@@ -19,7 +19,7 @@ if [ -f .env ]; then set -a; source .env; set +a; fi
 VIDEO_CODECS="h264 hevc av1"
 AUDIO_CODECS="aac opus flac"
 RESOLUTIONS="240p 480p 720p 1080p 2k 4k 8k"
-TESTS="codec color graceful reconnect hls multitrack"
+TESTS="codec res color graceful reconnect hls multitrack thumbnail passthrough"
 FULL_MATRIX=0
 DEFAULT_RES="480p"
 DEFAULT_VCODEC="h264"
@@ -28,17 +28,22 @@ STREAM_DURATION=6
 ASPECTS="16:9"
 GRACE_WAIT=""
 FPS_VALUES="24000/1001 24 25 30000/1001 30 50 60000/1001 60"
+THUMBNAIL_FORMATS="jxl avif png"
+THUMBNAIL_WIDTHS=$(echo "${THUMBNAIL_SIZES:-320,480}" | tr ',' ' ')
 
 show_help() { cat <<'EOF'
 Usage: ./test.sh [OPTIONS]
 
 Test suites:
   codec       – video+audio codec matrix (quick: 480p only; --full: all res)
+  res         – resolution/aspect matrix with the default codec pair
   color       – color-space / HDR compatibility + colr/clli/mdcv box validation
   graceful    – graceful stop & HLS cleanup
   reconnect   – abnormal disconnect + reconnect
   hls         – live HLS segment verification
   multitrack  – Enhanced RTMP multitrack (2 video + 2 audio)
+  thumbnail   – live + recording thumbnail generation (JXL, AVIF, PNG)
+  passthrough – audio byte-exact + video similarity after RTMP copy passthrough
   fps         – NTSC/PAL frame rate consistency (NOT in 'all')
   all         – all suites EXCEPT fps
 
@@ -47,7 +52,7 @@ Options:
   --audio LIST     Audio codecs: aac,opus,flac (default: all)
   --res LIST       Resolutions (default: 240p..8k)
   --aspect LIST    Aspect ratios (default: 16:9)
-  --tests LIST     Test suites to run (default: codec color graceful reconnect hls multitrack)
+  --tests LIST     Test suites to run (default: codec res color graceful reconnect hls multitrack thumbnail passthrough)
   --full           Full Cartesian product for codec/color
   --duration N     Stream duration in seconds (default: 6)
   --grace-wait N   Max seconds for HLS cleanup (default: STREAM_GRACE_PERIOD_SECONDS+5)
@@ -91,6 +96,124 @@ get_display() {
 api_call() { curl -s "${API_BASE}$1"; }
 
 count_recordings() { ls "$MEDIA_DIR/recordings/" 2>/dev/null | grep -c "^${1}_" 2>/dev/null || true; }
+
+wait_for_recording() {
+    local key="$1" timeout="${2:-20}" waited=0 rec=""
+    while [ "$waited" -le "$timeout" ]; do
+        rec=$(ls "$MEDIA_DIR/recordings/${key}_"*.mp4 2>/dev/null | head -1 || true)
+        if [ -n "$rec" ] && [ -s "$rec" ]; then echo "$rec"; return 0; fi
+        sleep 1; waited=$((waited+1))
+    done
+    return 1
+}
+
+wait_for_hls_segment() {
+    local key="$1" timeout="${2:-30}" waited=0 hls_dir="$MEDIA_DIR/hls/$key" seg_count=0
+    while [ "$waited" -le "$timeout" ]; do
+        if [ -d "$hls_dir" ] && [ -f "$hls_dir/index.m3u8" ]; then
+            seg_count=$(find "$hls_dir" -maxdepth 1 -name 'segment*.m4s' 2>/dev/null | wc -l)
+            if [ "$seg_count" -gt 0 ]; then echo "$seg_count"; return 0; fi
+        fi
+        sleep 1; waited=$((waited+1))
+    done
+    return 1
+}
+
+expected_vcodec_name() { case "$1" in h264) echo h264;; hevc) echo hevc;; av1) echo av1;; *) echo "$1";; esac; }
+expected_acodec_name() { case "$1" in aac) echo aac;; opus) echo opus;; flac) echo flac;; *) echo "$1";; esac; }
+
+verify_media_properties() {
+    local media="$1" exp_v="${2:-}" exp_a="${3:-}" exp_size="${4:-}"
+    python3 - "$media" "$exp_v" "$exp_a" "$exp_size" <<'PYEOF'
+import json, subprocess, sys
+media, exp_v, exp_a, exp_size = sys.argv[1:5]
+cmd = ['ffprobe', '-v', 'error', '-show_streams', '-of', 'json', media]
+try:
+    info = json.loads(subprocess.check_output(cmd, text=True))
+except Exception as e:
+    print(f'  ✗ ffprobe stream metadata failed: {e}')
+    sys.exit(1)
+streams = info.get('streams', [])
+video = next((s for s in streams if s.get('codec_type') == 'video'), None)
+audio = next((s for s in streams if s.get('codec_type') == 'audio'), None)
+ok = True
+if exp_v:
+    if not video:
+        print(f'  ✗ missing video stream (expected {exp_v})'); ok = False
+    elif video.get('codec_name') != exp_v:
+        print(f"  ✗ video codec {video.get('codec_name')} != {exp_v}"); ok = False
+    else:
+        print(f"  ✓ video codec {exp_v}")
+if exp_a:
+    if not audio:
+        print(f'  ✗ missing audio stream (expected {exp_a})'); ok = False
+    elif audio.get('codec_name') != exp_a:
+        print(f"  ✗ audio codec {audio.get('codec_name')} != {exp_a}"); ok = False
+    else:
+        print(f"  ✓ audio codec {exp_a}")
+if exp_size and video:
+    try:
+        ew, eh = map(int, exp_size.lower().split('x', 1))
+        aw, ah = int(video.get('width', 0)), int(video.get('height', 0))
+        if (aw, ah) != (ew, eh):
+            print(f'  ✗ resolution {aw}x{ah} != {ew}x{eh}'); ok = False
+        else:
+            print(f'  ✓ resolution {aw}x{ah}')
+    except Exception as e:
+        print(f'  ⚠ resolution check skipped: {e}')
+print('MEDIA_PROPS_OK' if ok else 'MEDIA_PROPS_FAIL')
+sys.exit(0 if ok else 1)
+PYEOF
+}
+
+check_thumbnail_set() {
+    local dir="$1" prefix="$2" timeout="${3:-30}" waited=0
+    while [ "$waited" -le "$timeout" ]; do
+        local ok=1 missing=()
+        for width in $THUMBNAIL_WIDTHS; do
+            for fmt in $THUMBNAIL_FORMATS; do
+                local p="$dir/${prefix}_w${width}.${fmt}"
+                if [ ! -s "$p" ]; then ok=0; missing+=("w${width}.${fmt}"); fi
+            done
+        done
+        if [ "$ok" -eq 1 ]; then
+            for width in $THUMBNAIL_WIDTHS; do
+                local found=""
+                for fmt in $THUMBNAIL_FORMATS; do found+=" w${width}.${fmt}"; done
+                echo -e "${GREEN}  ✓ thumbnails:${found}${NC}"
+            done
+            return 0
+        fi
+        sleep 1; waited=$((waited+1))
+    done
+    echo -e "${RED}  ✗ missing thumbnails for ${prefix}: ${missing[*]}${NC}"
+    return 1
+}
+
+check_video_similarity() {
+    local ref="$1" rec="$2" threshold="${3:-0.98}" out ssim
+    out=$(ffmpeg -hide_banner -v info -i "$ref" -i "$rec" \
+        -filter_complex "[0:v]fps=15,scale=320:-2,setpts=PTS-STARTPTS[ref];[1:v]fps=15,scale=320:-2,setpts=PTS-STARTPTS[dist];[ref][dist]ssim" \
+        -frames:v 60 -an -f null - 2>&1) || true
+    ssim=$(echo "$out" | grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2)
+    if [ -z "$ssim" ]; then
+        echo -e "${RED}  ✗ video similarity: SSIM unavailable${NC}"
+        echo "$out" | tail -5 | sed 's/^/    /'
+        return 1
+    fi
+    echo "  Video SSIM: $ssim"
+    if python3 - "$ssim" "$threshold" <<'PYEOF'
+import sys
+ssim = float(sys.argv[1]); threshold = float(sys.argv[2])
+sys.exit(0 if ssim >= threshold else 1)
+PYEOF
+    then
+        echo -e "${GREEN}  ✓ video similarity >= ${threshold}${NC}"
+        return 0
+    fi
+    echo -e "${RED}  ✗ video similarity below ${threshold}${NC}"
+    return 1
+}
 
 # ── MP4 integrity + stts check ────────────────────────────────────
 check_mp4() {
@@ -168,11 +291,9 @@ PYEOF
     return 0
 }
 
-find_thumbnail() { local key="$1"; find "$MEDIA_DIR/thumbnails/recordings" -name "${key}_*.mp4_w*.webp" 2>/dev/null | head -1; }
-
 # ── Core stream test ──────────────────────────────────────────────
 run_stream_test() {
-    local name="$1" vcodec_raw="$2" acodec_raw="$3" size="$4" key="$5" check_hls="${6:-0}"
+    local name="$1" vcodec_raw="$2" acodec_raw="$3" size="$4" key="$5" check_hls="${6:-0}" exp_v="${7:-}" exp_a="${8:-}"
     echo ""; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "Test: $name"; echo "Key:  $key"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -191,29 +312,33 @@ run_stream_test() {
     local ff_pid=$!
 
     if [ "$check_hls" -eq 1 ]; then
-        sleep 3; local hls_dir="$MEDIA_DIR/hls/$key"
-        if [ -d "$hls_dir" ] && [ -f "$hls_dir/index.m3u8" ]; then
-            local seg_count; seg_count=$(ls -1 "$hls_dir"/*.ts 2>/dev/null | wc -l)
-            echo -e "${GREEN}  ✓ HLS active ($seg_count segs)${NC}"
+        local seg_count=""
+        if seg_count=$(wait_for_hls_segment "$key" 20); then
+            echo -e "${GREEN}  ✓ HLS active ($seg_count m4s segs)${NC}"
+            api_call "/api/streams" >/dev/null || true
         else echo -e "${YELLOW}  ⚠ HLS not yet available${NC}"; fi
     fi
-    wait $ff_pid 2>/dev/null || true; sleep 5
+    wait $ff_pid 2>/dev/null || true
 
-    local mp4_count; mp4_count=$(count_recordings "$key")
+    local rec="" mp4_count; rec=$(wait_for_recording "$key" 20 || true); mp4_count=$(count_recordings "$key")
     local result="FAIL"; local result_color="$RED"
 
-    if [ "$mp4_count" -gt 0 ]; then
+    if [ "$mp4_count" -gt 0 ] && [ -n "$rec" ]; then
         echo -e "${GREEN}  ✓ Recording generated ($mp4_count file(s))${NC}"
-        local thumb; thumb=$(find_thumbnail "$key")
-        [ -n "$thumb" ] && echo -e "${GREEN}  ✓ Thumbnails found${NC}" || echo -e "${YELLOW}  ⚠ No thumbnails${NC}"
         [ -f "$MEDIA_DIR/recordings/index.json" ] && echo -e "${GREEN}  ✓ index.json${NC}" || echo -e "${YELLOW}  ⚠ index.json not found${NC}"
 
         local ok=1
         for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do
-            [ -f "$f" ] && check_mp4 "$f" "$key" 15 || ok=0
+            if [ -f "$f" ]; then
+                check_mp4 "$f" "$key" 15 || ok=0
+                if [ -n "$exp_v" ] || [ -n "$exp_a" ]; then
+                    verify_media_properties "$f" "$exp_v" "$exp_a" "$size" || ok=0
+                fi
+                check_thumbnail_set "$MEDIA_DIR/thumbnails/recordings" "$(basename "$f")" 30 || ok=0
+            fi
         done
         [ "$ok" -eq 1 ] && { result="PASS"; result_color="$GREEN"; }
-    else echo -e "${RED}  ✗ No recording generated${NC}"; FAIL=$((FAIL+1))
+    else echo -e "${RED}  ✗ No recording generated${NC}"
     fi
     echo -e "${result_color}  ● Result: $result${NC}"
     echo "$key|$result" >> "$RESULTS_FILE"
@@ -232,8 +357,25 @@ run_codec_matrix() {
                 local vargs=$(get_vcodec_args "$v"); local aargs=$(get_acodec_args "$a")
                 local vd=$(get_display "$v"); local ad=$(get_display "$a")
                 local key="codec_${v}_${a}_${r}_$(date +%s)"
-                run_stream_test "${vd}+${ad}@${r}" "$vargs" "$aargs" "$size" "$key" 0
+                run_stream_test "${vd}+${ad}@${r}" "$vargs" "$aargs" "$size" "$key" 0 "$(expected_vcodec_name "$v")" "$(expected_acodec_name "$a")"
             done
+        done
+    done
+}
+
+# ── Resolution / aspect matrix ────────────────────────────────────
+run_resolution_matrix() {
+    echo "========== RESOLUTION / ASPECT MATRIX =========="
+    local vargs=$(get_vcodec_args "$DEFAULT_VCODEC")
+    local aargs=$(get_acodec_args "$DEFAULT_ACODEC")
+    local vd=$(get_display "$DEFAULT_VCODEC")
+    local ad=$(get_display "$DEFAULT_ACODEC")
+    for asp in $ASPECTS; do
+        for r in $RESOLUTIONS; do
+            local size=$(res_and_aspect_to_size "$r" "$asp")
+            local safe_asp=${asp//:/x}
+            local key="res_${DEFAULT_VCODEC}_${DEFAULT_ACODEC}_${r}_${safe_asp}_$(date +%s)"
+            run_stream_test "${vd}+${ad}@${r}/${asp}" "$vargs" "$aargs" "$size" "$key" 0 "$(expected_vcodec_name "$DEFAULT_VCODEC")" "$(expected_acodec_name "$DEFAULT_ACODEC")"
         done
     done
 }
@@ -264,25 +406,29 @@ run_color_test() {
     [ "$encoder" = "libsvtav1" ] && args+=(-svtav1-params "preset=12:crf=35")
 
     ffmpeg "${args[@]}" "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
-    local ff_pid=$!; wait $ff_pid 2>/dev/null || true; sleep 5
+    local ff_pid=$!; wait $ff_pid 2>/dev/null || true
 
-    local mp4_count=$(count_recordings "$key")
+    local mp4_path="" mp4_count=0
+    mp4_path=$(wait_for_recording "$key" 20 || true)
+    mp4_count=$(count_recordings "$key")
     local result="FAIL" result_color="$RED" ok=1
     [ "$mp4_count" -gt 0 ] && echo -e "${GREEN}  ✓ Recording ($mp4_count file(s))${NC}" || ok=0
 
-    local mp4_path=""
+    if [ "$ok" -eq 1 ] && [ -z "$mp4_path" ]; then ok=0; fi
     if [ "$ok" -eq 1 ]; then
-        for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do [ -f "$f" ] && mp4_path="$f"; done
-        [ -n "$mp4_path" ] && check_mp4 "$mp4_path" "$key" 15 || ok=0
+        check_mp4 "$mp4_path" "$key" 15 || ok=0
     fi
-
-    if [ "$ok" -eq 1 ] && [ -n "$mp4_path" ]; then
+    if [ "$ok" -eq 1 ]; then
         local color_info; color_info=$(extract_color_info "$mp4_path")
         echo "  Color info:"; echo "$color_info" | sed 's/^/    /'
 
         # Check init.mp4 for colr/clli/mdcv on HDR streams
         local hls_dir="$MEDIA_DIR/hls/$key"
-        if [ "$hdr" = "hdr" ] && [ -f "$hls_dir/init.mp4" ]; then
+        if [ "$hdr" = "hdr" ]; then
+            if [ ! -f "$hls_dir/init.mp4" ]; then
+                echo -e "${RED}  ✗ HDR validation requires $hls_dir/init.mp4${NC}"
+                ok=0
+            else
             local tmp_init; tmp_init=$(mktemp); cp "$hls_dir/init.mp4" "$tmp_init" 2>/dev/null || true
             local box_out
             box_out=$(python3 <<PYEOF
@@ -337,14 +483,18 @@ PYEOF
             if echo "$box_out" | grep -q "^HDR_OK$"; then
                 echo -e "${GREEN}  ✓ HDR boxes (colr/clli/mdcv) present in init.mp4${NC}"
             else
-                echo -e "${YELLOW}  ⚠ HDR boxes absent (encoder may not send Enhanced RTMP Metadata)${NC}"
+                echo -e "${RED}  ✗ HDR boxes absent or incomplete in init.mp4${NC}"
+                ok=0
+            fi
             fi
         fi
 
-        if [ "$expected" = "WARN" ]; then
-            result="WARN"; result_color="$YELLOW"
-        else
-            result="PASS"; result_color="$GREEN"
+        if [ "$ok" -eq 1 ]; then
+            if [ "$expected" = "WARN" ]; then
+                result="WARN"; result_color="$YELLOW"
+            else
+                result="PASS"; result_color="$GREEN"
+            fi
         fi
     else
         echo -e "${RED}  ✗ No recording or integrity failed${NC}"
@@ -364,9 +514,9 @@ run_color_matrix() {
     run_color_test "H.264 NV12 8-bit SDR"       libx264   nv12        ""      sdr  PASS
     run_color_test "H.264 4:2:0 10-bit SDR"     libx264   yuv420p10le ""      sdr  WARN
     run_color_test "HEVC 4:2:0 10-bit SDR"       libx265   yuv420p10le ""      sdr  PASS
-    run_color_test "HEVC 4:2:0 10-bit HDR"       libx265  yuv420p10le ""      hdr  WARN
+    run_color_test "HEVC 4:2:0 10-bit HDR"       libx265  yuv420p10le ""      hdr  PASS
     run_color_test "AV1 4:2:0 10-bit SDR"        libsvtav1 yuv420p10le ""     sdr  PASS
-    run_color_test "AV1 4:2:0 10-bit HDR"        libsvtav1 yuv420p10le ""     hdr  WARN
+    run_color_test "AV1 4:2:0 10-bit HDR"        libsvtav1 yuv420p10le ""     hdr  PASS
 }
 
 # ── Graceful stop ─────────────────────────────────────────────────
@@ -437,24 +587,26 @@ run_hls_test() {
     echo "========== HLS / E2E STREAMING =========="
     local key="hls_$(date +%s)" size="640x360"
     local vargs=$(get_vcodec_args "h264"); local aargs=$(get_acodec_args "aac")
-    run_stream_test "H.264+AAC@360p" "$vargs" "$aargs" "$size" "$key" 1
+    run_stream_test "H.264+AAC@360p" "$vargs" "$aargs" "$size" "$key" 1 h264 aac
 }
 
 # ── Multitrack ────────────────────────────────────────────────────
 run_multitrack_test() {
     echo "========== MULTITRACK ENHANCED RTMP =========="
-    local key="multitrack_$(date +%s)"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "Multitrack (2v+2a)"; echo "Key: $key"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    local key="multitrack_$(date +%s)" duration="$STREAM_DURATION"
+    [ "$duration" -lt 12 ] 2>/dev/null && duration=12
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "Multitrack (2v+2a)"; echo "Key: $key"; echo "Duration: ${duration}s"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    ffmpeg -y -re -f lavfi -i "testsrc=duration=${STREAM_DURATION}:size=1280x720:rate=30" -f lavfi -i "testsrc=duration=${STREAM_DURATION}:size=640x360:rate=30" \
-        -f lavfi -i "sine=frequency=440:duration=${STREAM_DURATION}" -f lavfi -i "sine=frequency=880:duration=${STREAM_DURATION}" \
+    ffmpeg -y -re -f lavfi -i "testsrc=duration=${duration}:size=1280x720:rate=30" -f lavfi -i "testsrc=duration=${duration}:size=640x360:rate=30" \
+        -f lavfi -i "sine=frequency=440:duration=${duration}" -f lavfi -i "sine=frequency=880:duration=${duration}" \
         -map 0:v -c:v:0 libsvtav1 -svtav1-params preset=12 -pix_fmt:v:0 yuv420p -b:v:0 1500k -g:v:0 60 -keyint_min:v:0 60 \
         -map 1:v -c:v:1 libx264 -preset:v:1 ultrafast -pix_fmt:v:1 yuv420p -b:v:1 500k -g:v:1 60 -keyint_min:v:1 60 \
         -map 2:a -c:a:0 libopus -ar:a:0 48000 -b:a:0 128k -map 3:a -c:a:1 aac -ar:a:1 44100 -b:a:1 128k \
         -f flv "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
     local ffmpeg_pid=$!; sleep 1
     if ! kill -0 "$ffmpeg_pid" 2>/dev/null; then echo -e "${RED}  ✗ ffmpeg failed to start${NC}"; echo "$key|FAIL" >> "$RESULTS_FILE"; FAIL=$((FAIL+1)); return; fi
-    sleep 8
+    wait_for_hls_segment "$key" 30 >/dev/null || true
+    sleep 2
 
     local result="FAIL" result_color="$RED" hls_dir="$MEDIA_DIR/hls/$key"
     local hls_ok=1 fmp4_ok=1 codec_ok=1 rec_ok=1
@@ -480,6 +632,11 @@ run_multitrack_test() {
             cat "$init_dir/init.mp4" "${segments[0]}" > "$tmp_c"
             if ffprobe -hide_banner -loglevel error -show_format -show_streams "$tmp_c" >/dev/null 2>&1; then
                 echo -e "${GREEN}  ✓ $label fMP4 valid${NC}"
+                if [ "$label" = "default" ]; then
+                    verify_media_properties "$tmp_c" av1 opus "" || codec_ok=0
+                else
+                    verify_media_properties "$tmp_c" h264 aac "" || codec_ok=0
+                fi
             else echo -e "${RED}  ✗ $label fMP4 invalid${NC}"; fmp4_ok=0; fi
         fi
     done; rm -f "$tmp_c"
@@ -498,14 +655,26 @@ for s in d:
     if kill -0 "$ffmpeg_pid" 2>/dev/null; then kill "$ffmpeg_pid" 2>/dev/null || true; wait "$ffmpeg_pid" 2>/dev/null || true; fi; sleep 5
 
     local rec_count; rec_count=$(find "$MEDIA_DIR/recordings" -name "${key}_*.mp4" 2>/dev/null | wc -l) || rec_count=0
-    [ "$rec_count" -eq 0 ] && { echo -e "${RED}  ✗ No recording${NC}"; rec_ok=0; } || echo -e "${GREEN}  ✓ Recording ($rec_count)${NC}"
-    [ "$rec_count" -eq 1 ] && echo -e "${GREEN}  ✓ Exactly 1 recording${NC}" || [ "$rec_count" -gt 0 ] && { echo -e "${YELLOW}  ⚠ Expected 1 recording, found $rec_count${NC}"; }
+    if [ "$rec_count" -eq 0 ]; then
+        echo -e "${RED}  ✗ No recording${NC}"; rec_ok=0
+    else
+        echo -e "${GREEN}  ✓ Recording ($rec_count)${NC}"
+        if [ "$rec_count" -eq 1 ]; then
+            echo -e "${GREEN}  ✓ Exactly 1 recording${NC}"
+        else
+            echo -e "${YELLOW}  ⚠ Expected 1 recording, found $rec_count${NC}"
+        fi
+    fi
 
     for f in "$MEDIA_DIR/recordings/${key}_"*.mp4; do
-        [ -f "$f" ] && check_mp4 "$f" "$key" 30 || rec_ok=0
+        if [ -f "$f" ]; then
+            check_mp4 "$f" "$key" 30 || rec_ok=0
+            verify_media_properties "$f" av1 opus "1280x720" || rec_ok=0
+            check_thumbnail_set "$MEDIA_DIR/thumbnails/recordings" "$(basename "$f")" 30 || rec_ok=0
+        fi
     done
 
-    [ "$hls_ok" -eq 1 ] && [ "$fmp4_ok" -eq 1 ] && [ "$rec_ok" -eq 1 ] && { result="PASS"; result_color="$GREEN"; }
+    [ "$hls_ok" -eq 1 ] && [ "$fmp4_ok" -eq 1 ] && [ "$codec_ok" -eq 1 ] && [ "$rec_ok" -eq 1 ] && { result="PASS"; result_color="$GREEN"; }
     echo -e "${result_color}  ● Result: $result${NC}"; echo "$key|$result" >> "$RESULTS_FILE"
     [ "$result" = "PASS" ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
 }
@@ -574,14 +743,15 @@ print(f"Report: {op}")
 PYEOF
 }
 
-# ── Passthrough byte-exact verification ─────────────────────────
+# ── Passthrough bounded similarity verification ───────────────────
 # Encodes once, pushes with -c copy, and verifies raw audio frame
-# data is byte-identical between input FLV and output recording.
+# data is byte-identical over the matched media window with a small,
+# codec-specific allowance for encoder/container setup and tail packets.
 run_passthrough_test() {
-    echo "========== AUDIO PASSTHROUGH BYTE-EXACT =========="
+    echo "========== AUDIO PASSTHROUGH BOUNDED SIMILARITY =========="
     local duration=4
 
-    for acodec in aac opus flac; do
+    for acodec in $AUDIO_CODECS; do
         local key="pt_${acodec}_$(date +%s)"
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -591,7 +761,12 @@ run_passthrough_test() {
 
         local result="FAIL" result_color="$RED"
         local acodec_args=$(get_acodec_args "$acodec")
-        local fourcc=""; case "$acodec" in aac) fourcc="AAC_LEGACY";; opus) fourcc="Opus";; flac) fourcc="fLaC";; esac
+        local fourcc="" max_audio_delta=0
+        case "$acodec" in
+            aac) fourcc="AAC_LEGACY"; max_audio_delta=1;;
+            opus) fourcc="Opus"; max_audio_delta=4;;
+            flac) fourcc="fLaC"; max_audio_delta=5;;
+        esac
 
         # 1. Encode once to FLV
         local flv; flv=$(mktemp /tmp/pt_${acodec}.XXXXXX.flv)
@@ -607,21 +782,23 @@ run_passthrough_test() {
         # 2. Push with -c copy
         echo "  Pushing through RTMP with -c copy..."
         ffmpeg -y -re -i "$flv" -c copy -f flv "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
-        local ff_pid=$!; wait $ff_pid 2>/dev/null || true; sleep 5
+        local ff_pid=$!; wait $ff_pid 2>/dev/null || true
 
         # 3. Find recording
-        local rec; rec=$(ls "$MEDIA_DIR/recordings/${key}_"*.mp4 2>/dev/null | head -1)
+        local rec; rec=$(wait_for_recording "$key" 20 || true)
         if [ -z "$rec" ]; then echo -e "${RED}  ✗ No recording${NC}"; rm -f "$flv"; FAIL=$((FAIL+1)); echo "pt_${acodec}|FAIL" >> "$RESULTS_FILE"; continue; fi
         echo "  Recording: $(basename "$rec") ($(stat -c%s "$rec") bytes)"
 
         # 4. Byte-level comparison via standalone Python script
-        export PT_FLV="$flv" PT_REC="$rec" PT_FOURCC="$fourcc"
+        export PT_FLV="$flv" PT_REC="$rec" PT_FOURCC="$fourcc" PT_MAX_AUDIO_FRAME_DELTA="$max_audio_delta"
         local py_out
         py_out=$(python3 "$(dirname "$0")/tests/passthrough.py" 2>&1) || true
         echo "$py_out" | sed 's/^/  /'
 
-        # 5. stts verification and final result
-        if echo "$py_out" | grep -q "^PASSTHROUGH_OK$"; then
+        # 5. Audio byte-exact + video similarity + stts verification
+        local video_ok=1
+        check_video_similarity "$flv" "$rec" 0.98 || video_ok=0
+        if echo "$py_out" | grep -q "^PASSTHROUGH_OK$" && [ "$video_ok" -eq 1 ]; then
             if check_mp4 "$rec" "$key" 15; then
                 result="PASS"; result_color="$GREEN"
             fi
@@ -634,6 +811,45 @@ run_passthrough_test() {
     done
 }
 
+# ── Thumbnail generation ──────────────────────────────────────────
+run_thumbnail_test() {
+    echo "========== THUMBNAIL GENERATION (JXL / AVIF / PNG) =========="
+    local key="thumb_$(date +%s)" duration="$STREAM_DURATION"
+    [ "$duration" -lt 8 ] 2>/dev/null && duration=8
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; echo "Thumbnail formats"; echo "Key: $key"; echo "Widths: $THUMBNAIL_WIDTHS | Formats: $THUMBNAIL_FORMATS"; echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    ffmpeg -y -re -f lavfi -i "testsrc=duration=${duration}:size=640x360:rate=30" -f lavfi -i "sine=frequency=440:duration=${duration}" \
+        -c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency -g 60 -keyint_min 60 -c:a aac -t "$duration" -f flv \
+        "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
+    local ff_pid=$!
+    local result="FAIL" result_color="$RED" ok=1
+
+    local seg_count=""
+    if seg_count=$(wait_for_hls_segment "$key" 30); then
+        echo -e "${GREEN}  ✓ live HLS segment ready ($seg_count m4s segs)${NC}"
+    else
+        echo -e "${RED}  ✗ no live HLS segment available for thumbnail source${NC}"
+        ok=0
+    fi
+    api_call "/api/streams" >/dev/null || true
+    check_thumbnail_set "$MEDIA_DIR/thumbnails/streams" "$key" 30 || ok=0
+
+    wait $ff_pid 2>/dev/null || true
+    local rec; rec=$(wait_for_recording "$key" 30 || true)
+    if [ -n "$rec" ]; then
+        echo -e "${GREEN}  ✓ Recording generated for thumbnail source${NC}"
+        check_mp4 "$rec" "$key" 15 || ok=0
+        check_thumbnail_set "$MEDIA_DIR/thumbnails/recordings" "$(basename "$rec")" 45 || ok=0
+    else
+        echo -e "${RED}  ✗ No recording generated for thumbnail test${NC}"
+        ok=0
+    fi
+
+    [ "$ok" -eq 1 ] && { result="PASS"; result_color="$GREEN"; }
+    echo -e "${result_color}  ● Result: $result${NC}"; echo "$key|$result" >> "$RESULTS_FILE"
+    [ "$result" = "PASS" ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+}
+
 # ── Main ──────────────────────────────────────────────────────────
 echo "=== Livestream Test Suite ==="
 echo "API: $API_BASE | RTMP: $RTMP_BASE | Duration: ${STREAM_DURATION}s"
@@ -643,16 +859,18 @@ echo ""
 
 api_call "/api/health" >/dev/null || { echo "Server not running"; exit 1; }
 
-echo "$TESTS" | grep -qw "all" && TESTS="codec color graceful reconnect hls multitrack"
+echo "$TESTS" | grep -qw "all" && TESTS="codec res color graceful reconnect hls multitrack thumbnail passthrough"
 
 for t in $TESTS; do
     case $t in
         codec) run_codec_matrix ;;
-        color) run_color_matrix ;;
+        res) run_resolution_matrix ;;
+        color|hdr|hdr-validate) run_color_matrix ;;
         graceful) run_graceful_stop_test ;;
         reconnect) run_reconnect_test ;;
         hls) run_hls_test ;;
         multitrack) run_multitrack_test ;;
+        thumbnail|thumbnails) run_thumbnail_test ;;
         fps) run_fps_matrix ;;
         passthrough) run_passthrough_test ;;
         *) echo "Unknown: $t" ;;
