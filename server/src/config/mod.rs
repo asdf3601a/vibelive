@@ -16,6 +16,8 @@ pub struct Config {
     pub stream_grace_period_seconds: u64,
     pub recording_remux_enabled: bool,
     pub recording_remux_concurrency: u32,
+    pub thumbnail_ffmpeg_concurrency: u32,
+    pub thumbnail_rate_limit_seconds: u32,
 }
 
 impl Config {
@@ -59,6 +61,12 @@ impl Config {
                 .parse()?,
             recording_remux_concurrency: env::var("RECORDING_REMUX_CONCURRENCY")
                 .unwrap_or_else(|_| "4".into())
+                .parse()?,
+            thumbnail_ffmpeg_concurrency: env::var("THUMBNAIL_FFMPEG_CONCURRENCY")
+                .unwrap_or_else(|_| "4".into())
+                .parse()?,
+            thumbnail_rate_limit_seconds: env::var("THUMBNAIL_RATE_LIMIT_SECONDS")
+                .unwrap_or_else(|_| "5".into())
                 .parse()?,
         })
     }

@@ -1,6 +1,12 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
+
+const FFMPEG_TIMEOUT_SECS: u64 = 30;
 
 async fn find_latest_segment(dir: &PathBuf) -> anyhow::Result<PathBuf> {
     let mut latest: Option<(u32, PathBuf)> = None;
@@ -23,12 +29,37 @@ async fn find_latest_segment(dir: &PathBuf) -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("no finalized segments found"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_thumbnails_for_stream(
     media_dir: &str,
     stream_key: &str,
     sizes: &[u32],
     interval_seconds: u32,
+    rate_limit_seconds: u32,
+    ended_flag: Option<Arc<AtomicBool>>,
+    last_attempt: Option<Arc<AtomicU64>>,
+    semaphore: Arc<Semaphore>,
 ) -> anyhow::Result<Vec<PathBuf>> {
+    // Rate-limit check first (cheapest, no I/O)
+    if let Some(ref attempt_ts) = last_attempt {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let last = attempt_ts.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < rate_limit_seconds as u64 {
+            return Err(anyhow::anyhow!("rate limited"));
+        }
+        attempt_ts.store(now, Ordering::Relaxed);
+    }
+
+    // Early ended check (atomic read, no I/O)
+    if let Some(ref flag) = ended_flag
+        && flag.load(Ordering::Relaxed)
+    {
+        return Err(anyhow::anyhow!("stream has ended"));
+    }
+
     let dir = PathBuf::from(media_dir).join("thumbnails").join("streams");
     tokio::fs::create_dir_all(&dir).await?;
 
@@ -53,6 +84,17 @@ pub async fn generate_thumbnails_for_stream(
     tmp_data.extend_from_slice(&init);
     tmp_data.extend_from_slice(&seg);
     tokio::fs::write(&tmp_path, &tmp_data).await?;
+
+    // Acquire concurrency permit (may wait for other ffmpeg to drain)
+    let _permit = semaphore.acquire().await;
+
+    // Re-check after acquiring permit
+    if let Some(ref flag) = ended_flag
+        && flag.load(Ordering::Relaxed)
+    {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(anyhow::anyhow!("stream has ended"));
+    }
 
     let mut results = Vec::new();
     for &width in sizes {
@@ -113,8 +155,11 @@ pub async fn generate_thumbnails_for_file(
     video_path: &std::path::Path,
     output_dir: &std::path::Path,
     sizes: &[u32],
+    semaphore: Arc<Semaphore>,
 ) -> anyhow::Result<Vec<PathBuf>> {
     tokio::fs::create_dir_all(output_dir).await?;
+
+    let _permit = semaphore.acquire().await;
 
     let filename = video_path
         .file_name()
@@ -187,23 +232,52 @@ async fn run_ffmpeg_thumbnail_fmt(
     }.to_string());
     args.push(tmp_output.to_str().unwrap().to_string());
 
-    let cmd_output = Command::new("ffmpeg").args(&args).output().await?;
+    let child = Command::new("ffmpeg")
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("ffmpeg spawn failed: {}", e))?;
 
-    if !cmd_output.status.success() {
-        let stderr = String::from_utf8_lossy(&cmd_output.stderr);
-        let _ = tokio::fs::remove_file(&tmp_output).await;
-        return Err(anyhow::anyhow!("ffmpeg failed for {}: {}", fmt, stderr));
+    let child_id = child.id();
+
+    match timeout(Duration::from_secs(FFMPEG_TIMEOUT_SECS), child.wait_with_output()).await {
+        Ok(Ok(cmd_output)) => {
+            if !cmd_output.status.success() {
+                let stderr = String::from_utf8_lossy(&cmd_output.stderr);
+                let _ = tokio::fs::remove_file(&tmp_output).await;
+                return Err(anyhow::anyhow!("ffmpeg failed for {}: {}", fmt, stderr));
+            }
+
+            let meta = tokio::fs::metadata(&tmp_output).await?;
+            if meta.len() == 0 {
+                let _ = tokio::fs::remove_file(&tmp_output).await;
+                return Err(anyhow::anyhow!("ffmpeg produced empty output for {}", fmt));
+            }
+
+            tokio::fs::rename(&tmp_output, output).await?;
+            Ok(output.to_path_buf())
+        }
+        Ok(Err(e)) => {
+            let _ = tokio::fs::remove_file(&tmp_output).await;
+            Err(anyhow::anyhow!("ffmpeg process error: {}", e))
+        }
+        Err(_) => {
+            if let Some(id) = child_id {
+                let _ = Command::new("kill")
+                    .arg("-9")
+                    .arg(id.to_string())
+                    .output()
+                    .await;
+            }
+            let _ = tokio::fs::remove_file(&tmp_output).await;
+            Err(anyhow::anyhow!(
+                "ffmpeg timed out after {}s for {}",
+                FFMPEG_TIMEOUT_SECS,
+                fmt
+            ))
+        }
     }
-
-    let meta = tokio::fs::metadata(&tmp_output).await?;
-    if meta.len() == 0 {
-        let _ = tokio::fs::remove_file(&tmp_output).await;
-        return Err(anyhow::anyhow!("ffmpeg produced empty output for {}", fmt));
-    }
-
-    tokio::fs::rename(&tmp_output, output).await?;
-
-    Ok(output.to_path_buf())
 }
 
 const THUMBNAIL_FORMATS: &[&str] = &["jxl", "avif", "png"];

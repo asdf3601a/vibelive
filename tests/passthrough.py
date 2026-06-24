@@ -56,9 +56,13 @@ if ext == 'adts':
         rec_frames.append(raw[pos + 7:pos + fl])
         pos += fl
 elif ext == 'ogg':
-    # Opus: skip first 2 Ogg pages (OpusHead, OpusTags), one page per frame
+    # Opus: skip first 2 Ogg pages (OpusHead, OpusTags).
+    # Opus packets can span Ogg page boundaries: when a segment byte
+    # is 255, the packet continues in the next segment (possibly on the
+    # next page). Assemble across boundaries.
     pos = 0
     pages_skipped = 0
+    pending = b''
     while pos + 27 <= len(raw):
         if raw[pos:pos + 4] != b'OggS':
             pos += 1
@@ -66,9 +70,17 @@ elif ext == 'ogg':
         nsegs = raw[pos + 26]
         seg_table = raw[pos + 27:pos + 27 + nsegs]
         data_start = pos + 27 + nsegs
-        if pages_skipped >= 2:
-            frame = raw[data_start:data_start + sum(seg_table)]
-            rec_frames.append(frame)
+        data_pos = data_start
+        if pages_skipped < 2:
+            pages_skipped += 1
+            pos = data_start + sum(seg_table)
+            continue
+        for seg_len in seg_table:
+            pending += raw[data_pos:data_pos + seg_len]
+            data_pos += seg_len
+            if seg_len < 255:
+                rec_frames.append(pending)
+                pending = b''
         pages_skipped += 1
         pos = data_start + sum(seg_table)
 elif ext == 'flac':

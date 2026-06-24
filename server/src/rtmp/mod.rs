@@ -7,6 +7,8 @@ pub use server::start_rtmp_server;
 use crate::hls::HlsStreamState;
 use crate::recording::Fmp4Recorder;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub struct StreamManager {
     publishers: HashMap<String, PublisherInfo>,
@@ -30,6 +32,10 @@ pub struct PublisherInfo {
     pub tracks: Vec<TrackInfo>,
     #[serde(skip)]
     pub disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip)]
+    pub ended: Arc<AtomicBool>,
+    #[serde(skip)]
+    pub last_thumbnail_attempt_secs: Arc<AtomicU64>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -101,6 +107,7 @@ impl StreamManager {
             && let Some(ref mut info) = self.publishers.get_mut(stream_key)
         {
             info.disconnected_at = None;
+            info.ended.store(false, Ordering::SeqCst);
         }
         pending
     }

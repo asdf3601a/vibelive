@@ -8,6 +8,7 @@ use rml_rtmp::sessions::{
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -310,6 +311,23 @@ async fn finalize_stream(
         tracing::warn!("Failed to write master playlist for {}: {}", stream_key, e);
     }
 
+    // Set ended flag and delete live thumbnails BEFORE spawning any tasks
+    {
+        let sm = app_state.stream_manager.read().await;
+        if let Some(info) = sm.get_publisher(stream_key) {
+            info.ended.store(true, Ordering::SeqCst);
+        }
+    }
+    let stream_thumb_dir = PathBuf::from(&media_dir).join("thumbnails").join("streams");
+    let sizes = app_state.config.thumbnail_sizes.clone();
+    for &w in &sizes {
+        for ext in &["jxl", "avif", "png"] {
+            let _ = tokio::fs::remove_file(
+                stream_thumb_dir.join(format!("{}_w{}.{}", stream_key, w, ext)),
+            ).await;
+        }
+    }
+
     if let Some(ref mut r) = recorder {
         drain_hls_to_recorder(&mut hls, r).await;
         let total_duration_secs: f64 = hls.total_duration_secs();
@@ -319,7 +337,6 @@ async fn finalize_stream(
             None
         };
         if let Ok(mp4_path) = r.close().await {
-            let sizes = app_state.config.thumbnail_sizes.clone();
             let base_url = app_state.config.recordings_base_url.clone();
             let key = stream_key.to_string();
             let app_state = Arc::clone(app_state);
@@ -329,13 +346,22 @@ async fn finalize_stream(
                 .and_then(|n| n.to_str())
                 .map(|n| n.to_string())
                 .unwrap_or_default();
+            let thumbnail_semaphore = app_state.thumbnail_semaphore.clone();
             tokio::spawn(async move {
+                // Enqueue remux FIRST (runs in background, own semaphore handles concurrency)
+                app_state.remux_queue.enqueue(remux_path);
+
+                // Generate recording thumbnails (acquires thumbnail semaphore)
                 let thumb_dir = PathBuf::from(&media_dir)
                     .join("thumbnails")
                     .join("recordings");
-                if let Err(e) =
-                    crate::thumbnail::generate_thumbnails_for_file(&mp4_path, &thumb_dir, &sizes)
-                        .await
+                if let Err(e) = crate::thumbnail::generate_thumbnails_for_file(
+                    &mp4_path,
+                    &thumb_dir,
+                    &sizes,
+                    thumbnail_semaphore,
+                )
+                .await
                 {
                     tracing::warn!(
                         "Post-recording thumbnail generation failed for {}: {}",
@@ -343,6 +369,7 @@ async fn finalize_stream(
                         e
                     );
                 }
+
                 if let Err(e) = crate::recording::update_index_json(
                     &media_dir,
                     &filename,
@@ -355,8 +382,7 @@ async fn finalize_stream(
                 {
                     tracing::warn!("update_index_json failed for {}: {}", key, e);
                 }
-                // Background remux (non-blocking, concurrency-limited)
-                app_state.remux_queue.enqueue(remux_path);
+
                 // Only clean up HLS files if no new publisher has taken over
                 let sm = app_state.stream_manager.read().await;
                 let still_in_use = sm.is_live_or_pending(&key);
@@ -369,15 +395,6 @@ async fn finalize_stream(
                 } else {
                     let hls_dir = PathBuf::from(&media_dir).join("hls").join(&key);
                     let _ = tokio::fs::remove_dir_all(&hls_dir).await;
-                    let stream_thumb_dir =
-                        PathBuf::from(&media_dir).join("thumbnails").join("streams");
-                    for &w in &sizes {
-                        for ext in &["jxl", "avif", "png"] {
-                            let _ = tokio::fs::remove_file(
-                                stream_thumb_dir.join(format!("{}_w{}.{}", key, w, ext)),
-                            ).await;
-                        }
-                    }
                 }
             });
         }
@@ -574,6 +591,8 @@ async fn handle_event(
                         metadata: None,
                         tracks: Vec::new(),
                         disconnected_at: None,
+                        ended: Arc::new(AtomicBool::new(false)),
+                        last_thumbnail_attempt_secs: Arc::new(AtomicU64::new(0)),
                     },
                 );
                 drop(sm);
@@ -1266,45 +1285,47 @@ async fn handle_video_data(
                                         }
                                     }
                                 }
-                                // Every track gets its own track state
-                                let track_state =
-                                    ctx.get_or_create_track_state(track.track_id, false);
-                                match inner_pt {
-                                    Some(crate::rtmp::enhanced::VideoPacketType::SequenceStart) => {
-                                        let _ = track_state
-                                            .set_video_config(
-                                                track.payload,
-                                                codec,
-                                                video_width,
-                                                video_height,
-                                            )
-                                            .await;
-                                    }
-                                    Some(crate::rtmp::enhanced::VideoPacketType::SequenceEnd) => {
-                                        let _ = track_state.finalize_segment().await;
-                                        ctx.closed_video_tracks.insert(track.track_id);
-                                    }
-                                    Some(
-                                        crate::rtmp::enhanced::VideoPacketType::Metadata,
-                                    ) => {
-                                        track_state.set_video_color_config(
-                                            parse_enhanced_color_config(track.payload),
-                                        );
-                                        if let Some(hdr) =
-                                            parse_enhanced_hdr_metadata(track.payload)
-                                        {
-                                            track_state.set_hdr_metadata(hdr);
+                                // Every track gets its own track state (skip track 0 — already handled by ctx.hls_state)
+                                if track.track_id != 0 {
+                                    let track_state =
+                                        ctx.get_or_create_track_state(track.track_id, false);
+                                    match inner_pt {
+                                        Some(crate::rtmp::enhanced::VideoPacketType::SequenceStart) => {
+                                            let _ = track_state
+                                                .set_video_config(
+                                                    track.payload,
+                                                    codec,
+                                                    video_width,
+                                                    video_height,
+                                                )
+                                                .await;
                                         }
-                                    }
-                                    _ => {
-                                        let _ = track_state
-                                            .write_video(
-                                                track.payload,
-                                                ts,
-                                                is_keyframe,
-                                                track.composition_time_offset,
-                                            )
-                                            .await;
+                                        Some(crate::rtmp::enhanced::VideoPacketType::SequenceEnd) => {
+                                            let _ = track_state.finalize_segment().await;
+                                            ctx.closed_video_tracks.insert(track.track_id);
+                                        }
+                                        Some(
+                                            crate::rtmp::enhanced::VideoPacketType::Metadata,
+                                        ) => {
+                                            track_state.set_video_color_config(
+                                                parse_enhanced_color_config(track.payload),
+                                            );
+                                            if let Some(hdr) =
+                                                parse_enhanced_hdr_metadata(track.payload)
+                                            {
+                                                track_state.set_hdr_metadata(hdr);
+                                            }
+                                        }
+                                        _ => {
+                                            let _ = track_state
+                                                .write_video(
+                                                    track.payload,
+                                                    ts,
+                                                    is_keyframe,
+                                                    track.composition_time_offset,
+                                                )
+                                                .await;
+                                        }
                                     }
                                 }
                             }
@@ -1571,21 +1592,23 @@ async fn handle_audio_data(
                                         }
                                     }
                                 }
-                                // Every track gets its own track state
-                                let track_state =
-                                    ctx.get_or_create_track_state(track.track_id, true);
-                                match inner_pt {
-                                    Some(crate::rtmp::enhanced::AudioPacketType::SequenceStart) => {
-                                        let _ = track_state
-                                            .set_audio_config(codec, track.payload)
-                                            .await;
-                                    }
-                                    Some(crate::rtmp::enhanced::AudioPacketType::SequenceEnd) => {
-                                        let _ = track_state.finalize_segment().await;
-                                        ctx.closed_audio_tracks.insert(track.track_id);
-                                    }
-                                    _ => {
-                                        let _ = track_state.write_audio(track.payload, ts).await;
+                                // Every track gets its own track state (skip track 0 — already handled by ctx.hls_state)
+                                if track.track_id != 0 {
+                                    let track_state =
+                                        ctx.get_or_create_track_state(track.track_id, true);
+                                    match inner_pt {
+                                        Some(crate::rtmp::enhanced::AudioPacketType::SequenceStart) => {
+                                            let _ = track_state
+                                                .set_audio_config(codec, track.payload)
+                                                .await;
+                                        }
+                                        Some(crate::rtmp::enhanced::AudioPacketType::SequenceEnd) => {
+                                            let _ = track_state.finalize_segment().await;
+                                            ctx.closed_audio_tracks.insert(track.track_id);
+                                        }
+                                        _ => {
+                                            let _ = track_state.write_audio(track.payload, ts).await;
+                                        }
                                     }
                                 }
                             }

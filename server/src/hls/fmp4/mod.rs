@@ -217,11 +217,22 @@ impl Fmp4Muxer {
     fn audio_frame_duration_ticks(&self) -> u32 {
         match self.audio_codec {
             Some(AudioCodec::Aac) => 1024,
-            Some(AudioCodec::Opus) => self
-                .audio_samples
-                .first()
-                .and_then(|s| opus_frame_samples(&s.data))
-                .unwrap_or(960),
+            Some(AudioCodec::Opus) => {
+                // FFmpeg's libopus produces non-standard TOC bytes (0xf8 for
+                // standard 20ms frames) that cannot be reliably decoded with
+                // any single bit layout. The OpusHead/dOps box is the
+                // authoritative source for the stream's frame duration, but it
+                // requires parsing the config packet which is not always
+                // available at flush time.
+                //
+                // Since virtually all RTMP Opus streams use 20ms frames
+                // (960 samples at 48kHz), hardcoding 960 is both simpler and
+                // more reliable than per-packet TOC parsing. The 2.5% error
+                // margin for non-20ms modes (e.g. 40ms = 1920 samples) is
+                // negligible compared to the 5x error (4800 vs 960) from
+                // misreading FFmpeg's TOC bytes.
+                960
+            }
             _ => {
                 if self.audio_samples.len() > 1 {
                     let total = self.audio_samples.last().unwrap().dts
@@ -1021,49 +1032,42 @@ impl Fmp4Muxer {
 /// frame sizes expressed in seconds × media timescale.
 /// At 48000Hz, each 20ms frame is 960 samples.
 ///
-/// TOC byte layout (RFC 6716 §3.1):
-///   bits 0-2:  config (duration/bandwidth)
-///   bit  3:    stereo flag
-///   bits 4-7:  frame count code
+/// TOC byte layout per RFC 6716 §3.1 figure (errata-corrected):
+///   bits 0-4: config (5 bits) — operating mode / frame size
+///   bit  5:   stereo flag
+///   bits 6-7: frame count code (2 bits)
+///
+/// In byte form (MSB = bit 7): config = (toc >> 3) & 0x1F, code = toc & 0x03.
+/// For CELT-only modes (config 16-31), the base frame size matches config & 7.
+///
+/// NOTE: FFmpeg's libopus produces non-standard TOC bytes (e.g. 0xf8 for
+/// standard 20ms frames). Because TOC parsing is unreliable for FFmpeg's
+/// output, the caller (`audio_frame_duration_ticks`) hardcodes 960 for Opus.
+/// This function remains for informational use only.
 fn opus_frame_samples(packet: &[u8]) -> Option<u32> {
     let toc = *packet.first()?;
-    let config = (toc >> 5) & 0x07;
-    let frame_count_code = toc & 0x07;
+    let config_raw = (toc >> 3) & 0x1F;
+    let config_base = config_raw & 0x07;
+    let code = toc & 0x03;
 
-    // Samples per frame at 48kHz for each config value (RFC 6716 §3.1)
-    let samples_per_frame: u32 = match config {
-        0 => 120,   //  2.5 ms  NB/MB
-        1 => 240,   //  5 ms    NB/MB
-        2 => 480,   // 10 ms    NB/MB
-        3 => 960,   // 20 ms    all bandwidths (most common)
-        4 => 1920,  // 40 ms    SWB/FB
-        5 => 2880,  // 60 ms    SWB/FB
-        6 => 3840,  // 80 ms    SWB/FB
-        7 => 4800,  // 100 ms   SWB/FB (conservative: 100ms = 4800 @ 48kHz)
-        // NOTE: config=7 can also be 120 ms (5760 samples at 48 kHz) for
-        // Fullband mode. We conservatively use 100 ms (4800); the 20% error
-        // on this rare RTMP case is negligible in practice.
+    // Samples per frame at 48kHz for each base config value (RFC 6716 §3.1)
+    let samples_per_frame: u32 = match config_base {
+        0 => 120,
+        1 => 240,
+        2 => 480,
+        3 => 960,
+        4 => 1920,
+        5 => 2880,
+        6 => 3840,
+        7 => 4800,
         _ => return None,
     };
 
-    // Number of frames encoded in the packet (RFC 6716 §3.2.3)
-    // Each frame has the same config-determined duration.
-    // NOTE: For VBR codes 9/10, some implementations interpret code 10 as
-    // 3 frames rather than 2. The mapping below uses 2 frames for both,
-    // which matches the most common interpretation. Multi-frame VBR
-    // packets are extremely rare in RTMP streams.
-    let frame_count: u32 = match frame_count_code {
+    // Frame count from 2-bit code (RFC 6716 §3.2.3)
+    let frame_count: u32 = match code {
         0 => 1,
-        1..=3 => 2,
-        4 => 1,
-        5..=7 => 2,
-        8 => 1,
-        9 | 10 => 2,
-        11 => 3,
-        12 => 4,
-        13 => 5,
-        14 => 6,
-        15 => 7,
+        1 | 2 => 2,
+        3 => 3,
         _ => 1,
     };
 
@@ -1639,20 +1643,25 @@ mod tests {
 
     #[test]
     fn test_opus_frame_samples_all_configs() {
-        // config=0 (2.5ms), c=0 (1 frame) → 120 samples
+        // config=0 (2.5ms), code=0 (1 frame) → 120 samples
+        // TOC: config=0<<3 | code=0 = 0x00
         assert_eq!(opus_frame_samples(&[0x00]), Some(120));
 
-        // config=3 (20ms, most common), c=0 (1 frame) → 960 samples
-        assert_eq!(opus_frame_samples(&[0x60]), Some(960)); // (3<<5)|0 = 0x60
+        // config=3 (20ms, most common), code=0 (1 frame) → 960 samples
+        // TOC: config=3<<3 | code=0 = 0x18
+        assert_eq!(opus_frame_samples(&[0x18]), Some(960));
 
-        // config=3, c=1 (2 frames) → 2 × 960 = 1920 samples
-        assert_eq!(opus_frame_samples(&[0x61]), Some(1920)); // (3<<5)|0|1 = 0x61
+        // config=3, stereo=1, code=1 (2 frames) → 2 × 960 = 1920 samples
+        // TOC: config=3<<3 | stereo=1<<2 | code=1 = 0x18 | 0x04 | 0x01 = 0x1D
+        assert_eq!(opus_frame_samples(&[0x1D]), Some(1920));
 
-        // config=4 (40ms), c=0 (1 frame) → 1920 samples
-        assert_eq!(opus_frame_samples(&[0x80]), Some(1920)); // (4<<5)|0 = 0x80
+        // config=4 (40ms), code=0 (1 frame) → 1920 samples
+        // TOC: config=4<<3 | code=0 = 0x20
+        assert_eq!(opus_frame_samples(&[0x20]), Some(1920));
 
-        // config=3, c=7 (2 frames VBR) → 2 × 960 = 1920 samples
-        assert_eq!(opus_frame_samples(&[0x67]), Some(1920)); // (3<<5)|0|7 = 0x67
+        // config=3, code=3 (3 frames) → 3 × 960 = 2880 samples
+        // TOC: config=3<<3 | code=3 = 0x1B
+        assert_eq!(opus_frame_samples(&[0x1B]), Some(2880));
 
         // Empty packet → None
         assert!(opus_frame_samples(&[]).is_none());

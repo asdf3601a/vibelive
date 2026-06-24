@@ -8,7 +8,7 @@ pub mod util;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -17,6 +17,7 @@ pub struct AppState {
     pub stream_manager: RwLock<rtmp::StreamManager>,
     pub config: config::Config,
     pub remux_queue: Arc<recording::RemuxQueue>,
+    pub thumbnail_semaphore: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -35,6 +36,9 @@ async fn main() -> anyhow::Result<()> {
             cfg.recording_remux_enabled,
             cfg.recording_remux_concurrency as usize,
         )),
+        thumbnail_semaphore: Arc::new(Semaphore::new(
+            cfg.thumbnail_ffmpeg_concurrency as usize,
+        )),
     });
 
     let rtmp_addr: SocketAddr = format!("{}:{}", cfg.rtmp_host, cfg.rtmp_port).parse()?;
@@ -49,22 +53,37 @@ async fn main() -> anyhow::Result<()> {
     let thumb_state = app_state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
-            thumb_state.config.thumbnail_interval_seconds.max(5) as u64,
+            thumb_state.config.thumbnail_interval_seconds as u64,
         ));
         loop {
             interval.tick().await;
             let sm = thumb_state.stream_manager.read().await;
-            let keys: Vec<String> = sm.publishers().keys().cloned().collect();
+            let tasks: Vec<(String, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicU64>)> = sm
+                .publishers()
+                .iter()
+                .map(|(key, info)| {
+                    (
+                        key.clone(),
+                        info.ended.clone(),
+                        info.last_thumbnail_attempt_secs.clone(),
+                    )
+                })
+                .collect();
             let media_dir = thumb_state.config.media_dir.clone();
             let sizes = thumb_state.config.thumbnail_sizes.clone();
             let iv = thumb_state.config.thumbnail_interval_seconds;
+            let rl = thumb_state.config.thumbnail_rate_limit_seconds;
+            let sem = thumb_state.thumbnail_semaphore.clone();
             drop(sm);
-            for key in keys {
+            for (key, ended_flag, last_attempt) in tasks {
                 let md = media_dir.clone();
                 let sz = sizes.clone();
+                let sem = sem.clone();
                 tokio::spawn(async move {
-                    let _ =
-                        crate::thumbnail::generate_thumbnails_for_stream(&md, &key, &sz, iv).await;
+                    let _ = crate::thumbnail::generate_thumbnails_for_stream(
+                        &md, &key, &sz, iv, rl, Some(ended_flag), Some(last_attempt), sem,
+                    )
+                    .await;
                 });
             }
         }
