@@ -894,7 +894,7 @@ impl Fmp4Muxer {
             trun_header += 4;
         }
 
-        let mut entry_size = 4 + 4;
+        let mut entry_size = 4;
         if has_cto {
             entry_size += 4;
         }
@@ -920,10 +920,6 @@ impl Fmp4Muxer {
         let is_video = track_id == 1;
         let is_opus_audio = !is_video && self.audio_codec == Some(AudioCodec::Opus);
         // Video and audio DTS are both in ms — convert to respective timescales.
-        // Audio uses codec-known frame durations (AAC=1024, Opus=from TOC) in
-        // the tfhd/Sample-Table, so the tfdt may not land on a codec frame
-        // boundary — a small segment-boundary trim (≤1ms) is inherent to
-        // HLS concatenation and is handled correctly during remux.
         let scaled_base_dts = if is_video {
             (base_dts * self.video_fps_num + 500) / 1000
         } else {
@@ -999,7 +995,7 @@ impl Fmp4Muxer {
         if is_video {
             flags |= 0x000004;
         }
-        flags |= 0x000100 | 0x000200;
+        flags |= 0x000200;
         if has_cto {
             flags |= 0x000800;
         }
@@ -1014,7 +1010,6 @@ impl Fmp4Muxer {
         }
 
         for s in samples {
-            data.extend_from_slice(&s.duration.to_be_bytes());
             data.extend_from_slice(&s.size.to_be_bytes());
             if has_cto {
                 data.extend_from_slice(&s.composition_time_offset.to_be_bytes());
@@ -1044,6 +1039,7 @@ impl Fmp4Muxer {
 /// standard 20ms frames). Because TOC parsing is unreliable for FFmpeg's
 /// output, the caller (`audio_frame_duration_ticks`) hardcodes 960 for Opus.
 /// This function remains for informational use only.
+#[allow(dead_code)]
 fn opus_frame_samples(packet: &[u8]) -> Option<u32> {
     let toc = *packet.first()?;
     let config_raw = (toc >> 3) & 0x1F;
@@ -1445,10 +1441,10 @@ mod tests {
 
             if i == 0 {
                 assert!(trun_flags & 0x000004 != 0);
-                assert!(trun_flags & 0x000100 != 0);
+                assert!(trun_flags & 0x000100 == 0);
                 assert!(trun_flags & 0x000400 == 0);
             } else {
-                assert!(trun_flags & 0x000100 != 0);
+                assert!(trun_flags & 0x000100 == 0);
                 assert!(trun_flags & 0x000004 == 0);
                 assert!(trun_flags & 0x000400 == 0);
             }
@@ -1472,20 +1468,20 @@ mod tests {
                 ]);
                 let entry_off = trun_offset + 16;
                 let size = u32::from_be_bytes([
-                    frag[entry_off + 4],
-                    frag[entry_off + 5],
-                    frag[entry_off + 6],
-                    frag[entry_off + 7],
+                    frag[entry_off],
+                    frag[entry_off + 1],
+                    frag[entry_off + 2],
+                    frag[entry_off + 3],
                 ]);
                 assert_eq!(first_flags, 0x02000000);
                 assert_eq!(size, video_data.len() as u32);
             } else {
                 let entry_off = trun_offset + 12;
                 let size = u32::from_be_bytes([
-                    frag[entry_off + 4],
-                    frag[entry_off + 5],
-                    frag[entry_off + 6],
-                    frag[entry_off + 7],
+                    frag[entry_off],
+                    frag[entry_off + 1],
+                    frag[entry_off + 2],
+                    frag[entry_off + 3],
                 ]);
                 assert_eq!(size, audio_data.len() as u32);
             }
@@ -1581,14 +1577,14 @@ mod tests {
                         ]);
                         assert!(trun_flags & 0x000800 != 0, "trun should have sample_composition_time_offset flag");
                         // trun data: version(1)+flags(3)+sample_count(4)+data_offset(4)+first_flags(4)+entries
-                        // Each entry: duration(4)+sample_size(4)+composition_time_offset(4)
-                        // CTO is at data_offset+24 for video
+                        // Each entry: sample_size(4)+composition_time_offset(4)
+                        // CTO is at data_offset+20 for video
                         // CTO is in media timescale: 100ms X 30 / 1000 = 3
                         let cto = i32::from_be_bytes([
-                            frag[idata + 24],
-                            frag[idata + 25],
-                            frag[idata + 26],
-                            frag[idata + 27],
+                            frag[idata + 20],
+                            frag[idata + 21],
+                            frag[idata + 22],
+                            frag[idata + 23],
                         ]);
                         assert_eq!(cto, 3);
                         return;
