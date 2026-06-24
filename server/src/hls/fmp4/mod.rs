@@ -743,10 +743,37 @@ impl Fmp4Muxer {
         pasp_data.extend_from_slice(&1u32.to_be_bytes());
         write_box(&mut data, b"pasp", &pasp_data);
 
-        // HDR metadata boxes (colr, clli, mdcv) — required for correct PQ/HLG playback
+        // HDR metadata boxes (colr, clli, mdcv) — required for correct PQ/HLG playback.
+        // FFmpeg 8.x currently carries HDR10 CLL/MDCV for HEVC as SEI NAL units
+        // in hvcC but may omit hdrCll/hdrMdcv from Enhanced-RTMP colorInfo.
+        // Fall back to those config SEI messages when explicit HDR metadata was
+        // not already set from AMF metadata.
         self.write_colr(&mut data);
-        self.write_clli(&mut data);
-        self.write_mdcv(&mut data);
+        if self.hdr_metadata.is_some() {
+            self.write_clli(&mut data);
+            self.write_mdcv(&mut data);
+        } else if codec_fourcc == b"hvc1"
+            && let Some(hdr) = self
+                .video_config
+                .as_ref()
+                .and_then(|cfg| codec::hevc_hdr_metadata_from_hvcc(cfg))
+        {
+            let mut clli = Vec::new();
+            clli.extend_from_slice(&hdr.max_content_light_level.to_be_bytes());
+            clli.extend_from_slice(&hdr.max_frame_average_light_level.to_be_bytes());
+            write_box(&mut data, b"clli", &clli);
+
+            let mut mdcv = Vec::new();
+            for &i in &[1, 2, 0] {
+                mdcv.extend_from_slice(&hdr.display_primaries_x[i].to_be_bytes());
+                mdcv.extend_from_slice(&hdr.display_primaries_y[i].to_be_bytes());
+            }
+            mdcv.extend_from_slice(&hdr.white_point_x.to_be_bytes());
+            mdcv.extend_from_slice(&hdr.white_point_y.to_be_bytes());
+            mdcv.extend_from_slice(&hdr.max_luminance.to_be_bytes());
+            mdcv.extend_from_slice(&hdr.min_luminance.to_be_bytes());
+            write_box(&mut data, b"mdcv", &mdcv);
+        }
 
         write_box(w, codec_fourcc, &data);
     }

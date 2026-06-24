@@ -355,11 +355,16 @@ run_color_test() {
         if [ "$encoder" = "libx265" ]; then
             # FFmpeg's Enhanced RTMP muxer emits hdrCll/hdrMdcv only when the
             # encoder exposes content-light/mastering-display side data.
-            args+=(-x265-params "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400")
+            args+=(-x265-params "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400")
+        elif [ "$encoder" = "libsvtav1" ]; then
+            # SVT-AV1 uses normalized mastering-display coordinates and emits
+            # HDR metadata OBUs in coded frames; the fMP4 muxer extracts those
+            # so AV1 live HLS init segments get clli/mdcv as well.
+            args+=(-svtav1-params "preset=12:crf=35:color-primaries=9:transfer-characteristics=16:matrix-coefficients=9:mastering-display=G(0.265,0.690)B(0.150,0.060)R(0.680,0.320)WP(0.3127,0.3290)L(1000,0.005):content-light=1000,400")
         fi
     fi
     [ "$encoder" = "libx265" ] && args+=(-preset ultrafast)
-    [ "$encoder" = "libsvtav1" ] && args+=(-svtav1-params "preset=12:crf=35")
+    [ "$encoder" = "libsvtav1" ] && [ "$hdr" != "hdr" ] && args+=(-svtav1-params "preset=12:crf=35")
 
     ffmpeg "${args[@]}" "${RTMP_BASE}/${key}" >/dev/null 2>&1 &
     local ff_pid=$!; wait $ff_pid 2>/dev/null || true

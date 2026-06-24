@@ -1,4 +1,4 @@
-use super::{AudioCodec, Fmp4Muxer, VideoCodec};
+use super::{AudioCodec, Fmp4Muxer, HdrMetadata, VideoCodec};
 
 // ── RFC 6381 codec strings ───────────────────────────────────────
 
@@ -563,6 +563,261 @@ pub fn av1_color_config_from_config(config: &[u8]) -> Option<crate::hls::fmp4::C
         transfer_characteristics: h.transfer_characteristics,
         matrix_coefficients: h.matrix_coefficients,
         full_range: h.full_range,
+    })
+}
+
+fn read_leb128(data: &[u8], offset: &mut usize) -> Option<usize> {
+    let mut value = 0usize;
+    let mut shift = 0;
+    while *offset < data.len() {
+        let byte = data[*offset];
+        *offset += 1;
+        value |= ((byte & 0x7F) as usize) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+        if shift > 56 {
+            return None;
+        }
+    }
+    None
+}
+
+fn for_each_av1_obu<F: FnMut(u8, &[u8])>(data: &[u8], mut f: F) {
+    let mut offset = 0;
+    while offset < data.len() {
+        let obu_header = data[offset];
+        offset += 1;
+        let obu_type = (obu_header >> 3) & 0x0F;
+        let obu_extension_flag = (obu_header >> 2) & 1;
+        let obu_has_size_field = (obu_header >> 1) & 1;
+        if obu_extension_flag == 1 {
+            if offset >= data.len() {
+                break;
+            }
+            offset += 1;
+        }
+        let obu_size = if obu_has_size_field == 1 {
+            match read_leb128(data, &mut offset) {
+                Some(size) => size,
+                None => break,
+            }
+        } else {
+            data.len().saturating_sub(offset)
+        };
+        if offset + obu_size > data.len() {
+            break;
+        }
+        f(obu_type, &data[offset..offset + obu_size]);
+        offset += obu_size;
+    }
+}
+
+/// Accumulator for the six mastering-display fields before they are assembled
+/// into `HdrMetadata` (primaries_x, primaries_y, white_point_x, white_point_y,
+/// max_luminance, min_luminance).
+type MdcvParts = ([u16; 3], [u16; 3], u16, u16, u32, u32);
+
+/// Extract HDR CLL/MDCV from AV1 metadata OBUs in a coded frame.
+pub fn av1_hdr_metadata_from_obus(data: &[u8]) -> Option<HdrMetadata> {
+    let mut cll: Option<(u16, u16)> = None;
+    let mut mdcv: Option<MdcvParts> = None;
+    for_each_av1_obu(data, |obu_type, payload| {
+        if obu_type != 5 || payload.is_empty() {
+            return;
+        }
+        let mut off = 0;
+        let Some(metadata_type) = read_leb128(payload, &mut off) else {
+            return;
+        };
+        let p = &payload[off..];
+        match metadata_type {
+            1 if p.len() >= 4 => {
+                cll = Some((
+                    u16::from_be_bytes([p[0], p[1]]),
+                    u16::from_be_bytes([p[2], p[3]]),
+                ));
+            }
+            2 if p.len() >= 24 => {
+                let x = [
+                    u16::from_be_bytes([p[0], p[1]]),
+                    u16::from_be_bytes([p[4], p[5]]),
+                    u16::from_be_bytes([p[8], p[9]]),
+                ];
+                let y = [
+                    u16::from_be_bytes([p[2], p[3]]),
+                    u16::from_be_bytes([p[6], p[7]]),
+                    u16::from_be_bytes([p[10], p[11]]),
+                ];
+                mdcv = Some((
+                    x,
+                    y,
+                    u16::from_be_bytes([p[12], p[13]]),
+                    u16::from_be_bytes([p[14], p[15]]),
+                    u32::from_be_bytes([p[16], p[17], p[18], p[19]]),
+                    u32::from_be_bytes([p[20], p[21], p[22], p[23]]),
+                ));
+            }
+            _ => {}
+        }
+    });
+    let (max_content_light_level, max_frame_average_light_level) = cll?;
+    let (
+        display_primaries_x,
+        display_primaries_y,
+        white_point_x,
+        white_point_y,
+        max_luminance,
+        min_luminance,
+    ) = mdcv?;
+    Some(HdrMetadata {
+        max_content_light_level,
+        max_frame_average_light_level,
+        display_primaries_x,
+        display_primaries_y,
+        white_point_x,
+        white_point_y,
+        max_luminance,
+        min_luminance,
+    })
+}
+
+fn ebsp_to_rbsp(nal: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nal.len());
+    let mut zeros = 0u8;
+    for &b in nal {
+        if zeros >= 2 && b == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        out.push(b);
+        zeros = if b == 0 { zeros.saturating_add(1) } else { 0 };
+    }
+    out
+}
+
+fn parse_hevc_sei_nal(
+    nal: &[u8],
+    cll: &mut Option<(u16, u16)>,
+    mdcv: &mut Option<MdcvParts>,
+) {
+    if nal.len() < 3 {
+        return;
+    }
+    let rbsp = ebsp_to_rbsp(&nal[2..]);
+    let mut off = 0;
+    while off + 2 <= rbsp.len() {
+        let mut payload_type = 0usize;
+        while off < rbsp.len() && rbsp[off] == 0xFF {
+            payload_type += 255;
+            off += 1;
+        }
+        if off >= rbsp.len() {
+            break;
+        }
+        payload_type += rbsp[off] as usize;
+        off += 1;
+
+        let mut payload_size = 0usize;
+        while off < rbsp.len() && rbsp[off] == 0xFF {
+            payload_size += 255;
+            off += 1;
+        }
+        if off >= rbsp.len() {
+            break;
+        }
+        payload_size += rbsp[off] as usize;
+        off += 1;
+        if off + payload_size > rbsp.len() {
+            break;
+        }
+        let p = &rbsp[off..off + payload_size];
+        match payload_type {
+            // content_light_level_info
+            144 if p.len() >= 4 => {
+                *cll = Some((
+                    u16::from_be_bytes([p[0], p[1]]),
+                    u16::from_be_bytes([p[2], p[3]]),
+                ));
+            }
+            // mastering_display_colour_volume, order in HEVC SEI is G, B, R.
+            137 if p.len() >= 24 => {
+                let x = [
+                    u16::from_be_bytes([p[8], p[9]]),
+                    u16::from_be_bytes([p[0], p[1]]),
+                    u16::from_be_bytes([p[4], p[5]]),
+                ];
+                let y = [
+                    u16::from_be_bytes([p[10], p[11]]),
+                    u16::from_be_bytes([p[2], p[3]]),
+                    u16::from_be_bytes([p[6], p[7]]),
+                ];
+                *mdcv = Some((
+                    x,
+                    y,
+                    u16::from_be_bytes([p[12], p[13]]),
+                    u16::from_be_bytes([p[14], p[15]]),
+                    u32::from_be_bytes([p[16], p[17], p[18], p[19]]),
+                    u32::from_be_bytes([p[20], p[21], p[22], p[23]]),
+                ));
+            }
+            _ => {}
+        }
+        off += payload_size;
+    }
+}
+
+/// Extract HDR CLL/MDCV SEI messages from an HEVCDecoderConfigurationRecord.
+pub fn hevc_hdr_metadata_from_hvcc(config: &[u8]) -> Option<HdrMetadata> {
+    if config.len() < 23 {
+        return None;
+    }
+    let num_arrays = config[22] as usize;
+    let mut off = 23;
+    let mut cll = None;
+    let mut mdcv = None;
+    for _ in 0..num_arrays {
+        if off + 3 > config.len() {
+            break;
+        }
+        let nal_type = config[off] & 0x3F;
+        off += 1;
+        let count = u16::from_be_bytes([config[off], config[off + 1]]) as usize;
+        off += 2;
+        for _ in 0..count {
+            if off + 2 > config.len() {
+                break;
+            }
+            let len = u16::from_be_bytes([config[off], config[off + 1]]) as usize;
+            off += 2;
+            if off + len > config.len() {
+                break;
+            }
+            if nal_type == 39 || nal_type == 40 {
+                parse_hevc_sei_nal(&config[off..off + len], &mut cll, &mut mdcv);
+            }
+            off += len;
+        }
+    }
+    let (max_content_light_level, max_frame_average_light_level) = cll?;
+    let (
+        display_primaries_x,
+        display_primaries_y,
+        white_point_x,
+        white_point_y,
+        max_luminance,
+        min_luminance,
+    ) = mdcv?;
+    Some(HdrMetadata {
+        max_content_light_level,
+        max_frame_average_light_level,
+        display_primaries_x,
+        display_primaries_y,
+        white_point_x,
+        white_point_y,
+        max_luminance,
+        min_luminance,
     })
 }
 

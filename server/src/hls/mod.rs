@@ -146,6 +146,21 @@ impl HlsStreamState {
         {
             self.fmp4_muxer.set_video_color_config(color_cfg);
         }
+        if codec == fmp4::VideoCodec::H265
+            && let Some(hdr) = fmp4::codec::hevc_hdr_metadata_from_hvcc(config)
+        {
+            // FFmpeg 8.x carries HDR10 CLL/MDCV as HEVC SEI NAL units in hvcC,
+            // but does not currently emit hdrCll/hdrMdcv AMF fields in the
+            // Enhanced-RTMP colorInfo packet. Preserve those SEI values in the
+            // fMP4 sample entry so HLS init.mp4 still gets clli/mdcv.
+            self.fmp4_muxer.set_video_color_config(fmp4::ColorConfig {
+                color_primaries: 9,
+                transfer_characteristics: 16,
+                matrix_coefficients: 9,
+                full_range: false,
+            });
+            self.fmp4_muxer.set_hdr_metadata(hdr);
+        }
         self.init_written = false;
         self.refresh_init_if_segment_open().await?;
         Ok(())
@@ -281,6 +296,21 @@ impl HlsStreamState {
             Some(fmp4::VideoCodec::AV1) => Cow::Owned(fmp4::ensure_av1_obu_size_fields(data)),
             _ => Cow::Borrowed(data),
         };
+        if self.fmp4_muxer.video_codec() == Some(fmp4::VideoCodec::AV1) {
+            let mut init_changed = false;
+            if let Some(color_cfg) = fmp4::codec::av1_color_config_from_config(sample_data.as_ref()) {
+                self.fmp4_muxer.set_video_color_config(color_cfg);
+                init_changed = true;
+            }
+            if let Some(hdr) = fmp4::codec::av1_hdr_metadata_from_obus(sample_data.as_ref()) {
+                self.fmp4_muxer.set_hdr_metadata(hdr);
+                init_changed = true;
+            }
+            if init_changed {
+                self.init_written = false;
+                self.refresh_init_if_segment_open().await?;
+            }
+        }
         let pts = (dts as i64 + composition_time_offset as i64) as u64;
         self.fmp4_muxer
             .add_video_sample(sample_data, dts, pts, is_keyframe);
