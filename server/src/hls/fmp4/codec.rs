@@ -94,7 +94,17 @@ impl Fmp4Muxer {
     fn audio_codec_string(&self) -> Option<String> {
         let codec = self.audio_codec?;
         match codec {
-            AudioCodec::Aac => Some("mp4a.40.2".to_string()),
+            AudioCodec::Aac => {
+                let config = self.audio_config.as_ref()?;
+                if config.is_empty() {
+                    return Some("mp4a.40.2".to_string());
+                }
+                let audio_object_type = config[0] >> 3;
+                if audio_object_type == 0 || audio_object_type == 31 {
+                    return Some("mp4a.40.2".to_string());
+                }
+                Some(format!("mp4a.40.{}", audio_object_type))
+            }
             AudioCodec::Opus => Some("opus".to_string()),
             AudioCodec::Flac => Some("fLaC".to_string()),
         }
@@ -680,6 +690,33 @@ mod tests {
         assert_eq!(Fmp4Muxer::reverse_bits_32(0x60000000), 0x00000006);
         assert_eq!(Fmp4Muxer::reverse_bits_32(0xFFFFFFFF), 0xFFFFFFFF);
         assert_eq!(Fmp4Muxer::reverse_bits_32(0x00000000), 0x00000000);
+    }
+
+    #[test]
+    fn test_aac_codec_string_from_config() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Aac);
+        // AAC-LC, 44100Hz, stereo: audioObjectType=2
+        muxer.set_audio_config(vec![0x12, 0x10]);
+        assert_eq!(muxer.audio_codec_string(), Some("mp4a.40.2".to_string()));
+
+        // HE-AAC explicit (SBR), audioObjectType=5
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Aac);
+        muxer.set_audio_config(vec![0x29, 0x00]); // 0x29 >> 3 = 5
+        assert_eq!(muxer.audio_codec_string(), Some("mp4a.40.5".to_string()));
+
+        // AAC-LTP, audioObjectType=4
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Aac);
+        muxer.set_audio_config(vec![0x20, 0x00]); // 0x20 >> 3 = 4
+        assert_eq!(muxer.audio_codec_string(), Some("mp4a.40.4".to_string()));
+
+        // audioObjectType=0 (null) falls back to 2
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Aac);
+        muxer.set_audio_config(vec![0x00, 0x00]);
+        assert_eq!(muxer.audio_codec_string(), Some("mp4a.40.2".to_string()));
     }
 
     #[test]

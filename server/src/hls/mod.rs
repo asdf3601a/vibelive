@@ -15,8 +15,7 @@ pub struct HlsStreamState {
     fmp4_muxer: fmp4::Fmp4Muxer,
     has_video: bool,
     has_audio: bool,
-    first_video_ts: Option<u32>,
-    first_audio_ts: Option<u32>,
+    first_ts: Option<u32>,
     init_written: bool,
     init_data: Option<Vec<u8>>,
     segment_data: Vec<Vec<u8>>,
@@ -72,8 +71,7 @@ impl HlsStreamState {
             fmp4_muxer: fmp4::Fmp4Muxer::new(),
             has_video: false,
             has_audio: false,
-            first_video_ts: None,
-            first_audio_ts: None,
+            first_ts: None,
             init_written: false,
             init_data: None,
             segment_data: Vec::new(),
@@ -201,10 +199,10 @@ impl HlsStreamState {
         if self.is_audio_only {
             return Ok(());
         }
-        if self.first_video_ts.is_none() {
-            self.first_video_ts = Some(timestamp);
+        if self.first_ts.is_none() {
+            self.first_ts = Some(timestamp);
         }
-        let base_ts = self.first_video_ts.unwrap_or(0);
+        let base_ts = self.first_ts.unwrap_or(0);
         let dts = (timestamp.saturating_sub(base_ts)) as u64 + self.timestamp_offset;
 
         if !self.has_video {
@@ -222,8 +220,8 @@ impl HlsStreamState {
             self.rotate_segment().await.map_err(|e| {
                 tracing::error!(
                     "write_video: failed to create first segment, has_video=false, \
-                         first_video_ts={:?}, segment_index={}, error={}",
-                    self.first_video_ts,
+                         first_ts={:?}, segment_index={}, error={}",
+                    self.first_ts,
                     self.segment_index,
                     e
                 );
@@ -293,8 +291,8 @@ impl HlsStreamState {
     }
 
     pub async fn write_audio(&mut self, data: &[u8], timestamp: u32) -> anyhow::Result<()> {
-        if self.first_audio_ts.is_none() {
-            self.first_audio_ts = Some(timestamp);
+        if self.first_ts.is_none() {
+            self.first_ts = Some(timestamp);
         }
         if !self.has_audio {
             if let Some(codec) = self.audio_codec {
@@ -306,7 +304,7 @@ impl HlsStreamState {
         }
         if self.current_file.is_none() {
             if self.is_audio_only {
-                let base_ts = self.first_audio_ts.unwrap_or(0);
+                let base_ts = self.first_ts.unwrap_or(0);
                 let pts = (timestamp.saturating_sub(base_ts)) as u64 + self.timestamp_offset;
                 self.rotate_segment().await.map_err(|e| {
                     tracing::error!(
@@ -324,7 +322,7 @@ impl HlsStreamState {
                 return Ok(());
             }
         }
-        let base_ts = self.first_audio_ts.unwrap_or(0);
+        let base_ts = self.first_ts.unwrap_or(0);
         let pts = (timestamp.saturating_sub(base_ts)) as u64 + self.timestamp_offset;
         self.fmp4_muxer.add_audio_sample(Cow::Borrowed(data), pts);
         self.last_audio_pts = pts;
@@ -468,8 +466,7 @@ impl HlsStreamState {
             .last_video_pts
             .max(self.last_audio_pts)
             .saturating_add(33);
-        self.first_video_ts = None;
-        self.first_audio_ts = None;
+        self.first_ts = None;
         self.segment_index += 1;
         self.rotate_segment().await?;
         self.current_segment_start = self.timestamp_offset;

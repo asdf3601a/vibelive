@@ -62,7 +62,6 @@ pub struct Fmp4Muxer {
     audio_samples: Vec<Sample>,
     video_sequence_number: u32,
     video_base_dts: u64,
-    video_dts_tick: u64,
     audio_base_dts: u64,
     audio_sample_rate: u32,
     video_fps_num: u64,
@@ -84,7 +83,6 @@ impl Fmp4Muxer {
             audio_samples: Vec::new(),
             video_sequence_number: 0,
             video_base_dts: 0,
-            video_dts_tick: 0,
             audio_base_dts: 0,
             audio_sample_rate: 44100,
             video_fps_num: 30,
@@ -160,23 +158,7 @@ impl Fmp4Muxer {
     }
 
     pub fn add_video_sample(&mut self, data: Cow<'_, [u8]>, dts: u64, pts: u64, is_keyframe: bool) {
-        let dur_ticks = self.video_fps_den;
-
-        // Detect frame drops via RTMP timestamp vs. expected tick-based timing
-        if dur_ticks > 0 {
-            let expected_pts_ms = self.video_dts_tick * 1000 / self.video_fps_num;
-            if dts > expected_pts_ms {
-                let missing =
-                    ((dts - expected_pts_ms) * self.video_fps_num).div_ceil(1000 * dur_ticks);
-                self.video_dts_tick += missing * dur_ticks;
-            } else if dts < expected_pts_ms {
-                let extra = ((expected_pts_ms - dts) * self.video_fps_num) / (1000 * dur_ticks);
-                self.video_dts_tick = self.video_dts_tick.saturating_sub(extra * dur_ticks);
-            }
-        }
-
-        let dts_ts = self.video_dts_tick;
-        self.video_dts_tick += dur_ticks;
+        let dts_ts = dts;
 
         if self.video_samples.is_empty() {
             self.video_base_dts = dts_ts;
@@ -219,56 +201,63 @@ impl Fmp4Muxer {
     }
 
     pub fn last_video_sample_duration(&self) -> u64 {
-        self.video_samples
-            .last()
-            .map(|s| (s.duration as u64 * 1000 + self.video_fps_num / 2) / self.video_fps_num)
-            .unwrap_or(33)
+        if self.video_fps_num > 0 && self.video_fps_den > 0 {
+            (self.video_fps_den * 1000 + self.video_fps_num / 2) / self.video_fps_num
+        } else {
+            33
+        }
     }
 
     pub fn last_audio_sample_duration(&self) -> u64 {
-        self.audio_samples
-            .last()
-            .map(|s| (s.duration as u64 * 1000 + self.audio_sample_rate as u64 / 2) / self.audio_sample_rate as u64)
-            .unwrap_or(21)
+        let ticks = self.audio_frame_duration_ticks() as u64;
+        let rate = self.audio_sample_rate as u64;
+        (ticks * 1000 + rate / 2).checked_div(rate).unwrap_or(21)
+    }
+
+    fn audio_frame_duration_ticks(&self) -> u32 {
+        match self.audio_codec {
+            Some(AudioCodec::Aac) => 1024,
+            Some(AudioCodec::Opus) => self
+                .audio_samples
+                .first()
+                .and_then(|s| opus_frame_samples(&s.data))
+                .unwrap_or(960),
+            _ => {
+                if self.audio_samples.len() > 1 {
+                    let total = self.audio_samples.last().unwrap().dts
+                        - self.audio_samples.first().unwrap().dts;
+                    let cnt = self.audio_samples.len() as u64 - 1;
+                    ((total * self.audio_sample_rate as u64 + (cnt * 1000) / 2)
+                        / (cnt * 1000)) as u32
+                } else {
+                    match self.audio_codec {
+                        Some(AudioCodec::Flac) => 4096,
+                        _ => 1024,
+                    }
+                }
+            }
+        }
     }
 
     fn compute_and_set_durations(&mut self) {
-        // Video: uniform framerate-controlled duration from tick counter.
-        let video_dur = self.video_fps_den as u32;
-        for s in &mut self.video_samples {
-            s.duration = video_dur;
+        // Video: compute per-sample duration from DTS deltas (ms → timescale ticks).
+        // The last sample's duration uses the declared framerate as fallback.
+        let default_dur = self.video_fps_den as u32;
+        if self.video_samples.len() > 1 {
+            for i in 0..self.video_samples.len() - 1 {
+                let delta_ms = self.video_samples[i + 1].dts - self.video_samples[i].dts;
+                self.video_samples[i].duration =
+                    (((delta_ms * self.video_fps_num + 500) / 1000) as u32).max(1);
+            }
+            if let Some(last) = self.video_samples.last_mut() {
+                last.duration = default_dur;
+            }
+        } else if let Some(s) = self.video_samples.first_mut() {
+            s.duration = default_dur;
         }
 
         if !self.audio_samples.is_empty() {
-            // Audio: use codec-known frame sizes instead of averaging
-            // RTMP integer-millisecond timestamps.  RTMP timestamps
-            // have jitter (e.g. AAC frames alternate 23/24 ms for
-            // a true 23.22 ms frame) which produces an incorrect
-            // average and accumulates drift vs tick-perfect video.
-            let dur = match self.audio_codec {
-                Some(AudioCodec::Aac) => 1024u32,
-                Some(AudioCodec::Opus) => self
-                    .audio_samples
-                    .first()
-                    .and_then(|s| opus_frame_samples(&s.data))
-                    .unwrap_or(960),
-                _ => {
-                    // FLAC (variable block size) or unknown:
-                    // fall back to RTMP timestamp averaging
-                    if self.audio_samples.len() > 1 {
-                        let total = self.audio_samples.last().unwrap().dts
-                            - self.audio_samples.first().unwrap().dts;
-                        let cnt = self.audio_samples.len() as u64 - 1;
-                        ((total * self.audio_sample_rate as u64 + (cnt * 1000) / 2)
-                            / (cnt * 1000)) as u32
-                    } else {
-                        match self.audio_codec {
-                            Some(AudioCodec::Flac) => 4096,
-                            _ => 1024,
-                        }
-                    }
-                }
-            };
+            let dur = self.audio_frame_duration_ticks();
             for s in &mut self.audio_samples {
                 s.duration = dur;
             }
@@ -894,7 +883,7 @@ impl Fmp4Muxer {
             trun_header += 4;
         }
 
-        let mut entry_size = 4;
+        let mut entry_size = 4 + 4;
         if has_cto {
             entry_size += 4;
         }
@@ -919,12 +908,15 @@ impl Fmp4Muxer {
     ) {
         let is_video = track_id == 1;
         let is_opus_audio = !is_video && self.audio_codec == Some(AudioCodec::Opus);
-        // Video DTS is already in media timescale (from tick counter).
-        // Audio DTS is in ms — convert using sample_rate.
+        // Video and audio DTS are both in ms — convert to respective timescales.
+        // Audio uses codec-known frame durations (AAC=1024, Opus=from TOC) in
+        // the tfhd/Sample-Table, so the tfdt may not land on a codec frame
+        // boundary — a small segment-boundary trim (≤1ms) is inherent to
+        // HLS concatenation and is handled correctly during remux.
         let scaled_base_dts = if is_video {
-            base_dts
+            (base_dts * self.video_fps_num + 500) / 1000
         } else {
-            base_dts * self.audio_sample_rate as u64 / 1000
+            (base_dts * self.audio_sample_rate as u64 + 500) / 1000
         };
         let scaled_duration = if is_video {
             samples
@@ -996,7 +988,7 @@ impl Fmp4Muxer {
         if is_video {
             flags |= 0x000004;
         }
-        flags |= 0x000200;
+        flags |= 0x000100 | 0x000200;
         if has_cto {
             flags |= 0x000800;
         }
@@ -1011,6 +1003,7 @@ impl Fmp4Muxer {
         }
 
         for s in samples {
+            data.extend_from_slice(&s.duration.to_be_bytes());
             data.extend_from_slice(&s.size.to_be_bytes());
             if has_cto {
                 data.extend_from_slice(&s.composition_time_offset.to_be_bytes());
@@ -1034,8 +1027,8 @@ impl Fmp4Muxer {
 ///   bits 4-7:  frame count code
 fn opus_frame_samples(packet: &[u8]) -> Option<u32> {
     let toc = *packet.first()?;
-    let config = toc & 0x07;
-    let frame_count_code = (toc >> 4) & 0x0F;
+    let config = (toc >> 5) & 0x07;
+    let frame_count_code = toc & 0x07;
 
     // Samples per frame at 48kHz for each config value (RFC 6716 §3.1)
     let samples_per_frame: u32 = match config {
@@ -1448,10 +1441,10 @@ mod tests {
 
             if i == 0 {
                 assert!(trun_flags & 0x000004 != 0);
-                assert!(trun_flags & 0x000100 == 0);
+                assert!(trun_flags & 0x000100 != 0);
                 assert!(trun_flags & 0x000400 == 0);
             } else {
-                assert!(trun_flags & 0x000100 == 0);
+                assert!(trun_flags & 0x000100 != 0);
                 assert!(trun_flags & 0x000004 == 0);
                 assert!(trun_flags & 0x000400 == 0);
             }
@@ -1475,20 +1468,20 @@ mod tests {
                 ]);
                 let entry_off = trun_offset + 16;
                 let size = u32::from_be_bytes([
-                    frag[entry_off],
-                    frag[entry_off + 1],
-                    frag[entry_off + 2],
-                    frag[entry_off + 3],
+                    frag[entry_off + 4],
+                    frag[entry_off + 5],
+                    frag[entry_off + 6],
+                    frag[entry_off + 7],
                 ]);
                 assert_eq!(first_flags, 0x02000000);
                 assert_eq!(size, video_data.len() as u32);
             } else {
                 let entry_off = trun_offset + 12;
                 let size = u32::from_be_bytes([
-                    frag[entry_off],
-                    frag[entry_off + 1],
-                    frag[entry_off + 2],
-                    frag[entry_off + 3],
+                    frag[entry_off + 4],
+                    frag[entry_off + 5],
+                    frag[entry_off + 6],
+                    frag[entry_off + 7],
                 ]);
                 assert_eq!(size, audio_data.len() as u32);
             }
@@ -1584,14 +1577,14 @@ mod tests {
                         ]);
                         assert!(trun_flags & 0x000800 != 0, "trun should have sample_composition_time_offset flag");
                         // trun data: version(1)+flags(3)+sample_count(4)+data_offset(4)+first_flags(4)+entries
-                        // Each entry: sample_size(4)+composition_time_offset(4)
-                        // CTO is at data_offset+20 for video
-                        // CTO is in media timescale: 100ms × 30 / 1000 = 3
+                        // Each entry: duration(4)+sample_size(4)+composition_time_offset(4)
+                        // CTO is at data_offset+24 for video
+                        // CTO is in media timescale: 100ms X 30 / 1000 = 3
                         let cto = i32::from_be_bytes([
-                            frag[idata + 20],
-                            frag[idata + 21],
-                            frag[idata + 22],
-                            frag[idata + 23],
+                            frag[idata + 24],
+                            frag[idata + 25],
+                            frag[idata + 26],
+                            frag[idata + 27],
                         ]);
                         assert_eq!(cto, 3);
                         return;
@@ -1650,16 +1643,16 @@ mod tests {
         assert_eq!(opus_frame_samples(&[0x00]), Some(120));
 
         // config=3 (20ms, most common), c=0 (1 frame) → 960 samples
-        assert_eq!(opus_frame_samples(&[0x03]), Some(960));
+        assert_eq!(opus_frame_samples(&[0x60]), Some(960)); // (3<<5)|0 = 0x60
 
         // config=3, c=1 (2 frames) → 2 × 960 = 1920 samples
-        assert_eq!(opus_frame_samples(&[0x1B]), Some(1920)); // c=1 | s=1 | config=3 = 0x1B
+        assert_eq!(opus_frame_samples(&[0x61]), Some(1920)); // (3<<5)|0|1 = 0x61
 
-        // config=4 (40ms), c=8 (1 frame VBR) → 1920 samples
-        assert_eq!(opus_frame_samples(&[0x84]), Some(1920)); // c=8 | config=4 = 0x84
+        // config=4 (40ms), c=0 (1 frame) → 1920 samples
+        assert_eq!(opus_frame_samples(&[0x80]), Some(1920)); // (4<<5)|0 = 0x80
 
-        // config=3, c=11 (3 frames VBR) → 3 × 960 = 2880 samples
-        assert_eq!(opus_frame_samples(&[0xB3]), Some(2880)); // c=11 | config=3 = 0xB3
+        // config=3, c=7 (2 frames VBR) → 2 × 960 = 1920 samples
+        assert_eq!(opus_frame_samples(&[0x67]), Some(1920)); // (3<<5)|0|7 = 0x67
 
         // Empty packet → None
         assert!(opus_frame_samples(&[]).is_none());
@@ -1693,8 +1686,8 @@ mod tests {
         muxer.set_audio_config(vec![0x01, 0x02, 0x38, 0x01, 0x80, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00]);
 
         // Opus packet with TOC: config=3 (20ms), c=0 (1 frame) → 960 samples
-        // With stereo flag set (bit 3) → 0x08 | 0x03 = 0x0B
-        let toc: u8 = 0x0B;
+        // TOC = (3<<5) | 0 = 0x60
+        let toc: u8 = 0x60;
         let packet = vec![toc, 0x00, 0x01, 0x02];
         muxer.add_audio_sample(packet.into(), 0);
 

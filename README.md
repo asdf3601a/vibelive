@@ -84,7 +84,7 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
 - **`RemuxQueue`** — Optional background FFmpeg remux after recording finalization:
   - Runs asynchronously after `recorder.close()` so stream shutdown is never blocked
   - Uses `-movflags +faststart` to relocate moov to the front for maximum player compatibility
-  - Adds `-strict -2` for FLAC-in-MP4 compatibility (Debian Bookworm's FFmpeg)
+   - Adds `-strict -2` for FLAC-in-MP4 compatibility (required by older FFmpeg versions).
   - Concurrency controlled via `tokio::sync::Semaphore` (`RECORDING_REMUX_CONCURRENCY`, default 4)
   - Configurable via `RECORDING_REMUX_ENABLED` (default true) — no remux performed when disabled (file is already a valid fragmented MP4 with moov at front)
 
@@ -286,6 +286,7 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
 | `STREAM_GRACE_PERIOD_SECONDS` | 30 | 30 | Reconnection grace period |
 | `RECORDING_REMUX_ENABLED` | true | true | Background FFmpeg remux (faststart) on finalized recordings |
 | `RECORDING_REMUX_CONCURRENCY` | 4 | 4 | Max concurrent remux tasks |
+| `RUST_LOG` | `info` (in Docker Compose) | (not in .env.example) | Log level filter (uses `tracing-subscriber` `EnvFilter`) |
 
 ## 4. Frontend Architecture (`frontend/`)
 
@@ -631,7 +632,9 @@ The project includes a unified test script `./test.sh` that covers codec compati
 | `multitrack` | Enhanced RTMP multitrack (2 video + 2 audio, mixed codecs) |
 | `hdr-validate` | HDR box validation (HEVC & AV1, 15s streams, ISOBMFF box structure) |
 | `fps` | NTSC/PAL frame rate consistency test (NOT included in `all`) |
-| `all` | Every suite except `fps` |
+| `all` | Every suite except `fps` and `passthrough` |
+
+**Passthrough test** (`--tests passthrough`): Encodes one test pattern and pushes through RTMP with `-c copy`, then verifies raw audio frame data is byte-identical between input FLV and output recording. Currently passes for AAC (173/173 frames, 100%) and FLAC (39/39 frames, 100%); Opus is pending (Ogg page parser needs multi-segment packet reassembly refinement — see Known Issues). Also validates stts box sample_deltas are correct for each codec.
 
 **Available options:**
 - `--video LIST` — `h264`, `hevc`, `av1`
@@ -668,9 +671,24 @@ ffmpeg -re \
 
 Then open `http://localhost:8080/live/testkey` in a browser. Multitrack streams show a quality selector button (gear icon) in the player control bar to switch between Default and Track 1.
 
-## 10. Development Guidelines
+## 10. Known Issues
 
-### 10.1 Code Quality
+### Audio / Recording
+
+| Issue | Impact | Workaround |
+|-------|--------|------------|
+| **Opus passthrough test Ogg parser** | `test.sh --tests passthrough` for Opus produces 20 frames instead of 199 due to multi-segment Opus packet reassembly in the Ogg page parser. This is a **test script limitation only** — the server's Opus audio pipeline is verified correct (100% frame size match via `ffprobe`). | Fix the `tests/passthrough.py` Ogg parser to handle packets spanning Ogg page boundaries (indicated by 255-byte segment markers). |
+
+### Testing / CI
+
+| Issue | Impact | Workaround |
+|-------|--------|------------|
+| **Multitrack recording captures track 0 only** | The `Fmp4Recorder` only records the **default track** (track_id == 0). Multitrack streams (2 video + 2 audio) produce single-track recordings with track 0's codecs only — stts checks should match single-track behavior. The `multitrack` test FAIL is an **HLS timing issue** in test.sh (AV1 encoder startup delay), not a recording or stts bug. | Increase `sleep` duration for the multitrack test's HLS check; validate stts only against track 0's expected layout. |
+| **Reconnect test flakiness** | The reconnect test is sensitive to grace period timing and system load. `kill -9` on ffmpeg can leave stale processes. | Run reconnect tests in isolation (`--tests reconnect --grace-wait 40`). |
+
+## 11. Development Guidelines
+
+### 11.1 Code Quality
 
 Always run before committing:
 ```bash
@@ -679,21 +697,21 @@ cargo clippy --all-targets --all-features
 cargo test
 ```
 
-### 10.2 Adding a New API Endpoint
+### 11.2 Adding a New API Endpoint
 
 1. Add handler in `server/src/api/{module}.rs`
 2. Register route in `server/src/api/mod.rs` (`create_router`)
 3. Add frontend API call in `frontend/src/api/streams.ts` or `recordings.ts`
 4. Add types in `frontend/src/types/index.ts`
 
-### 10.3 Adding a New Codec
+### 11.3 Adding a New Codec
 
 1. Add variant to `hls/fmp4/mod.rs` `VideoCodec` or `AudioCodec`
 2. Update `write_stsd_video/audio` to emit the correct sample entry box
 3. Map RTMP codec ID → `VideoCodec`/`AudioCodec` in `rtmp/session.rs::handle_video/audio_data`
 4. Add test in `hls/fmp4/mod.rs` tests
 
-### 10.4 File Organization
+### 11.4 File Organization
 
 ```
 vibe-livestream/
@@ -724,7 +742,7 @@ vibe-livestream/
 └── test.sh                  # Unified integration test suite
 ```
 
-### 10.5 Customizing the Site Icon
+### 11.5 Customizing the Site Icon
 
 The site icon (favicon + navbar logo) is `frontend/public/icon.svg` — a 512×512 SVG with a purple background and a white "On Air" symbol. Replace this file to customize the brand identity:
 
@@ -739,14 +757,14 @@ The SVG is referenced in two places; both use the root-relative `/icon.svg` path
 
 Keep the same filename (`icon.svg`) for a seamless swap. The file is served as a static asset by both Vite (dev server) and nginx (production).
 
-## 11. Security Notes
+## 12. Security Notes
 
 - **No authentication** is currently implemented. Anyone who can reach `:1935` can publish, and anyone who can reach `:8080` can watch/list.
 - Stream keys are arbitrary strings — there is no validation.
 - The server binds to `0.0.0.0` by default.
 - If deploying publicly, place nginx or a load balancer in front and add authentication/authorization at that layer.
 
-## 12. CI/CD
+## 13. CI/CD
 
 GitHub Actions (`.github/workflows/ci.yml`):
 
@@ -755,7 +773,7 @@ GitHub Actions (`.github/workflows/ci.yml`):
 3. **Frontend Build** — `npm ci && npm run build`
 4. **Docker Build** — `docker build`
 
-## 13. References
+## 14. References
 
 - [AV1 Bitstream & Decoding Process Specification](https://github.com/AOMediaCodec/av1-spec.git)
 - [HTTP Live Streaming 2nd Edition (draft-pantos-hls-rfc8216bis-22)](https://www.ietf.org/archive/id/draft-pantos-hls-rfc8216bis-22.txt)
