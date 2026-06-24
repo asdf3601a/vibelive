@@ -8,7 +8,7 @@
             class="flex items-center gap-2.5 text-white font-bold text-lg tracking-tight hover:opacity-80 transition shrink-0"
           >
             <img src="/icon.svg" alt="LiveStream" class="h-7 w-7 rounded-md" />
-            LiveStream
+            <span class="hidden sm:inline">LiveStream</span>
           </router-link>
 
           <div class="flex items-center gap-3 text-sm text-text-secondary flex-nowrap">
