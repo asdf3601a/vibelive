@@ -55,35 +55,46 @@ fn build_stream_response(
     }
 }
 
-pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let sm = state.stream_manager.read().await;
-    let sizes = state.config.thumbnail_sizes.clone();
-    let media_dir = state.config.media_dir.clone();
-    let interval = state.config.thumbnail_interval_seconds;
-    let rate_limit = state.config.thumbnail_rate_limit_seconds;
-    let semaphore = state.thumbnail_semaphore.clone();
+/// Fire-and-forget live-stream thumbnail generation so the static files exist
+/// for nginx to serve. Shared by the list and get endpoints.
+fn spawn_stream_thumbnails(state: &Arc<AppState>, info: &crate::rtmp::PublisherInfo) {
+    let md = state.config.media_dir.clone();
+    let sz = state.config.thumbnail_sizes.clone();
+    let iv = state.config.thumbnail_interval_seconds;
+    let rl = state.config.thumbnail_rate_limit_seconds;
+    let ended = info.ended.clone();
+    let last_attempt = info.last_thumbnail_attempt_secs.clone();
+    let sem = state.thumbnail_semaphore.clone();
+    let key = info.stream_key.clone();
+    tokio::spawn(async move {
+        let _ = crate::thumbnail::generate_thumbnails_for_stream(
+            crate::thumbnail::StreamThumbnailRequest {
+                media_dir: &md,
+                stream_key: &key,
+                sizes: &sz,
+                interval_seconds: iv,
+                rate_limit_seconds: rl,
+                ended_flag: Some(ended),
+                last_attempt: Some(last_attempt),
+                semaphore: sem,
+            },
+        )
+        .await;
+    });
+}
 
+pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sizes = state.config.thumbnail_sizes.clone();
+    let sm = state.stream_manager.read().await;
     let mut streams: Vec<StreamResponse> = sm
         .publishers()
         .values()
         .map(|info| {
-            // Fire-and-forget thumbnail generation so static files exist for nginx
-            let key = info.stream_key.clone();
-            let md = media_dir.clone();
-            let sz = sizes.clone();
-            let iv = interval;
-            let rl = rate_limit;
-            let ended = info.ended.clone();
-            let last_attempt = info.last_thumbnail_attempt_secs.clone();
-            let sem = semaphore.clone();
-            tokio::spawn(async move {
-                let _ = crate::thumbnail::generate_thumbnails_for_stream(
-                    &md, &key, &sz, iv, rl, Some(ended), Some(last_attempt), sem,
-                ).await;
-            });
+            spawn_stream_thumbnails(&state, info);
             build_stream_response(info, &sizes)
         })
         .collect();
+    drop(sm);
 
     streams.sort_by(|a, b| a.stream_key.cmp(&b.stream_key));
 
@@ -94,21 +105,7 @@ pub async fn get(State(state): State<Arc<AppState>>, Path(key): Path<String>) ->
     let sm = state.stream_manager.read().await;
     match sm.get_publisher(&key) {
         Some(info) => {
-            // Fire-and-forget thumbnail generation
-            let md = state.config.media_dir.clone();
-            let sz = state.config.thumbnail_sizes.clone();
-            let iv = state.config.thumbnail_interval_seconds;
-            let rl = state.config.thumbnail_rate_limit_seconds;
-            let ended = info.ended.clone();
-            let last_attempt = info.last_thumbnail_attempt_secs.clone();
-            let sem = state.thumbnail_semaphore.clone();
-            let stream_key = key.clone();
-            tokio::spawn(async move {
-                let _ = crate::thumbnail::generate_thumbnails_for_stream(
-                    &md, &stream_key, &sz, iv, rl, Some(ended), Some(last_attempt), sem,
-                )
-                .await;
-            });
+            spawn_stream_thumbnails(&state, info);
 
             (
                 StatusCode::OK,

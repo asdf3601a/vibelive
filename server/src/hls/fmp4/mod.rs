@@ -12,11 +12,33 @@ pub enum VideoCodec {
     AV1,
 }
 
+impl VideoCodec {
+    /// Human-readable name used in stream metadata and track listings.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::H264 => "H264",
+            Self::H265 => "HEVC",
+            Self::AV1 => "AV1",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AudioCodec {
     Aac,
     Opus,
     Flac,
+}
+
+impl AudioCodec {
+    /// Human-readable name used in stream metadata and track listings.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Aac => "AAC",
+            Self::Opus => "Opus",
+            Self::Flac => "FLAC",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +70,10 @@ pub struct HdrMetadata {
     pub max_luminance: u32,
     pub min_luminance: u32,
 }
+
+/// Sample-entry flag bits written into trun/tfhd (ISOBMFF §8.8.3).
+const SAMPLE_FLAG_KEYFRAME: u32 = 0x02000000;
+const SAMPLE_FLAG_NON_KEYFRAME: u32 = 0x01010000;
 
 pub struct Fmp4Muxer {
     video_codec: Option<VideoCodec>,
@@ -158,14 +184,16 @@ impl Fmp4Muxer {
     }
 
     pub fn add_video_sample(&mut self, data: Cow<'_, [u8]>, dts: u64, pts: u64, is_keyframe: bool) {
-        let dts_ts = dts;
-
         if self.video_samples.is_empty() {
-            self.video_base_dts = dts_ts;
+            self.video_base_dts = dts;
         }
 
         let size = data.len() as u32;
-        let flags = if is_keyframe { 0x02000000 } else { 0x01010000 };
+        let flags = if is_keyframe {
+            SAMPLE_FLAG_KEYFRAME
+        } else {
+            SAMPLE_FLAG_NON_KEYFRAME
+        };
         let diff = pts as i64 - dts as i64;
         let cto_ts = if diff >= 0 {
             (diff * self.video_fps_num as i64 + 500) / 1000
@@ -174,7 +202,7 @@ impl Fmp4Muxer {
         } as i32;
         self.video_samples.push(Sample {
             data: data.into_owned(),
-            dts: dts_ts,
+            dts,
             size,
             duration: 0,
             flags,
@@ -927,11 +955,10 @@ impl Fmp4Muxer {
             match self.audio_codec {
                 Some(AudioCodec::Aac) | Some(AudioCodec::Opus) => {
                     let frame = self.audio_frame_duration_ticks() as u64;
-                    if frame > 0 {
-                        ((scaled + frame / 2) / frame) * frame
-                    } else {
-                        scaled
-                    }
+                    (scaled + frame / 2)
+                        .checked_div(frame)
+                        .map(|q| q * frame)
+                        .unwrap_or(scaled)
                 }
                 _ => scaled,
             }
@@ -942,7 +969,11 @@ impl Fmp4Muxer {
             self.audio_frame_duration_ticks()
         };
         let default_size = samples.first().map(|s| s.size).unwrap_or(0);
-        let default_flags = if is_video { 0x01010000 } else { 0x02000000 };
+        let default_flags = if is_video {
+            SAMPLE_FLAG_NON_KEYFRAME
+        } else {
+            SAMPLE_FLAG_KEYFRAME
+        };
 
         let mut traf_data = Vec::new();
         self.write_tfhd(
@@ -1010,7 +1041,7 @@ impl Fmp4Muxer {
         data.extend_from_slice(&data_offset.to_be_bytes());
 
         if is_video {
-            let first_flags = samples.first().map(|s| s.flags).unwrap_or(0x02000000);
+            let first_flags = samples.first().map(|s| s.flags).unwrap_or(SAMPLE_FLAG_KEYFRAME);
             data.extend_from_slice(&first_flags.to_be_bytes());
         }
 

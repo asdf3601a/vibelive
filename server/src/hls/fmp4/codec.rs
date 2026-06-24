@@ -531,15 +531,17 @@ pub fn av1c_box_from_config(config: &[u8]) -> Vec<u8> {
     let config_with_sizes = ensure_av1_obu_size_fields(config);
     let h = find_av1_sequence_header(&config_with_sizes).and_then(parse_av1_sequence_header);
 
-    let profile_level = (h.as_ref().map(|s| s.seq_profile).unwrap_or(0) << 5)
-        | (h.as_ref().map(|s| s.seq_level_idx_0).unwrap_or(0) & 0x1F);
-    let flags2 = (h.as_ref().map(|s| s.seq_tier_0).unwrap_or(0) << 7)
-        | (h.as_ref().map(|s| s.high_bitdepth).unwrap_or(0) << 6)
-        | (h.as_ref().map(|s| s.twelve_bit).unwrap_or(0) << 5)
-        | (h.as_ref().map(|s| s.monochrome).unwrap_or(0) << 4)
-        | (h.as_ref().map(|s| s.chroma_subsampling_x).unwrap_or(0) << 3)
-        | (h.as_ref().map(|s| s.chroma_subsampling_y).unwrap_or(0) << 2)
-        | (h.as_ref().map(|s| s.chroma_sample_position).unwrap_or(0) & 0x03);
+    // Fall back to a zeroed header when parsing fails so a single destructure
+    // replaces the repeated `.as_ref().map(...).unwrap_or(0)` below.
+    let s = h.unwrap_or_default();
+    let profile_level = (s.seq_profile << 5) | (s.seq_level_idx_0 & 0x1F);
+    let flags2 = (s.seq_tier_0 << 7)
+        | (s.high_bitdepth << 6)
+        | (s.twelve_bit << 5)
+        | (s.monochrome << 4)
+        | (s.chroma_subsampling_x << 3)
+        | (s.chroma_subsampling_y << 2)
+        | (s.chroma_sample_position & 0x03);
 
     let mut av1c = vec![0x81, profile_level, flags2, 0x00];
     av1c.extend_from_slice(&config_with_sizes);

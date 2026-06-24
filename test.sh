@@ -237,52 +237,8 @@ check_mp4() {
     if [ "$corrupt" -eq 1 ]; then return 1; fi
 
     # stts consistency check (audio AAC frames must be uniform 1024)
-    export STTS_MP4="$mp4"
     local stts_pass
-    stts_pass=$(python3 <<'PYEOF'
-import struct, os, sys
-d = open(os.environ['STTS_MP4'], 'rb').read()
-def box(data, target, start, end):
-    o = start
-    while o + 8 <= end:
-        sz = struct.unpack('>I', data[o:o+4])[0]; tp = data[o+4:o+8]
-        if sz == 0 or o + sz > end: break
-        if tp == target: yield (o, sz)
-        if tp in (b'moov',b'trak',b'mdia',b'minf',b'stbl',b'moof'):
-            yield from box(data, target, o+8, o+sz)
-        if tp == b'stsd': yield from box(data, target, o+12, o+sz)
-        o += sz
-ok = True; found_nonempty = False
-for off, sz in box(d, b'stts', 0, len(d)):
-    ec = struct.unpack('>I', d[off+12:off+16])[0]
-    if ec == 0: continue
-    found_nonempty = True
-    pos = off + 16
-    entries = []
-    for _ in range(ec):
-        cnt = struct.unpack('>I', d[pos:pos+4])[0]; dur = struct.unpack('>I', d[pos+4:pos+8])[0]; entries.append((cnt, dur)); pos += 8
-    total = sum(e[0] for e in entries)
-    durs_str = ', '.join(f'{c}x{d}' for c,d in entries)
-    if len(entries) > 6:
-        print(f'  stts: {len(entries)} groups (expected ≤6): {durs_str[:80]}...')
-        ok = False
-    else:
-        dom_cnt, dom_dur = max(entries, key=lambda e: e[0])
-        # Flag nonstandard audio durations
-        if dom_dur not in (120, 240, 480, 512, 960, 1024, 1920, 2048, 2880, 3840, 4096, 4608, 4800):
-            print(f'  stts: {total} samples, {durs_str} - ⚠ nonstandard delta={dom_dur}')
-        else:
-            print(f'  stts: {total} samples, {durs_str}')
-        zero_frames = sum(c for c,d in entries if d <= 1)
-        if zero_frames > total * 0.05:
-            print(f'  ✗ stts: {zero_frames}/{total} frames with duration≤1 (essentially zero)')
-            ok = False
-if not found_nonempty:
-    print('  stts: fragmented MP4 (durations in moof)')
-print('OK' if ok else 'FAIL')
-sys.exit(0 if ok else 1)
-PYEOF
-) || true
+    stts_pass=$(python3 "$(dirname "$0")/tests/stts_check.py" "$mp4" 2>&1) || true
 
     echo "$stts_pass" | grep -q "^OK$" && echo -e "${GREEN}  ✓ stts consistent${NC}" || echo -e "${YELLOW}  ⚠ stts incomplete${NC}"
     echo "$stts_pass" | grep -v "^OK$" | grep -v "^FAIL$" | while IFS= read -r l; do echo "  $l"; done
@@ -429,56 +385,8 @@ run_color_test() {
                 echo -e "${RED}  ✗ HDR validation requires $hls_dir/init.mp4${NC}"
                 ok=0
             else
-            local tmp_init; tmp_init=$(mktemp); cp "$hls_dir/init.mp4" "$tmp_init" 2>/dev/null || true
             local box_out
-            box_out=$(python3 <<PYEOF
-import struct
-
-d = open("$tmp_init", 'rb').read()
-CONTAINERS = {b'moov', b'trak', b'mdia', b'minf', b'stbl'}
-SAMPLE_ENTRIES = {b'avc1', b'hvc1', b'hev1', b'av01'}
-
-def children_payload(data, off, size, typ):
-    if typ == b'stsd':
-        return off + 16, off + size  # skip FullBox header + entry_count
-    if typ in SAMPLE_ENTRIES:
-        return off + 86, off + size  # visual sample entry header
-    if typ in CONTAINERS:
-        return off + 8, off + size
-    return None
-
-def fb(data, target, start=0, end=None):
-    if end is None:
-        end = len(data)
-    off = start
-    while off + 8 <= end:
-        sz = struct.unpack('>I', data[off:off+4])[0]
-        typ = data[off+4:off+8]
-        if sz < 8 or off + sz > end:
-            break
-        if typ == target:
-            return (sz, data[off+8:off+sz])
-        child_range = children_payload(data, off, sz, typ)
-        if child_range:
-            r = fb(data, target, *child_range)
-            if r:
-                return r
-        off += sz
-    return None
-
-ok = True
-for box_name, exp_present in [(b'colr', True), (b'clli', True), (b'mdcv', True)]:
-    r = fb(d, box_name)
-    if r:
-        sz, pl = r
-        print(f'  {box_name.decode()}: present ({sz}b)')
-    else:
-        print(f'  {box_name.decode()}: MISSING' if exp_present else f'  {box_name.decode()}: absent (expected)')
-        if exp_present: ok = False
-print('HDR_OK' if ok else 'HDR_FAIL')
-PYEOF
-) || true
-            rm -f "$tmp_init"
+            box_out=$(python3 "$(dirname "$0")/tests/hdr_boxes.py" "$hls_dir/init.mp4" 2>&1) || true
             echo "$box_out" | sed 's/^/    /'
             if echo "$box_out" | grep -q "^HDR_OK$"; then
                 echo -e "${GREEN}  ✓ HDR boxes (colr/clli/mdcv) present in init.mp4${NC}"

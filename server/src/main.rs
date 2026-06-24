@@ -81,7 +81,16 @@ async fn main() -> anyhow::Result<()> {
                 let sem = sem.clone();
                 tokio::spawn(async move {
                     let _ = crate::thumbnail::generate_thumbnails_for_stream(
-                        &md, &key, &sz, iv, rl, Some(ended_flag), Some(last_attempt), sem,
+                        crate::thumbnail::StreamThumbnailRequest {
+                            media_dir: &md,
+                            stream_key: &key,
+                            sizes: &sz,
+                            interval_seconds: iv,
+                            rate_limit_seconds: rl,
+                            ended_flag: Some(ended_flag),
+                            last_attempt: Some(last_attempt),
+                            semaphore: sem,
+                        },
                     )
                     .await;
                 });

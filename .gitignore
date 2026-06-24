@@ -9,3 +9,5 @@ frontend/node_modules
 frontend/dist
 data/
 data_test/
+__pycache__/
+*.pyc

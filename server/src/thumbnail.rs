@@ -8,6 +8,20 @@ use tokio::time::timeout;
 
 const FFMPEG_TIMEOUT_SECS: u64 = 30;
 
+/// Parameters for generating live-stream thumbnails. Grouping these into a
+/// struct keeps call sites self-documenting and makes future additions
+/// non-breaking instead of growing an 8-argument function signature.
+pub struct StreamThumbnailRequest<'a> {
+    pub media_dir: &'a str,
+    pub stream_key: &'a str,
+    pub sizes: &'a [u32],
+    pub interval_seconds: u32,
+    pub rate_limit_seconds: u32,
+    pub ended_flag: Option<Arc<AtomicBool>>,
+    pub last_attempt: Option<Arc<AtomicU64>>,
+    pub semaphore: Arc<Semaphore>,
+}
+
 async fn find_latest_segment(dir: &PathBuf) -> anyhow::Result<PathBuf> {
     let mut latest: Option<(u32, PathBuf)> = None;
     let mut rd = tokio::fs::read_dir(dir).await?;
@@ -29,17 +43,20 @@ async fn find_latest_segment(dir: &PathBuf) -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("no finalized segments found"))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn generate_thumbnails_for_stream(
-    media_dir: &str,
-    stream_key: &str,
-    sizes: &[u32],
-    interval_seconds: u32,
-    rate_limit_seconds: u32,
-    ended_flag: Option<Arc<AtomicBool>>,
-    last_attempt: Option<Arc<AtomicU64>>,
-    semaphore: Arc<Semaphore>,
+    req: StreamThumbnailRequest<'_>,
 ) -> anyhow::Result<Vec<PathBuf>> {
+    let StreamThumbnailRequest {
+        media_dir,
+        stream_key,
+        sizes,
+        interval_seconds,
+        rate_limit_seconds,
+        ended_flag,
+        last_attempt,
+        semaphore,
+    } = req;
+
     // Rate-limit check first (cheapest, no I/O)
     if let Some(ref attempt_ts) = last_attempt {
         let now = SystemTime::now()
