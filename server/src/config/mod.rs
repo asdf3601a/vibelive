@@ -12,6 +12,7 @@ pub struct Config {
     pub recording_enabled: bool,
     pub thumbnail_sizes: Vec<u32>,
     pub thumbnail_interval_seconds: u32,
+    pub thumbnail_live_update: bool,
     pub recordings_base_url: String,
     pub stream_grace_period_seconds: u64,
     pub recording_remux_enabled: bool,
@@ -49,7 +50,10 @@ impl Config {
                 .parse()?,
             thumbnail_sizes,
             thumbnail_interval_seconds: env::var("THUMBNAIL_INTERVAL_SECONDS")
-                .unwrap_or_else(|_| "10".into())
+                .unwrap_or_else(|_| "300".into())
+                .parse()?,
+            thumbnail_live_update: env::var("THUMBNAIL_LIVE_UPDATE")
+                .unwrap_or_else(|_| "true".into())
                 .parse()?,
             recordings_base_url: env::var("RECORDINGS_BASE_URL")
                 .unwrap_or_else(|_| "/recordings".into()),

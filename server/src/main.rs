@@ -18,6 +18,7 @@ pub struct AppState {
     pub config: config::Config,
     pub remux_queue: Arc<recording::RemuxQueue>,
     pub thumbnail_semaphore: Arc<Semaphore>,
+    pub recording_thumbnail_semaphore: Arc<Semaphore>,
 }
 
 #[tokio::main]
@@ -37,6 +38,9 @@ async fn main() -> anyhow::Result<()> {
             cfg.recording_remux_concurrency as usize,
         )),
         thumbnail_semaphore: Arc::new(Semaphore::new(
+            cfg.thumbnail_ffmpeg_concurrency as usize,
+        )),
+        recording_thumbnail_semaphore: Arc::new(Semaphore::new(
             cfg.thumbnail_ffmpeg_concurrency as usize,
         )),
     });
@@ -73,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
             let sizes = thumb_state.config.thumbnail_sizes.clone();
             let iv = thumb_state.config.thumbnail_interval_seconds;
             let rl = thumb_state.config.thumbnail_rate_limit_seconds;
+            let lu = thumb_state.config.thumbnail_live_update;
             let sem = thumb_state.thumbnail_semaphore.clone();
             drop(sm);
             for (key, ended_flag, last_attempt) in tasks {
@@ -87,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
                             sizes: &sz,
                             interval_seconds: iv,
                             rate_limit_seconds: rl,
+                            live_update: lu,
                             ended_flag: Some(ended_flag),
                             last_attempt: Some(last_attempt),
                             semaphore: sem,

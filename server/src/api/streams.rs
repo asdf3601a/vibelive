@@ -62,6 +62,7 @@ fn spawn_stream_thumbnails(state: &Arc<AppState>, info: &crate::rtmp::PublisherI
     let sz = state.config.thumbnail_sizes.clone();
     let iv = state.config.thumbnail_interval_seconds;
     let rl = state.config.thumbnail_rate_limit_seconds;
+    let lu = state.config.thumbnail_live_update;
     let ended = info.ended.clone();
     let last_attempt = info.last_thumbnail_attempt_secs.clone();
     let sem = state.thumbnail_semaphore.clone();
@@ -74,6 +75,7 @@ fn spawn_stream_thumbnails(state: &Arc<AppState>, info: &crate::rtmp::PublisherI
                 sizes: &sz,
                 interval_seconds: iv,
                 rate_limit_seconds: rl,
+                live_update: lu,
                 ended_flag: Some(ended),
                 last_attempt: Some(last_attempt),
                 semaphore: sem,

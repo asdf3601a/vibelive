@@ -407,28 +407,52 @@ async fn finalize_stream(
                 .and_then(|n| n.to_str())
                 .map(|n| n.to_string())
                 .unwrap_or_default();
-            let thumbnail_semaphore = app_state.thumbnail_semaphore.clone();
+            let recording_thumbnail_semaphore = app_state.recording_thumbnail_semaphore.clone();
             tokio::spawn(async move {
                 // Enqueue remux FIRST (runs in background, own semaphore handles concurrency)
                 app_state.remux_queue.enqueue(remux_path);
 
-                // Generate recording thumbnails (acquires thumbnail semaphore)
+                // Generate recording thumbnails (acquires the recording-dedicated
+                // semaphore so live-thumbnail peaks cannot starve post-recording
+                // generation). Unlike live thumbnails, failures are retried since a
+                // recording is a one-shot artifact that won't be regenerated later.
                 let thumb_dir = PathBuf::from(&media_dir)
                     .join("thumbnails")
                     .join("recordings");
-                if let Err(e) = crate::thumbnail::generate_thumbnails_for_file(
-                    &mp4_path,
-                    &thumb_dir,
-                    &sizes,
-                    thumbnail_semaphore,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        "Post-recording thumbnail generation failed for {}: {}",
-                        key,
-                        e
-                    );
+                for attempt in 1..=RECORDING_THUMBNAIL_MAX_ATTEMPTS {
+                    match crate::thumbnail::generate_thumbnails_for_file(
+                        &mp4_path,
+                        &thumb_dir,
+                        &sizes,
+                        recording_thumbnail_semaphore.clone(),
+                    )
+                    .await
+                    {
+                        Ok(_) => break,
+                        Err(e) => {
+                            if attempt < RECORDING_THUMBNAIL_MAX_ATTEMPTS {
+                                tracing::warn!(
+                                    "Recording thumbnail attempt {}/{} failed for {}: {}; retrying in {}s",
+                                    attempt,
+                                    RECORDING_THUMBNAIL_MAX_ATTEMPTS,
+                                    key,
+                                    e,
+                                    RECORDING_THUMBNAIL_RETRY_DELAY_SECS
+                                );
+                                tokio::time::sleep(tokio::time::Duration::from_secs(
+                                    RECORDING_THUMBNAIL_RETRY_DELAY_SECS,
+                                ))
+                                .await;
+                            } else {
+                                tracing::warn!(
+                                    "Recording thumbnail generation failed after {} attempts for {}: {}",
+                                    RECORDING_THUMBNAIL_MAX_ATTEMPTS,
+                                    key,
+                                    e
+                                );
+                            }
+                        }
+                    }
                 }
 
                 if let Err(e) = crate::recording::update_index_json(
@@ -864,6 +888,9 @@ fn audio_codec_id_name(id: u32) -> String {
         other => other.to_string(),
     }
 }
+
+const RECORDING_THUMBNAIL_MAX_ATTEMPTS: u32 = 3;
+const RECORDING_THUMBNAIL_RETRY_DELAY_SECS: u64 = 5;
 
 const MDCV_CHROMA_DEN: f64 = 50000.0;
 const MDCV_LUMA_DEN: f64 = 10000.0;

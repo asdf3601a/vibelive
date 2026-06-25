@@ -17,6 +17,7 @@ pub struct StreamThumbnailRequest<'a> {
     pub sizes: &'a [u32],
     pub interval_seconds: u32,
     pub rate_limit_seconds: u32,
+    pub live_update: bool,
     pub ended_flag: Option<Arc<AtomicBool>>,
     pub last_attempt: Option<Arc<AtomicU64>>,
     pub semaphore: Arc<Semaphore>,
@@ -52,6 +53,7 @@ pub async fn generate_thumbnails_for_stream(
         sizes,
         interval_seconds,
         rate_limit_seconds,
+        live_update,
         ended_flag,
         last_attempt,
         semaphore,
@@ -127,8 +129,13 @@ pub async fn generate_thumbnails_for_stream(
             }
         }
 
-        // Check if existing PNG thumbnail is fresh enough (PNG is the canonical indicator)
-        let should_generate = if let Ok(meta) = tokio::fs::metadata(&png_path).await {
+        // Decide whether to (re)generate. In once-mode (live_update=false) we
+        // only generate when no thumbnail exists yet, then never refresh.
+        // In live-update mode we regenerate once the PNG is older than the
+        // configured interval. PNG is the canonical existence indicator.
+        let should_generate = if !live_update {
+            !tokio::fs::try_exists(&png_path).await.unwrap_or(false)
+        } else if let Ok(meta) = tokio::fs::metadata(&png_path).await {
             if let Ok(modified) = meta.modified() {
                 modified.elapsed().unwrap_or(Duration::MAX)
                     >= Duration::from_secs(interval_seconds as u64)

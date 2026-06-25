@@ -258,12 +258,11 @@ impl RemuxQueue {
         }
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let permit = this.semaphore.acquire().await;
+            let _permit = this.semaphore.acquire().await;
             tracing::info!("Remuxing recording: {}", path.display());
             if let Err(e) = remux_fmp4_to_mp4(&path).await {
                 tracing::warn!("Remux failed for {}: {}", path.display(), e);
             }
-            drop(permit);
         });
     }
 }
