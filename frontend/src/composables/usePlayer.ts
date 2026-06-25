@@ -816,6 +816,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   let lastTapTime = 0
 
   let touchHandled = false
+  let tapRegion: 'left' | 'center' | 'right' | null = null
 
   function handleTouchStart(e: TouchEvent) {
     touchHandled = false
@@ -834,25 +835,42 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
     }
     lastTapTime = now
 
-    if (touchCount === 2) {
-      const rect = containerRef.value?.getBoundingClientRect()
-      if (!rect) return
+    const rect = containerRef.value?.getBoundingClientRect()
+    if (rect) {
       const x = touchStartX - rect.left
       const third = rect.width / 3
-      if (x < third) {
+      if (x < third) tapRegion = 'left'
+      else if (x > rect.width - third) tapRegion = 'right'
+      else tapRegion = 'center'
+    }
+
+    if (touchCount === 2) {
+      touchHandled = true
+      if (!rect) return
+      if (tapRegion === 'left') {
         dynamicSeek('backward')
-        touchHandled = true
-      } else if (x > rect.width - third) {
+      } else if (tapRegion === 'right') {
         dynamicSeek('forward')
-        touchHandled = true
       }
       touchCount = 0
     }
   }
 
   function handleTouchEnd(_e: TouchEvent) {
-    // Single tap on the video area only shows controls (already done in touchstart).
-    // Play/pause is handled exclusively by the explicit buttons.
+    // Single tap on the video area only shows controls.
+    // Play/pause is handled by handleClick() based on tap region.
+  }
+
+  function handleClick() {
+    if (touchHandled) {
+      touchHandled = false
+      tapRegion = null
+      return
+    }
+    if (tapRegion === 'center' || tapRegion === null) {
+      togglePlay()
+    }
+    tapRegion = null
   }
 
   return {
@@ -933,6 +951,7 @@ currentHlsLevel,
     handleKeydown,
     handleTouchStart,
     handleTouchEnd,
+    handleClick,
     attachVideoEvents,
     detachVideoEvents,
     destroy,

@@ -13,7 +13,7 @@
     tabindex="0"
   >
     <!-- Video element (clipped to rounded corners) -->
-    <div class="absolute inset-0 overflow-hidden rounded-[inherit]" @click="togglePlay">
+    <div class="absolute inset-0 overflow-hidden rounded-[inherit]" @click="handleClick">
       <video
         ref="videoRef"
         class="absolute inset-0 w-full h-full"
@@ -370,6 +370,7 @@ currentHlsLevel,
   handleKeydown,
   handleTouchStart,
   handleTouchEnd,
+  handleClick,
   attachVideoEvents,
   detachVideoEvents,
   destroy,
