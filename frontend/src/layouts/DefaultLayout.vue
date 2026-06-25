@@ -27,8 +27,9 @@
     </main>
 
     <footer class="border-t border-border-default mt-auto py-4 text-center text-xs text-text-muted">
-      RTMP Ingest → fMP4/HLS
+      LiveStream — Self-hosted live streaming
     </footer>
+
   </div>
 </template>
 
