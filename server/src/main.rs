@@ -30,6 +30,16 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let cfg = config::Config::from_env()?;
 
+    // Probe ffmpeg codecs once at startup so thumbnail generation skips
+    // unavailable formats (libjxl, libaom-av1) instead of wasting retries.
+    let (jxl_ok, avif_ok) = thumbnail::probe_codecs().await;
+    thumbnail::init_codec_info(jxl_ok, avif_ok);
+    tracing::info!(
+        "Thumbnail codecs — jxl: {}, avif: {}, png: always available",
+        if jxl_ok { "available" } else { "unavailable" },
+        if avif_ok { "available" } else { "unavailable" },
+    );
+
     let app_state = Arc::new(AppState {
         stream_manager: RwLock::new(rtmp::StreamManager::new()),
         config: cfg.clone(),

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -249,21 +248,17 @@ impl RemuxQueue {
         }
     }
 
-    /// Enqueue a recording for background remuxing.
-    /// If remux is disabled or concurrency is zero, this is a no-op.
-    /// Returns immediately; the actual remux runs in a spawned task.
-    pub fn enqueue(self: &Arc<Self>, path: PathBuf) {
+    /// Execute remux inline, acquiring the semaphore to respect concurrency.
+    /// Waits until the remux completes. Returns Ok(()) if remux is disabled.
+    /// Callers should proceed even on error — thumbnail generation still
+    /// works without faststart, just slightly less efficient.
+    pub async fn remux_now(&self, path: &std::path::Path) -> anyhow::Result<()> {
         if !self.enabled {
-            return;
+            return Ok(());
         }
-        let this = Arc::clone(self);
-        tokio::spawn(async move {
-            let _permit = this.semaphore.acquire().await;
-            tracing::info!("Remuxing recording: {}", path.display());
-            if let Err(e) = remux_fmp4_to_mp4(&path).await {
-                tracing::warn!("Remux failed for {}: {}", path.display(), e);
-            }
-        });
+        let _permit = self.semaphore.acquire().await;
+        tracing::info!("Remuxing recording: {}", path.display());
+        remux_fmp4_to_mp4(path).await
     }
 }
 

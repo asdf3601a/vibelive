@@ -409,8 +409,16 @@ async fn finalize_stream(
                 .unwrap_or_default();
             let recording_thumbnail_semaphore = app_state.recording_thumbnail_semaphore.clone();
             tokio::spawn(async move {
-                // Enqueue remux FIRST (runs in background, own semaphore handles concurrency)
-                app_state.remux_queue.enqueue(remux_path);
+                // Remux to faststart BEFORE thumbnail generation so we get
+                // efficient single-pass extraction. If remux fails, proceed
+                // anyway — thumbnails still work, just marginally slower.
+                if let Err(e) = app_state.remux_queue.remux_now(&remux_path).await {
+                    tracing::warn!(
+                        "Recording remux failed for {}: {} — proceeding with thumbnails anyway",
+                        key,
+                        e
+                    );
+                }
 
                 // Generate recording thumbnails (acquires the recording-dedicated
                 // semaphore so live-thumbnail peaks cannot starve post-recording
