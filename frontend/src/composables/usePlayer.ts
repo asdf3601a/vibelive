@@ -388,10 +388,6 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       ctx.close()
       autoplayAllowed.value = true
       sessionStorage.setItem('player_autoplay_allowed', 'true')
-      if (videoRef.value && isPlaying.value) {
-        videoRef.value.muted = false
-        isMuted.value = false
-      }
     } catch {
       /* permission not granted, fallback to muted autoplay */
     }
