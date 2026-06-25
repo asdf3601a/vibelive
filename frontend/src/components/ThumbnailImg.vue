@@ -1,12 +1,29 @@
 <template>
   <div class="group relative overflow-hidden rounded-xl bg-bg-base border border-border-default">
     <div class="w-full relative" :style="{ paddingBottom: aspectRatioPadding }">
-      <picture v-if="pngSrc && !error">
-        <source :srcset="jxlSrc" type="image/jxl">
-        <source :srcset="avifSrc" type="image/avif">
+      <!-- Multi-resolution mode (srcset + sizes) -->
+      <picture v-if="thumbnails && fallbackUrl && !error">
+        <source :srcset="jxlSrcset" :sizes="sizes" type="image/jxl">
+        <source :srcset="avifSrcset" :sizes="sizes" type="image/avif">
         <img
           :key="retryKey"
-          :src="pngSrc"
+          :src="fallbackUrl"
+          :srcset="pngSrcset"
+          :sizes="sizes"
+          alt="Stream thumbnail"
+          class="absolute inset-0 h-full w-full object-cover transition group-hover:scale-105"
+          loading="lazy"
+          @load="handleLoad"
+          @error="handleError"
+        />
+      </picture>
+      <!-- Single-URL mode (backward compatible) -->
+      <picture v-else-if="effectiveSrc && !error">
+        <source :srcset="singleJxlSrc" type="image/jxl">
+        <source :srcset="singleAvifSrc" type="image/avif">
+        <img
+          :key="retryKey"
+          :src="effectiveSrc"
           alt="Stream thumbnail"
           class="absolute inset-0 h-full w-full object-cover transition group-hover:scale-105"
           loading="lazy"
@@ -15,10 +32,10 @@
         />
       </picture>
       <!-- Loading / Placeholder state -->
-      <div v-if="!pngSrc || error || loading" class="absolute inset-0 flex items-center justify-center bg-bg-base">
+      <div v-if="!effectiveSrc || error || loading" class="absolute inset-0 flex items-center justify-center bg-bg-base">
         <div class="text-center px-4">
           <div class="mx-auto mb-2 flex h-10 w-10 items-center justify-center rounded-full bg-bg-elevated">
-            <svg v-if="loading && src" class="h-5 w-5 text-text-muted animate-spin" fill="none" viewBox="0 0 24 24">
+            <svg v-if="loading && effectiveSrc" class="h-5 w-5 text-text-muted animate-spin" fill="none" viewBox="0 0 24 24">
               <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
               <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
             </svg>
@@ -35,9 +52,12 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onUnmounted } from 'vue'
+import { useThumbnailSrcset } from '@/composables/useThumbnailSrcset'
 
 interface Props {
   src: string | null
+  thumbnails?: Record<string, string>
+  sizes?: string
   fallbackText?: string
   aspectRatio?: '16/9' | '4/3' | '1/1'
   retryIntervalMs?: number
@@ -46,6 +66,7 @@ interface Props {
 
 const props = withDefaults(defineProps<Props>(), {
   aspectRatio: '16/9',
+  sizes: '100vw',
   fallbackText: 'No preview',
   retryIntervalMs: 5000,
   maxRetries: 12,
@@ -57,12 +78,17 @@ const retryCount = ref(0)
 const retryKey = ref(0)
 let retryTimer: ReturnType<typeof setInterval> | null = null
 
-const pngSrc = computed(() => props.src)
-const jxlSrc = computed(() => pngSrc.value?.replace(/\.png$/, '.jxl'))
-const avifSrc = computed(() => pngSrc.value?.replace(/\.png$/, '.avif'))
+const thumbnailsRef = computed(() => props.thumbnails)
+const { pngSrcset, jxlSrcset, avifSrcset, fallbackUrl } = useThumbnailSrcset(thumbnailsRef)
+
+const singlePngSrc = computed(() => props.src)
+const singleJxlSrc = computed(() => singlePngSrc.value?.replace(/\.png$/, '.jxl'))
+const singleAvifSrc = computed(() => singlePngSrc.value?.replace(/\.png$/, '.avif'))
+
+const effectiveSrc = computed(() => fallbackUrl.value || singlePngSrc.value)
 
 const displayText = computed(() => {
-  if (loading.value && props.src) return 'Generating preview...'
+  if (loading.value && effectiveSrc.value) return 'Generating preview...'
   return props.fallbackText
 })
 
@@ -100,7 +126,7 @@ function stopRetry() {
   }
 }
 
-watch(() => props.src, (newSrc, oldSrc) => {
+watch(effectiveSrc, (newSrc, oldSrc) => {
   if (newSrc !== oldSrc) {
     loading.value = true
     error.value = false

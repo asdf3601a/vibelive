@@ -2,7 +2,9 @@
   <BaseCard hoverable>
     <router-link :to="`/live/${stream.stream_key}`" class="block">
       <ThumbnailImg
-        :src="thumbnailUrl"
+        :src="stream.thumbnail_url"
+        :thumbnails="stream.thumbnails"
+        sizes="(max-width: 640px) 100vw, (max-width: 1024px) 50vw, 33vw"
         :fallback-text="stream.stream_key"
         aspect-ratio="16/9"
       />
@@ -56,7 +58,6 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
 import type { Stream } from '@/types'
 import BaseCard from '@/components/ui/BaseCard.vue'
 import BaseBadge from '@/components/ui/BaseBadge.vue'
@@ -71,12 +72,6 @@ interface Props {
 }
 
 const props = defineProps<Props>()
-
-const thumbnailUrl = computed(() =>
-  props.stream.thumbnails['480']
-    || props.stream.thumbnails['320']
-    || props.stream.thumbnail_url
-)
 
 const relativeTime = useRelativeTime(props.stream.started_at)
 </script>

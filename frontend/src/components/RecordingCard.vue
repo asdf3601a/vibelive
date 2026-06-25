@@ -2,11 +2,13 @@
   <div class="flex items-center gap-2 sm:gap-4 rounded-lg border border-border-default bg-bg-surface/60 px-4 py-3 hover:bg-bg-surface transition">
     <!-- Preview thumbnail -->
     <div class="shrink-0 w-24 h-14 rounded-md overflow-hidden bg-bg-base relative group cursor-pointer" @click="$emit('play', recording)">
-      <picture v-if="thumbnailSrc && !thumbnailError" class="w-full h-full">
-        <source :srcset="jxlSrc" type="image/jxl">
-        <source :srcset="avifSrc" type="image/avif">
+      <picture v-if="fallbackUrl && !thumbnailError" class="w-full h-full">
+        <source :srcset="jxlSrcset" :sizes="thumbnailSizes" type="image/jxl">
+        <source :srcset="avifSrcset" :sizes="thumbnailSizes" type="image/avif">
         <img
-          :src="thumbnailSrc"
+          :src="fallbackUrl"
+          :srcset="pngSrcset"
+          :sizes="thumbnailSizes"
           class="w-full h-full object-cover"
           loading="lazy"
           @error="thumbnailError = true"
@@ -86,6 +88,7 @@ import { computed, ref } from 'vue'
 import type { Recording } from '@/types'
 import { formatDateTime, formatDuration, formatFileSize } from '@/utils/format'
 import { copyToClipboard } from '@/utils/clipboard'
+import { useThumbnailSrcset } from '@/composables/useThumbnailSrcset'
 import BaseButton from '@/components/ui/BaseButton.vue'
 interface Props {
   recording: Recording
@@ -98,17 +101,10 @@ defineEmits<{
 
 const thumbnailError = ref(false)
 const shareCopied = ref(false)
+const thumbnailSizes = '96px'
 
-const thumbnailSrc = computed(() => {
-  if (thumbnailError.value) return ''
-  return props.recording.thumbnails['480']
-    || props.recording.thumbnails['320']
-    || props.recording.thumbnail_url
-    || ''
-})
-
-const jxlSrc = computed(() => thumbnailSrc.value?.replace(/\.png$/, '.jxl'))
-const avifSrc = computed(() => thumbnailSrc.value?.replace(/\.png$/, '.avif'))
+const thumbnailsRef = computed(() => props.recording.thumbnails)
+const { pngSrcset, jxlSrcset, avifSrcset, fallbackUrl } = useThumbnailSrcset(thumbnailsRef)
 
 async function shareLink() {
   const url = `${window.location.origin}/recordings?play=${encodeURIComponent(props.recording.filename)}`
