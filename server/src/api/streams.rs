@@ -55,46 +55,13 @@ fn build_stream_response(
     }
 }
 
-/// Fire-and-forget live-stream thumbnail generation so the static files exist
-/// for nginx to serve. Shared by the list and get endpoints.
-fn spawn_stream_thumbnails(state: &Arc<AppState>, info: &crate::rtmp::PublisherInfo) {
-    let md = state.config.media_dir.clone();
-    let sz = state.config.thumbnail_sizes.clone();
-    let iv = state.config.thumbnail_interval_seconds;
-    let rl = state.config.thumbnail_rate_limit_seconds;
-    let lu = state.config.thumbnail_live_update;
-    let ended = info.ended.clone();
-    let last_attempt = info.last_thumbnail_attempt_secs.clone();
-    let sem = state.thumbnail_semaphore.clone();
-    let key = info.stream_key.clone();
-    tokio::spawn(async move {
-        let _ = crate::thumbnail::generate_thumbnails_for_stream(
-            crate::thumbnail::StreamThumbnailRequest {
-                media_dir: &md,
-                stream_key: &key,
-                sizes: &sz,
-                interval_seconds: iv,
-                rate_limit_seconds: rl,
-                live_update: lu,
-                ended_flag: Some(ended),
-                last_attempt: Some(last_attempt),
-                semaphore: sem,
-            },
-        )
-        .await;
-    });
-}
-
 pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sizes = state.config.thumbnail_sizes.clone();
     let sm = state.stream_manager.read().await;
     let mut streams: Vec<StreamResponse> = sm
         .publishers()
         .values()
-        .map(|info| {
-            spawn_stream_thumbnails(&state, info);
-            build_stream_response(info, &sizes)
-        })
+        .map(|info| build_stream_response(info, &sizes))
         .collect();
     drop(sm);
 
@@ -107,8 +74,6 @@ pub async fn get(State(state): State<Arc<AppState>>, Path(key): Path<String>) ->
     let sm = state.stream_manager.read().await;
     match sm.get_publisher(&key) {
         Some(info) => {
-            spawn_stream_thumbnails(&state, info);
-
             (
                 StatusCode::OK,
                 Json(serde_json::json!(build_stream_response(
