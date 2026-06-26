@@ -208,12 +208,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       hls.attachMedia(videoRef.value)
       hlsInstance = hls
 
-      const video = videoRef.value
-      if (autoplayAllowed.value) {
-        video.muted = false
-        isMuted.value = false
-      }
-      video.play().catch(() => {})
+      videoRef.value.play().catch(() => {})
     } else if (videoRef.value.canPlayType('application/vnd.apple.mpegurl')) {
       videoRef.value.src = url
     } else {
