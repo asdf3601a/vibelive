@@ -19,11 +19,6 @@ services:
     volumes:
       - ./data:/data
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 2g
-          cpus: "4.0"
 
   nginx:
     build:
@@ -38,8 +33,3 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 256m
-          cpus: "1.0"
