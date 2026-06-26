@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 pub struct HlsStreamState {
     stream_dir: PathBuf,
-    _track_id: u32,
+    track_id: u32,
     is_audio_only: bool,
     segment_duration: u32,
     current_segment_start: u64,
@@ -64,7 +64,7 @@ impl HlsStreamState {
         }
         Self {
             stream_dir: dir,
-            _track_id: track_id,
+            track_id,
             is_audio_only,
             segment_duration,
             current_segment_start: 0,
@@ -217,7 +217,6 @@ impl HlsStreamState {
         is_keyframe: bool,
         composition_time_offset: i32,
     ) -> anyhow::Result<()> {
-        use std::borrow::Cow;
         if self.is_audio_only {
             return Ok(());
         }
@@ -444,7 +443,7 @@ impl HlsStreamState {
         self.write_init_segment().await?;
         self.segment_open = true;
         self.update_playlist().await?;
-        tracing::debug!("rotate_segment: done, segment_index={}", self.segment_index);
+        tracing::debug!("rotate_segment: done, segment_index={}, track={}", self.segment_index, self.track_id);
         Ok(())
     }
 
@@ -486,7 +485,7 @@ impl HlsStreamState {
 
             self.segment_data.push(fragment.clone());
 
-            // Push segment write to DiskWriter (no fsync)
+            // Push segment write to DiskWriter
             let path = self.segment_path(self.segment_index);
             let tmp_path = path.with_extension("m4s.tmp");
             self.disk_writer.send(DiskCommand::WriteSegment {

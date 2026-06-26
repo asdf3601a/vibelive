@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
+const DISK_WRITER_CHANNEL_BOUND: usize = 10_000;
+
 pub enum DiskCommand {
     CreateDirAll { path: PathBuf },
     WriteAndRename { tmp_path: PathBuf, final_path: PathBuf, data: Vec<u8> },
@@ -17,7 +19,7 @@ pub enum DiskCommand {
 }
 
 pub struct DiskWriter {
-    tx: mpsc::UnboundedSender<DiskCommand>,
+    tx: mpsc::Sender<DiskCommand>,
 }
 
 impl Clone for DiskWriter {
@@ -36,28 +38,41 @@ impl Default for DiskWriter {
 
 impl DiskWriter {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(DISK_WRITER_CHANNEL_BOUND);
         tokio::spawn(Self::run(rx));
         Self { tx }
     }
 
-    pub fn sender(&self) -> mpsc::UnboundedSender<DiskCommand> {
+    pub fn sender(&self) -> mpsc::Sender<DiskCommand> {
         self.tx.clone()
     }
 
     pub fn send(&self, cmd: DiskCommand) {
-        if let Err(e) = self.tx.send(cmd) {
-            tracing::error!("DiskWriter: channel closed, command dropped: {}", e);
+        if let Err(e) = self.tx.try_send(cmd) {
+            tracing::error!("DiskWriter: channel send failed (backpressure or closed): {}", e);
         }
     }
 
     pub async fn flush(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.tx.send(DiskCommand::Flush { reply: tx });
+        let _ = self.tx.send(DiskCommand::Flush { reply: tx }).await;
         let _ = rx.await;
     }
 
-    async fn run(mut rx: mpsc::UnboundedReceiver<DiskCommand>) {
+    async fn fsync_file(file: &tokio::fs::File, label: &str) {
+        if let Err(e) = file.sync_data().await {
+            tracing::warn!("DiskWriter: fsync {} failed: {}", label, e);
+        }
+    }
+
+    async fn write_and_fsync(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+        let mut file = tokio::fs::File::create(path).await?;
+        file.write_all(data).await?;
+        Self::fsync_file(&file, &path.display().to_string()).await;
+        Ok(())
+    }
+
+    async fn run(mut rx: mpsc::Receiver<DiskCommand>) {
         let mut open_recordings: HashMap<String, tokio::fs::File> = HashMap::new();
 
         while let Some(cmd) = rx.recv().await {
@@ -68,7 +83,7 @@ impl DiskWriter {
                     }
                 }
                 DiskCommand::WriteAndRename { tmp_path, final_path, data } => {
-                    if let Err(e) = tokio::fs::write(&tmp_path, &data).await {
+                    if let Err(e) = Self::write_and_fsync(&tmp_path, &data).await {
                         tracing::error!("DiskWriter: write {:?} failed: {}", tmp_path, e);
                         continue;
                     }
@@ -80,7 +95,7 @@ impl DiskWriter {
                     }
                 }
                 DiskCommand::WriteSegment { tmp_path, final_path, data } => {
-                    if let Err(e) = tokio::fs::write(&tmp_path, &data).await {
+                    if let Err(e) = Self::write_and_fsync(&tmp_path, &data).await {
                         tracing::error!("DiskWriter: write segment {:?} failed: {}", tmp_path, e);
                         continue;
                     }
@@ -92,7 +107,7 @@ impl DiskWriter {
                     }
                 }
                 DiskCommand::WritePlaylist { lock_path, target_path, content } => {
-                    if let Err(e) = tokio::fs::write(&lock_path, &content).await {
+                    if let Err(e) = Self::write_and_fsync(&lock_path, content.as_bytes()).await {
                         tracing::error!("DiskWriter: write playlist {:?} failed: {}", lock_path, e);
                         continue;
                     }

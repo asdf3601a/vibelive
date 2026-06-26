@@ -1,21 +1,29 @@
 import { ref, computed, watch, onUnmounted } from 'vue'
 import Hls from 'hls.js'
 import type { TrackInfo } from '@/types'
+import { usePlayerVolume } from './playerVolume'
+import { createKeydownHandler, type SeekDirection } from './playerKeyboard'
+import { createTouchHandlers } from './playerGestures'
 
 export type PlayerState = 'idle' | 'loading' | 'playing' | 'paused' | 'buffering' | 'ended' | 'error'
-export type SeekDirection = 'forward' | 'backward'
-
-const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4, 8, 16] as const
+export type { SeekDirection }
 
 interface UsePlayerOptions {
   enableKeyboard?: boolean
   enableAutoHide?: boolean
 }
 
+function safeGetItem(storage: Storage, key: string, fallback: string = ''): string {
+  try { return storage.getItem(key) ?? fallback } catch { return fallback }
+}
+function safeSetItem(storage: Storage, key: string, value: string): void {
+  try { storage.setItem(key, value) } catch { /* Safari private browsing */ }
+}
+
 export function usePlayer(opts: UsePlayerOptions = {}) {
   const { enableKeyboard = true, enableAutoHide = true } = opts
 
-  // --- Refs ---
+  // --- Core refs ---
   const videoRef = ref<HTMLVideoElement | null>(null)
   const containerRef = ref<HTMLElement | null>(null)
   const src = ref<string | null>(null)
@@ -26,31 +34,25 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   const isPlaying = ref(false)
   const currentTime = ref(0)
   const duration = ref(0)
-  const volume = ref(Math.min(1.5, parseFloat(localStorage.getItem('player_volume') || '1')))
-  const previousVolume = ref(1)
-  const isMuted = ref(false)
-  const displayVolume = ref(volume.value)
-  const volumeBoostEnabled = ref(localStorage.getItem('player_volume_boost') === 'true')
-  const autoplayAllowed = ref(sessionStorage.getItem('player_autoplay_allowed') === 'true')
+  const autoplayAllowed = ref(safeGetItem(sessionStorage, 'player_autoplay_allowed') === 'true')
   const aspectFit = ref<'contain' | 'cover' | 'fill'>(
-    (localStorage.getItem('player_aspect_fit') as 'contain' | 'cover' | 'fill') || 'contain'
+    (safeGetItem(localStorage, 'player_aspect_fit') as 'contain' | 'cover' | 'fill') || 'contain'
   )
 
-  let audioCtx: AudioContext | null = null
-  let gainNode: GainNode | null = null
-  let audioBoostConnected = false
+  // --- Volume (delegated) ---
+  const vol = usePlayerVolume(videoRef)
 
   const volumeStage = computed(() => {
-    const v = volume.value
-    if (isMuted.value || v === 0) return 0
+    const v = vol.volume.value
+    if (vol.isMuted.value || v === 0) return 0
     if (v <= 0.25) return 1
     if (v <= 0.50) return 2
     if (v <= 0.75) return 3
     if (v <= 1.00) return 4
     return 5
   })
+  const isVolumeBoosted = computed(() => vol.volume.value > 1)
 
-  const isVolumeBoosted = computed(() => volume.value > 1)
   const playbackRate = ref(1)
   const buffered = ref<{ start: number; end: number }[]>([])
   const videoWidth = ref(0)
@@ -66,22 +68,18 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   const seekIndicator = ref<{ dir: 'forward' | 'backward'; amount: number } | null>(null)
   let seekIndicatorTimer: ReturnType<typeof setTimeout> | null = null
 
-  // Live stream effective duration (buffered edge for progress bar)
+  // Live stream
   const liveDuration = ref(0)
   const liveEdge = ref(0)
   const liveStart = ref(0)
-  const liveThreshold = ref(parseFloat(localStorage.getItem('player_live_threshold') || '10'))
+  const liveThreshold = ref(parseFloat(safeGetItem(localStorage, 'player_live_threshold', '10')))
   const isBehind = computed(() => isLive.value && liveEdge.value > 0 && (liveEdge.value - currentTime.value) > liveThreshold.value)
 
   // Debug
-  const showDebug = ref(localStorage.getItem('player_show_debug') === 'true')
-  watch(showDebug, (val) => {
-    localStorage.setItem('player_show_debug', String(val))
-  })
+  const showDebug = ref(safeGetItem(localStorage, 'player_show_debug') === 'true')
+  watch(showDebug, (val) => { safeSetItem(localStorage, 'player_show_debug', String(val)) })
 
-  watch(aspectFit, (val) => {
-    localStorage.setItem('player_aspect_fit', val)
-  })
+  watch(aspectFit, (val) => { safeSetItem(localStorage, 'player_aspect_fit', val) })
 
   // Controls visibility
   const controlsVisible = ref(true)
@@ -168,10 +166,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         state.value = isPlaying.value ? 'playing' : 'paused'
         hlsLevels.value = hls.levels.map((l, i) => ({
-          width: l.width,
-          height: l.height,
-          bitrate: l.bitrate,
-          id: i,
+          width: l.width, height: l.height, bitrate: l.bitrate, id: i,
         }))
       })
 
@@ -185,9 +180,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
         }
       })
 
-      hls.on(Hls.Events.BUFFER_APPENDED, () => {
-        updateBuffered()
-      })
+      hls.on(Hls.Events.BUFFER_APPENDED, () => { updateBuffered() })
 
       hls.on(Hls.Events.FRAG_LOADING, () => {
         if (state.value === 'playing') return
@@ -200,9 +193,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
         updateLiveBounds()
       })
 
-      hls.on(Hls.Events.LEVEL_UPDATED, () => {
-        updateLiveBounds()
-      })
+      hls.on(Hls.Events.LEVEL_UPDATED, () => { updateLiveBounds() })
 
       hls.loadSource(url)
       hls.attachMedia(videoRef.value)
@@ -217,10 +208,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   }
 
   function destroyHls() {
-    if (hlsInstance) {
-      hlsInstance.destroy()
-      hlsInstance = null
-    }
+    if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null }
     hlsLevels.value = []
     currentHlsLevel.value = -1
     hlsBandwidthEstimate.value = 0
@@ -242,10 +230,7 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
 
   function updateBuffered() {
     const v = videoRef.value
-    if (!v || !v.buffered || v.buffered.length === 0) {
-      buffered.value = []
-      return
-    }
+    if (!v || !v.buffered || v.buffered.length === 0) { buffered.value = []; return }
     const ranges: { start: number; end: number }[] = []
     for (let i = 0; i < v.buffered.length; i++) {
       ranges.push({ start: v.buffered.start(i), end: v.buffered.end(i) })
@@ -264,37 +249,18 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
     buffered.value = []
     droppedFrames.value = 0
     if (!preserveLoop) {
-      loopA.value = null
-      loopB.value = null
-      loopEnabled.value = false
+      loopA.value = null; loopB.value = null; loopEnabled.value = false
     }
-
-    if (!url || !videoRef.value) {
-      state.value = 'idle'
-      destroyHls()
-      return false
-    }
+    if (!url || !videoRef.value) { state.value = 'idle'; destroyHls(); return false }
 
     destroyHls()
-    hlsBandwidthEstimate.value = 0
-    hlsBufferLength.value = 0
-    hlsLiveLatency.value = -1
-    hlsLevelWidth.value = 0
-    hlsLevelHeight.value = 0
-    hlsLevelBitrate.value = 0
+    hlsBandwidthEstimate.value = 0; hlsBufferLength.value = 0; hlsLiveLatency.value = -1
+    hlsLevelWidth.value = 0; hlsLevelHeight.value = 0; hlsLevelBitrate.value = 0
     startDebugPoll()
-    if (videoRef.value) {
-      videoRef.value.removeAttribute('src')
-      videoRef.value.load()
-    }
+    if (videoRef.value) { videoRef.value.removeAttribute('src'); videoRef.value.load() }
 
     const isHls = url.includes('.m3u8')
-    if (isHls) {
-      setupHls(url)
-    } else {
-      videoRef.value!.src = url
-      state.value = 'playing'
-    }
+    if (isHls) { setupHls(url) } else { videoRef.value!.src = url; state.value = 'playing' }
     return true
   }
 
@@ -303,27 +269,18 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
     if (loopA.value !== null && videoRef.value.readyState >= 1) {
       videoRef.value.currentTime = loopA.value
     }
-    videoRef.value.play().then(() => {
-      state.value = 'playing'
-      isPlaying.value = true
-    }).catch(() => {})
+    videoRef.value.play().then(() => { state.value = 'playing'; isPlaying.value = true }).catch(() => {})
   }
 
   function pause() {
     if (!videoRef.value) return
     videoRef.value.pause()
-    state.value = 'paused'
-    isPlaying.value = false
+    state.value = 'paused'; isPlaying.value = false
   }
 
   function togglePlay() {
-    if (state.value === 'ended') {
-      seekTo(0)
-      play()
-      return
-    }
-    if (isPlaying.value) pause()
-    else play()
+    if (state.value === 'ended') { seekTo(0); play(); return }
+    if (isPlaying.value) pause(); else play()
   }
 
   function seekTo(time: number) {
@@ -346,33 +303,22 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
     const prev = currentTime.value
     seekTo(prev + seconds)
     const jumped = Math.round(Math.abs(currentTime.value - prev))
-    if (jumped > 0) {
-      showSeekIndicator(seconds > 0 ? 'forward' : 'backward', jumped)
-    }
+    if (jumped > 0) showSeekIndicator(seconds > 0 ? 'forward' : 'backward', jumped)
   }
 
   function dynamicSeek(dir: SeekDirection) {
     const now = Date.now()
     const delta = now - lastSeekTime.value
     lastSeekTime.value = now
-
-    if (delta < 800) {
-      seekCount.value = Math.min(seekCount.value + 1, 6)
-    } else {
-      seekCount.value = 1
-    }
-
+    if (delta < 800) { seekCount.value = Math.min(seekCount.value + 1, 6) } else { seekCount.value = 1 }
     if (seekDecayTimer) clearTimeout(seekDecayTimer)
     seekDecayTimer = setTimeout(() => { seekCount.value = 0 }, 1500)
-
     const baseJump = dir === 'forward' ? 5 : -5
     const jump = baseJump * seekCount.value
     const prev = currentTime.value
     seekTo(currentTime.value + jump)
     const jumped = Math.round(Math.abs(currentTime.value - prev))
-    if (jumped > 0) {
-      showSeekIndicator(dir, jumped)
-    }
+    if (jumped > 0) showSeekIndicator(dir, jumped)
   }
 
   async function requestAutoplayPermission() {
@@ -382,96 +328,8 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       await ctx.resume()
       ctx.close()
       autoplayAllowed.value = true
-      sessionStorage.setItem('player_autoplay_allowed', 'true')
-    } catch {
-      /* permission not granted, fallback to muted autoplay */
-    }
-  }
-
-  function setupAudioBoost() {
-    if (audioBoostConnected || !videoRef.value) return
-    try {
-      audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
-      const gain = audioCtx.createGain()
-      gain.gain.value = 1
-      const source = audioCtx.createMediaElementSource(videoRef.value)
-      source.connect(gain)
-      gain.connect(audioCtx.destination)
-      gainNode = gain
-      audioBoostConnected = true
-      videoRef.value.volume = 1
-    } catch {
-      audioBoostConnected = false
-    }
-  }
-
-  function toggleVolumeBoost() {
-    volumeBoostEnabled.value = !volumeBoostEnabled.value
-    localStorage.setItem('player_volume_boost', String(volumeBoostEnabled.value))
-    if (!volumeBoostEnabled.value && volume.value > 1) {
-      setVolume(1)
-    }
-  }
-
-  function destroyAudioBoost() {
-    if (audioCtx) {
-      audioCtx.close()
-      audioCtx = null
-    }
-    gainNode = null
-    audioBoostConnected = false
-  }
-
-  function setVolume(v: number) {
-    const maxVol = volumeBoostEnabled.value ? 1.5 : 1
-    let clamped = Math.max(0, Math.min(maxVol, v))
-
-    // Snap to 100% when boost enabled and within ±5%
-    if (volumeBoostEnabled.value && clamped > 0.95 && clamped < 1.05) {
-      clamped = 1
-    }
-
-    displayVolume.value = clamped
-    volume.value = clamped
-    if (clamped > 0) {
-      isMuted.value = false
-      previousVolume.value = clamped
-    }
-    localStorage.setItem('player_volume', String(clamped))
-
-    const video = videoRef.value
-    if (!video) return
-
-    video.muted = clamped === 0
-
-    if (clamped > 1) {
-      if (!audioBoostConnected) setupAudioBoost()
-      if (gainNode && audioCtx) {
-        video.volume = 1
-        if (audioCtx.state === 'suspended') audioCtx.resume()
-        gainNode.gain.value = clamped
-        return
-      }
-    }
-
-    if (gainNode && audioCtx) {
-      gainNode.gain.value = Math.min(1, clamped)
-      return
-    }
-
-    video.volume = Math.min(1, clamped)
-  }
-
-  function toggleMute() {
-    if (isMuted.value) {
-      const restore = previousVolume.value || 1
-      setVolume(restore)
-      isMuted.value = false
-    } else {
-      previousVolume.value = volume.value || 1
-      setVolume(0)
-      isMuted.value = true
-    }
+      safeSetItem(sessionStorage, 'player_autoplay_allowed', 'true')
+    } catch { /* permission not granted */ }
   }
 
   function setPlaybackRate(rate: number) {
@@ -481,49 +339,29 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
     playbackRate.value = rate
   }
 
-  function setAspectFit(val: 'contain' | 'cover' | 'fill') {
-    aspectFit.value = val
-  }
+  function setAspectFit(val: 'contain' | 'cover' | 'fill') { aspectFit.value = val }
 
   // A-B loop
   function setLoopA() {
     loopA.value = currentTime.value
     if (loopB.value !== null && loopA.value >= loopB.value) {
-      const tmp = loopA.value
-      loopA.value = loopB.value
-      loopB.value = tmp
+      const tmp = loopA.value; loopA.value = loopB.value; loopB.value = tmp
     }
   }
-
   function setLoopB() {
     loopB.value = currentTime.value
     if (loopA.value !== null && loopB.value <= loopA.value) {
-      const tmp = loopA.value
-      loopA.value = loopB.value
-      loopB.value = tmp
+      const tmp = loopA.value; loopA.value = loopB.value; loopB.value = tmp
     }
   }
-
-  function clearLoop() {
-    loopA.value = null
-    loopB.value = null
-    loopEnabled.value = false
-  }
-
-  function setLoopEnabled(val: boolean) {
-    loopEnabled.value = val
-  }
+  function clearLoop() { loopA.value = null; loopB.value = null; loopEnabled.value = false }
+  function setLoopEnabled(val: boolean) { loopEnabled.value = val }
 
   // Live edge
-  function seekToLiveEdge() {
-    if (liveEdge.value > 0) {
-      seekTo(liveEdge.value - 1)
-    }
-  }
-
+  function seekToLiveEdge() { if (liveEdge.value > 0) seekTo(liveEdge.value - 1) }
   function setLiveThreshold(seconds: number) {
     liveThreshold.value = Math.max(1, Math.min(60, seconds))
-    localStorage.setItem('player_live_threshold', String(liveThreshold.value))
+    safeSetItem(localStorage, 'player_live_threshold', String(liveThreshold.value))
   }
 
   // Track / quality switching
@@ -531,186 +369,85 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
     const track = tracks.value.find(t => t.track_id === trackId)
     if (!track) return
     activeTrackId.value = trackId
-    if (track.hls_url) {
-      loadSource(track.hls_url, isLive.value)
-    }
+    if (track.hls_url) loadSource(track.hls_url, isLive.value)
   }
 
   // Fullscreen
   function toggleFullscreen() {
     if (!containerRef.value) return
-    if (document.fullscreenElement) {
-      document.exitFullscreen()
-    } else {
-      containerRef.value.requestFullscreen()
-    }
+    if (document.fullscreenElement) { document.exitFullscreen() } else { containerRef.value.requestFullscreen() }
   }
 
   // Controls visibility
   function showControls() {
     controlsVisible.value = true
-    if (enableAutoHide && isPlaying.value) {
-      resetHideTimer()
-    }
+    if (enableAutoHide && isPlaying.value) resetHideTimer()
   }
-
-  function hideControls() {
-    if (showSettings.value) return
-    controlsVisible.value = false
-  }
-
+  function hideControls() { if (showSettings.value) return; controlsVisible.value = false }
   function resetHideTimer() {
     if (hideTimer) clearTimeout(hideTimer)
-    hideTimer = setTimeout(() => {
-      if (!showSettings.value) hideControls()
-    }, 2500)
+    hideTimer = setTimeout(() => { if (!showSettings.value) hideControls() }, 2500)
   }
-
   function onMouseMove() {
     if (!controlsVisible.value) showControls()
     else if (enableAutoHide && isPlaying.value) resetHideTimer()
   }
 
-  // Keyboard shortcuts
-  function handleKeydown(e: KeyboardEvent) {
-    if (!enableKeyboard) return
-    const tag = (e.target as HTMLElement)?.tagName
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+  // --- Keyboard (delegated) ---
+  const handleKeydown = createKeydownHandler({
+    enableKeyboard,
+    state,
+    volume: vol.volume,
+    playbackRate,
+    duration,
+    currentTime,
+    lastSeekTime,
+    seekCount,
+    seekDecayTimer: { get value() { return seekDecayTimer }, set value(v) { seekDecayTimer = v } },
+    togglePlay,
+    dynamicSeek,
+    seekRelative,
+    setVolume: vol.setVolume,
+    toggleMute: vol.toggleMute,
+    toggleFullscreen,
+    showControls,
+    setPlaybackRate,
+    seekTo,
+  })
 
-    switch (e.key) {
-      case ' ':
-      case 'k':
-        e.preventDefault()
-        togglePlay()
-        break
-      case 'j':
-        dynamicSeek('backward')
-        break
-      case 'l':
-        dynamicSeek('forward')
-        break
-      case 'ArrowLeft':
-        e.preventDefault()
-        seekRelative(e.shiftKey ? -10 : -5)
-        break
-      case 'ArrowRight':
-        e.preventDefault()
-        seekRelative(e.shiftKey ? 10 : 5)
-        break
-      case 'ArrowUp':
-        e.preventDefault()
-        setVolume(volume.value + 0.1)
-        break
-      case 'ArrowDown':
-        e.preventDefault()
-        setVolume(volume.value - 0.1)
-        break
-      case 'm':
-        toggleMute()
-        break
-      case 'f':
-        toggleFullscreen()
-        break
-      case 'Escape':
-        if (document.fullscreenElement) {
-          document.exitFullscreen()
-          showControls()
-        }
-        break
-      case ',':
-        if (state.value === 'paused') {
-          seekRelative(-1 / 24)
-        }
-        break
-      case '.':
-        if (state.value === 'paused') {
-          seekRelative(1 / 24)
-        }
-        break
-      case '>':
-        if (e.shiftKey) {
-          const idx = SPEEDS.indexOf(playbackRate.value as any)
-          if (idx < SPEEDS.length - 1) setPlaybackRate(SPEEDS[idx + 1])
-        }
-        break
-      case '<':
-        if (e.shiftKey) {
-          const idx = SPEEDS.indexOf(playbackRate.value as any)
-          if (idx > 0) setPlaybackRate(SPEEDS[idx - 1])
-        }
-        break
-      default:
-        if (e.key >= '0' && e.key <= '9') {
-          const pct = parseInt(e.key) / 10
-          seekTo(duration.value * pct)
-        }
-        break
-    }
-  }
+  // --- Gestures (delegated) ---
+  const gestures = createTouchHandlers({
+    containerRef,
+    dynamicSeek,
+    togglePlay,
+    showControls,
+  })
 
   // --- Video event handlers ---
-  function onVideoPlay() {
-    isPlaying.value = true
-    state.value = 'playing'
-    showControls()
-  }
-
-  function onVideoPause() {
-    isPlaying.value = false
-    state.value = 'paused'
-    controlsVisible.value = true
-  }
-
+  function onVideoPlay() { isPlaying.value = true; state.value = 'playing'; showControls() }
+  function onVideoPause() { isPlaying.value = false; state.value = 'paused'; controlsVisible.value = true }
   function onVideoEnded() {
-    if (loopEnabled.value) {
-      const startTime = loopA.value ?? 0
-      seekTo(startTime)
-      play()
-      return
-    }
-    isPlaying.value = false
-    state.value = 'ended'
-    controlsVisible.value = true
+    if (loopEnabled.value) { seekTo(loopA.value ?? 0); play(); return }
+    isPlaying.value = false; state.value = 'ended'; controlsVisible.value = true
     if (hideTimer) clearTimeout(hideTimer)
   }
-
   function onVideoTimeUpdate() {
-    const v = videoRef.value
-    if (!v) return
-    currentTime.value = v.currentTime
-    updateBuffered()
-
+    const v = videoRef.value; if (!v) return
+    currentTime.value = v.currentTime; updateBuffered()
     if (isLive.value) {
       updateLiveBounds()
       hlsLiveLatency.value = liveEdge.value > 0 ? liveEdge.value - currentTime.value : -1
       hlsBufferLength.value = liveEdge.value > 0 ? Math.max(0, liveEdge.value - currentTime.value) : 0
     }
-
-    // A-B loop
     if (loopB.value !== null && v.currentTime >= loopB.value) {
-      if (loopEnabled.value) {
-        v.currentTime = loopA.value ?? 0
-      } else {
-        v.currentTime = loopB.value
-        pause()
-      }
+      if (loopEnabled.value) { v.currentTime = loopA.value ?? 0 } else { v.currentTime = loopB.value; pause() }
     }
   }
-
   function onVideoLoadedMetadata() {
-    const v = videoRef.value
-    if (!v) return
-    duration.value = v.duration || 0
-    videoWidth.value = v.videoWidth || 0
-    videoHeight.value = v.videoHeight || 0
-    v.volume = Math.min(1, volume.value)
-    setPlaybackRate(playbackRate.value)
-    state.value = 'playing'
-
-    if (loopA.value !== null) {
-      v.currentTime = loopA.value
-    }
-
+    const v = videoRef.value; if (!v) return
+    duration.value = v.duration || 0; videoWidth.value = v.videoWidth || 0; videoHeight.value = v.videoHeight || 0
+    v.volume = Math.min(1, vol.volume.value); setPlaybackRate(playbackRate.value); state.value = 'playing'
+    if (loopA.value !== null) v.currentTime = loopA.value
     if ('webkitDroppedFrameCount' in v) {
       const pollDropped = () => {
         droppedFrames.value = (v as any).webkitDroppedFrameCount || 0
@@ -719,58 +456,33 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       requestAnimationFrame(pollDropped)
     }
   }
+  function onVideoWaiting() { if (isPlaying.value) state.value = 'buffering' }
+  function onVideoCanPlay() { if (state.value === 'buffering' || state.value === 'loading') state.value = isPlaying.value ? 'playing' : 'paused' }
+  function onVideoError() { state.value = 'error' }
 
-  function onVideoWaiting() {
-    if (isPlaying.value) state.value = 'buffering'
-  }
-
-  function onVideoCanPlay() {
-    if (state.value === 'buffering' || state.value === 'loading') {
-      state.value = isPlaying.value ? 'playing' : 'paused'
-    }
-  }
-
-  function onVideoError() {
-    state.value = 'error'
-  }
-
-  // Element-bound event listeners (to be called in onMounted)
   function attachVideoEvents() {
-    const v = videoRef.value
-    if (!v) return
-    v.addEventListener('play', onVideoPlay)
-    v.addEventListener('pause', onVideoPause)
-    v.addEventListener('ended', onVideoEnded)
-    v.addEventListener('timeupdate', onVideoTimeUpdate)
-    v.addEventListener('loadedmetadata', onVideoLoadedMetadata)
-    v.addEventListener('waiting', onVideoWaiting)
-    v.addEventListener('canplay', onVideoCanPlay)
-    v.addEventListener('error', onVideoError)
+    const v = videoRef.value; if (!v) return
+    v.addEventListener('play', onVideoPlay); v.addEventListener('pause', onVideoPause)
+    v.addEventListener('ended', onVideoEnded); v.addEventListener('timeupdate', onVideoTimeUpdate)
+    v.addEventListener('loadedmetadata', onVideoLoadedMetadata); v.addEventListener('waiting', onVideoWaiting)
+    v.addEventListener('canplay', onVideoCanPlay); v.addEventListener('error', onVideoError)
     v.addEventListener('progress', updateBuffered)
   }
-
   function detachVideoEvents() {
-    const v = videoRef.value
-    if (!v) return
-    v.removeEventListener('play', onVideoPlay)
-    v.removeEventListener('pause', onVideoPause)
-    v.removeEventListener('ended', onVideoEnded)
-    v.removeEventListener('timeupdate', onVideoTimeUpdate)
-    v.removeEventListener('loadedmetadata', onVideoLoadedMetadata)
-    v.removeEventListener('waiting', onVideoWaiting)
-    v.removeEventListener('canplay', onVideoCanPlay)
-    v.removeEventListener('error', onVideoError)
+    const v = videoRef.value; if (!v) return
+    v.removeEventListener('play', onVideoPlay); v.removeEventListener('pause', onVideoPause)
+    v.removeEventListener('ended', onVideoEnded); v.removeEventListener('timeupdate', onVideoTimeUpdate)
+    v.removeEventListener('loadedmetadata', onVideoLoadedMetadata); v.removeEventListener('waiting', onVideoWaiting)
+    v.removeEventListener('canplay', onVideoCanPlay); v.removeEventListener('error', onVideoError)
     v.removeEventListener('progress', updateBuffered)
   }
 
-  // Poll debug stats every 1s (also when paused)
+  // Debug poll
   let debugPollTimer: ReturnType<typeof setInterval> | null = null
-
   function startDebugPoll() {
     stopDebugPoll()
     debugPollTimer = setInterval(() => {
-      if (!videoRef.value) return
-      updateBuffered()
+      if (!videoRef.value) return; updateBuffered()
       if (isLive.value) {
         updateLiveBounds()
         hlsLiveLatency.value = liveEdge.value > 0 ? liveEdge.value - currentTime.value : -1
@@ -778,175 +490,37 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
       }
     }, 1000)
   }
-
-  function stopDebugPoll() {
-    if (debugPollTimer) {
-      clearInterval(debugPollTimer)
-      debugPollTimer = null
-    }
-  }
+  function stopDebugPoll() { if (debugPollTimer) { clearInterval(debugPollTimer); debugPollTimer = null } }
 
   // Cleanup
   function destroy() {
-    stopDebugPoll()
-    destroyHls()
-    destroyAudioBoost()
-    detachVideoEvents()
+    stopDebugPoll(); destroyHls(); vol.destroyAudioBoost(); detachVideoEvents()
     if (hideTimer) clearTimeout(hideTimer)
-    if (videoRef.value) {
-      videoRef.value.pause()
-      videoRef.value.removeAttribute('src')
-      videoRef.value.load()
-    }
-  }
-
-  // Touch gesture helpers
-  let touchStartX = 0
-  let touchStartY = 0
-  let touchCount = 0
-  let lastTapTime = 0
-
-  let touchHandled = false
-  let tapRegion: 'left' | 'center' | 'right' | null = null
-
-  function handleTouchStart(e: TouchEvent) {
-    touchHandled = false
-    if ((e.target as HTMLElement).closest('button, a, input, [role="button"], [data-no-gesture]')) return
-    if (e.touches.length !== 1) return
-    touchStartX = e.touches[0].clientX
-    touchStartY = e.touches[0].clientY
-
-    showControls()
-
-    const now = Date.now()
-    if (now - lastTapTime < 300) {
-      touchCount++
-    } else {
-      touchCount = 1
-    }
-    lastTapTime = now
-
-    const rect = containerRef.value?.getBoundingClientRect()
-    if (rect) {
-      const x = touchStartX - rect.left
-      const third = rect.width / 3
-      if (x < third) tapRegion = 'left'
-      else if (x > rect.width - third) tapRegion = 'right'
-      else tapRegion = 'center'
-    }
-
-    if (touchCount === 2) {
-      touchHandled = true
-      if (!rect) return
-      if (tapRegion === 'left') {
-        dynamicSeek('backward')
-      } else if (tapRegion === 'right') {
-        dynamicSeek('forward')
-      }
-      touchCount = 0
-    }
-  }
-
-  function handleTouchEnd(_e: TouchEvent) {
-    // Single tap on the video area only shows controls.
-    // Play/pause is handled by handleClick() based on tap region.
-  }
-
-  function handleClick() {
-    if (touchHandled) {
-      touchHandled = false
-      tapRegion = null
-      return
-    }
-    if (tapRegion === 'center' || tapRegion === null) {
-      togglePlay()
-    }
-    tapRegion = null
+    if (videoRef.value) { videoRef.value.pause(); videoRef.value.removeAttribute('src'); videoRef.value.load() }
   }
 
   return {
-    // refs (reactive state)
-    videoRef,
-    containerRef,
-    src,
-    tracks,
-    isLive,
-    state,
-    isPlaying,
-    currentTime,
-    duration,
-volume,
-  displayVolume,
-  volumeStage,
-  isVolumeBoosted,
-  volumeBoostEnabled,
-  isMuted,
-  playbackRate,
-    buffered,
-    videoWidth,
-    videoHeight,
-    droppedFrames,
-    loopA,
-    loopB,
-    loopEnabled,
-    showDebug,
-    controlsVisible,
-    showSettings,
-    hlsLevels,
-currentHlsLevel,
-    hlsBandwidthEstimate,
-    hlsBufferLength,
-    hlsLiveLatency,
-    hlsLevelWidth,
-    hlsLevelHeight,
-    hlsLevelBitrate,
-    activeTrackId,
-    activeTrack,
-    progress,
-  bufferedEnd,
-  progressBarDuration,
-  formattedCurrentTime,
-  formattedDuration,
-    seekIndicator,
-    liveDuration,
-    liveEdge,
-    liveStart,
-    liveThreshold,
-    isBehind,
-    seekToLiveEdge,
-    setLiveThreshold,
-    toggleVolumeBoost,
-    aspectFit,
-
+    // refs
+    videoRef, containerRef, src, tracks, isLive, state, isPlaying, currentTime, duration,
+    volume: vol.volume, displayVolume: vol.displayVolume, volumeStage, isVolumeBoosted,
+    volumeBoostEnabled: vol.volumeBoostEnabled, isMuted: vol.isMuted, playbackRate,
+    buffered, videoWidth, videoHeight, droppedFrames,
+    loopA, loopB, loopEnabled, showDebug, controlsVisible, showSettings,
+    hlsLevels, currentHlsLevel, hlsBandwidthEstimate, hlsBufferLength, hlsLiveLatency,
+    hlsLevelWidth, hlsLevelHeight, hlsLevelBitrate, activeTrackId, activeTrack,
+    progress, bufferedEnd, progressBarDuration, formattedCurrentTime, formattedDuration,
+    seekIndicator, liveDuration, liveEdge, liveStart, liveThreshold, isBehind,
+    seekToLiveEdge, setLiveThreshold, toggleVolumeBoost: vol.toggleVolumeBoost, aspectFit,
     // methods
-    loadSource,
-    play,
-    pause,
-    togglePlay,
-    seekTo,
-    seekRelative,
-    dynamicSeek,
-    setVolume,
-    toggleMute,
-    setPlaybackRate,
-    setAspectFit,
-    setLoopA,
-    setLoopB,
-    setLoopEnabled,
-    clearLoop,
-    selectTrack,
-    toggleFullscreen,
-    showControls,
-    hideControls,
-    onMouseMove,
+    loadSource, play, pause, togglePlay, seekTo, seekRelative, dynamicSeek,
+    setVolume: vol.setVolume, toggleMute: vol.toggleMute, setPlaybackRate, setAspectFit,
+    setLoopA, setLoopB, setLoopEnabled, clearLoop, selectTrack, toggleFullscreen,
+    showControls, hideControls, onMouseMove,
     handleKeydown,
-    handleTouchStart,
-    handleTouchEnd,
-    handleClick,
-    attachVideoEvents,
-    detachVideoEvents,
-    destroy,
-    autoplayAllowed,
-    requestAutoplayPermission,
+    handleTouchStart: gestures.handleTouchStart,
+    handleTouchEnd: gestures.handleTouchEnd,
+    handleClick: gestures.handleClick,
+    attachVideoEvents, detachVideoEvents, destroy,
+    autoplayAllowed, requestAutoplayPermission,
   }
 }

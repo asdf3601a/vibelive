@@ -1,3 +1,5 @@
+pub(crate) mod amf;
+pub(crate) mod color;
 pub(crate) mod enhanced;
 pub mod server;
 pub mod session;

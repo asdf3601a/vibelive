@@ -4,7 +4,7 @@
 .kilo/
 .claude/
 .playwright-cli/
-.github/
+.github/skills/
 frontend/node_modules
 frontend/dist
 data/

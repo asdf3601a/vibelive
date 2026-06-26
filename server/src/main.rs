@@ -10,7 +10,7 @@ pub mod util;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -21,6 +21,21 @@ pub struct AppState {
     pub thumbnail_semaphore: Arc<Semaphore>,
     pub recording_thumbnail_semaphore: Arc<Semaphore>,
     pub disk_writer: disk_writer::DiskWriter,
+}
+
+fn build_cors_layer(origins: &str) -> CorsLayer {
+    if origins == "*" {
+        CorsLayer::permissive()
+    } else {
+        let allowed: Vec<_> = origins
+            .split(',')
+            .map(|o| o.trim().parse::<axum::http::HeaderValue>().unwrap())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(allowed))
+            .allow_methods(Any)
+            .allow_headers(Any)
+    }
 }
 
 #[tokio::main]
@@ -124,8 +139,9 @@ async fn main() -> anyhow::Result<()> {
     let api_router = api::create_router(app_state.clone());
     let api_addr: SocketAddr = format!("{}:{}", cfg.api_host, cfg.api_port).parse()?;
 
+    let cors_layer = build_cors_layer(&cfg.cors_allowed_origins);
     let app = api_router
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer)
         .layer(TraceLayer::new_for_http());
 
     tracing::info!(
@@ -137,7 +153,22 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let listener = tokio::net::TcpListener::bind(api_addr).await?;
-    axum::serve(listener, app).await?;
+    let disk_writer_ref = app_state.disk_writer.clone();
+
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            if let Err(e) = result {
+                tracing::error!("API server error: {}", e);
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received Ctrl+C, shutting down gracefully...");
+        }
+    }
+
+    tracing::info!("Draining DiskWriter...");
+    disk_writer_ref.flush().await;
+    tracing::info!("Shutdown complete.");
 
     Ok(())
 }

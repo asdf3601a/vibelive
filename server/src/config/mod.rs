@@ -19,6 +19,7 @@ pub struct Config {
     pub recording_remux_concurrency: u32,
     pub thumbnail_ffmpeg_concurrency: u32,
     pub thumbnail_rate_limit_seconds: u32,
+    pub cors_allowed_origins: String,
 }
 
 impl Config {
@@ -72,6 +73,8 @@ impl Config {
             thumbnail_rate_limit_seconds: env::var("THUMBNAIL_RATE_LIMIT_SECONDS")
                 .unwrap_or_else(|_| "5".into())
                 .parse()?,
+            cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
+                .unwrap_or_else(|_| "*".into()),
         })
     }
 }

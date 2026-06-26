@@ -43,6 +43,10 @@ LiveStream Platform is a self-hosted live streaming server that ingests RTMP str
 | Rust API / HLS | 8081 | Internal API and HLS file serving (proxied by nginx) |
 | RTMP | 1935 | Stream ingestion |
 
+### DiskWriter
+
+All disk I/O (HLS segments, playlists, recordings, thumbnails) is decoupled from RTMP sessions via a channel-based `DiskWriter`. The RTMP session handler sends `DiskCommand` variants through a bounded `mpsc` channel (capacity 10,000) to a dedicated tokio task that serializes all filesystem operations. This prevents slow disk I/O from blocking the RTMP ingest pipeline.
+
 In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/recordings` to `localhost:8080` (nginx).
 
 ## 3. Backend Architecture (`server/`)
@@ -56,6 +60,8 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Event dispatch: `ConnectionRequested`, `PublishStreamRequested`, `VideoDataReceived`, `AudioDataReceived`, `StreamMetadataChanged`, `PublishStreamFinished`
   - **Grace period**: On disconnect, the stream enters a grace period (default 30s). If the publisher reconnects within the grace period, the existing `HlsStreamState` and `Fmp4Recorder` are resumed. Otherwise, the stream is finalized.
 - **`rtmp/enhanced.rs`** — Parses Enhanced RTMP headers (ExVideo/ExAudio, FFmpeg veovera format) to detect AV1, H.264, H.265 (HEVC), Opus, AAC, FLAC codecs. Supports **multitrack** streams (OBS/FFmpeg veovera v2 spec) with per-track codec detection and OneTrack / ManyTracks / ManyTracksManyCodecs layouts.
+- **`rtmp/amf.rs`** — AMF0 parser with depth-limited recursion (max depth 16) for Enhanced RTMP metadata. Handles Numbers, Strings, Objects, ECMA Arrays, Strict Arrays, and null/undefined values. Used to parse `colorInfo`, `hdrCll`, and `hdrMdcv` from Enhanced RTMP packets.
+- **`rtmp/color.rs`** — Color config and HDR metadata extraction from Enhanced RTMP packets. Supports both AMF0 wire format (OBS/veovera) and binary format (FFmpeg). HDR metadata includes CLLI (maxCLL/maxFALL) and MDCV (display primaries, white point, luminance).
 - **`rtmp/mod.rs`** — `StreamManager` holds two `HashMap`s:
   - `publishers`: active publishers with metadata and a `tracks` array (track_id, hls_url, video_codec, audio_codec)
   - `pending_streams`: disconnected but grace-period-active streams
@@ -73,14 +79,17 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Supports H.264, H.265 (HEVC), AV1 video + AAC, Opus, FLAC audio
   - Generates `init_segment()` (ftyp + moov), `flush_combined_fragment()` (moof + mdat)
   - Uses Sample tables with duration computation, composition time offsets, and proper `trex` defaults. Audio decode time is tracked in the codec media timescale for known fixed-frame codecs (AAC 1024-sample frames, Opus 960, FLAC 4096) so audio `tfdt.baseMediaDecodeTime` stays on the same sample grid as `tfhd.default_sample_duration` instead of being derived from rounded RTMP millisecond timestamps.
-  - **HDR metadata passthrough**: Writes `colr` (nclx with color_primaries / transfer_characteristics / matrix_coefficients / full_range), `clli` (maxCLL / maxFALL), and `mdcv` (display primaries, white point, luminance) boxes into the video sample entry when HDR metadata is present via Enhanced RTMP (AMF0 `colorInfo` or binary FFmpeg format). AV1 color config is also extracted from codec configuration OBU.
+  - **HDR metadata passthrough**: Writes `colr` (nclx with color_primaries / transfer_characteristics / matrix_coefficients / full_range), `clli` (maxCLL / maxFALL), and `mdcv` (display primaries, white point, luminance) boxes into the video sample entry. HDR metadata is sourced from three paths: (1) Enhanced RTMP AMF0 `colorInfo` (OBS/veovera), (2) Enhanced RTMP binary format (FFmpeg), (3) HEVC hvcC SEI NAL units and AV1 metadata OBUs (`hls/fmp4/codec.rs`). AV1 color config is also extracted from codec configuration OBU.
+- **`hls/fmp4/codec.rs`** — RFC 6381 codec string builders (avc1, hvc1, av01, mp4a, opus, fLaC), AV1 OBU parsing and normalization (`ensure_av1_obu_size_fields`, `av1c_box_from_config`), HEVC hvcC SEI HDR extraction (`hevc_hdr_metadata_from_hvcc`), AV1 metadata OBU HDR extraction (`av1_hdr_metadata_from_obus`), and audio config builders (`build_esds`, `build_dops`, `build_dfla`).
 
 ### 3.3 Recording (`recording/`)
 
 - **`recording/mod.rs`** — `Fmp4Recorder`:
-  - Collects init segment + all flushed segments
-  - On `close()`, concatenates into a single `.mp4` file (`{stream_key}_{YYYYMMDD}_{HHMMSS}.mp4`)
-  - `write_index_json()` scans the recordings directory and writes `recordings/index.json` with metadata and thumbnail URLs
+  - Streams recording data incrementally via `DiskWriter` channel commands (`CreateRecording`, `WriteRecordingData`, `CloseRecording`) — no in-memory buffering of the entire recording
+  - `write_init()` creates the recording file and writes the init segment (ftyp + moov). Init hash tracking prevents duplicate moov atoms on reconnect
+  - `write_segment()` rewrites each segment's `tfdt.baseMediaDecodeTime` to maintain a continuous timeline across reconnections, with gap detection and bridging
+  - On `close()`, sends `CloseRecording` which syncs and closes the file handle — output is `{stream_key}_{YYYYMMDD}_{HHMMSS}.mp4`
+  - `update_index_json()` atomically updates `recordings/index.json` with metadata and thumbnail URLs
 - **`RemuxQueue`** — Optional background FFmpeg remux after recording finalization:
   - Runs asynchronously after `recorder.close()` so stream shutdown is never blocked
   - Uses `-movflags +faststart` to relocate moov to the front for maximum player compatibility
@@ -90,14 +99,21 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
 
 ### 3.4 Thumbnails (`thumbnail.rs`)
 
-Top-level module at `server/src/thumbnail.rs`, using ffmpeg for multi-format thumbnail generation:
-- **Live thumbnails**: Concatenates `init.mp4` + latest `segment*.m4s` into a temp MP4, then runs ffmpeg
+Top-level module at `server/src/thumbnail.rs`, using a two-phase ffmpeg pipeline for multi-format thumbnail generation:
+
+**Phase 1 — PNG ref extraction**: A single ffmpeg call with `filter_complex` split+scale decodes the source video once and produces one PNG reference per configured width. This eliminates redundant MP4 reads when generating multiple resolutions.
+
+**Phase 2 — Format encoding**: JXL and AVIF are encoded from the cached PNG refs in separate ffmpeg calls. PNG is always available (built-in encoder). JXL (`libjxl`) and AVIF (`libaom-av1`) are detected at startup via `probe_codecs()` and silently skipped if unavailable.
+
+- **Live thumbnails**: Concatenates `init.mp4` + latest `segment*.m4s` into a temp MP4, then runs the two-phase pipeline
 - **Recording thumbnails**: Directly from the finalized MP4
 - **Atomic writes**: ffmpeg writes to `{output}.{fmt}.tmp`, then renames to `{output}.{fmt}` only after success. nginx never serves a partially-written file.
-- Uses `scale={width}:-1` maintaining aspect ratio
+- **Rate limiting**: Per-stream rate limiting via `THUMBNAIL_RATE_LIMIT_SECONDS` (default 5s) with atomic timestamp tracking
+- **Concurrency**: Separate semaphores for live and recording thumbnails (`THUMBNAIL_FFMPEG_CONCURRENCY`, default 4)
+- **Once-mode**: When `THUMBNAIL_LIVE_UPDATE=false`, each live stream gets a single thumbnail (generated once when none exists) instead of continuously refreshing
+- **Cleanup**: Stale 0-byte thumbnails are cleaned before generation. Live stream thumbnails are deleted when the stream ends; recording thumbnails persist indefinitely.
 - Output formats: **JPEG XL** (`-c:v libjxl -q:v 90`), **AVIF** (`-c:v libaom-av1 -crf 30 -still-picture 1`), **PNG** (fallback, always generated)
 - **Priority**: JXL → AVIF → PNG (browser picks first supported format via `<picture>`)
-- **Cleanup**: Live stream thumbnails are deleted when the stream ends; recording thumbnails persist indefinitely.
 
 ### 3.5 API (`api/`)
 
@@ -109,6 +125,8 @@ Axum router with these endpoints:
 | `GET /api/streams` | List active streams with metadata and `tracks` array |
 | `GET /api/streams/{key}` | Get single stream details (includes `tracks` with per-track HLS URLs and codecs) |
 | `GET /api/recordings` | List recordings (from index.json or fallback scan) |
+**HLS content-type middleware**: Sets correct MIME types for HLS segments (`video/mp4` for `.m4s`) and playlists (`application/vnd.apple.mpegurl` for `.m3u8`) to ensure browser compatibility.
+
 Static file serving:
 - `/hls/*` → `MEDIA_DIR/hls/*`
 - `/recordings/*` → `MEDIA_DIR/recordings/*`
@@ -281,11 +299,15 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
 | `HLS_SEGMENTS_KEEP` | 10 | 10 | Number of segments retained in the playlist (sliding window) |
 | `RECORDING_ENABLED` | true | true | Enable MP4 recording |
 | `THUMBNAIL_SIZES` | `320,480` | `320,480` | Comma-separated thumbnail widths |
-| `THUMBNAIL_INTERVAL_SECONDS` | 10 | 10 | Minimum interval between thumbnail regenerations |
+| `THUMBNAIL_INTERVAL_SECONDS` | 300 | 300 | Minimum interval between thumbnail regenerations |
 | `RECORDINGS_BASE_URL` | `/recordings` | `/recordings` | Base URL for recording links |
 | `STREAM_GRACE_PERIOD_SECONDS` | 30 | 30 | Reconnection grace period |
 | `RECORDING_REMUX_ENABLED` | true | true | Background FFmpeg remux (faststart) on finalized recordings |
 | `RECORDING_REMUX_CONCURRENCY` | 4 | 4 | Max concurrent remux tasks |
+| `THUMBNAIL_LIVE_UPDATE` | true | true | When false, each live stream gets a single thumbnail (generated once) instead of continuously refreshing |
+| `THUMBNAIL_FFMPEG_CONCURRENCY` | 4 | 4 | Max concurrent ffmpeg processes for thumbnail generation |
+| `THUMBNAIL_RATE_LIMIT_SECONDS` | 5 | 5 | Minimum interval between thumbnail regeneration attempts per stream |
+| `CORS_ALLOWED_ORIGINS` | `*` | `*` | Comma-separated list of allowed CORS origins, or `*` for permissive |
 | `RUST_LOG` | `info` (in Docker Compose) | (not in .env.example) | Log level filter (uses `tracing-subscriber` `EnvFilter`) |
 
 ## 4. Frontend Architecture (`frontend/`)
@@ -306,6 +328,7 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
 | `/` | `Home.vue` | Active stream grid with polling |
 | `/live/:key` | `LiveWatch.vue` | HLS player + stream metadata sidebar |
 | `/recordings` | `Recordings.vue` | Recordings library with filters (stream key, date range), shareable `?play=filename&loopA=&loopB=&loop=` URLs |
+| `/:pathMatch(.*)*` | `NotFound.vue` | Catch-all 404 page |
 
 ### 4.3 Key Patterns
 
@@ -325,6 +348,7 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
   - **Seek indicator**: Floating `+N`/`−N` badge on seek via keyboard/touch.
   - **Settings menu**: Speed, A-B loop, live lag threshold, volume boost toggle, debug toggle — unified row layout.
 - **Thumbnail loading**: `ThumbnailImg.vue` handles the fact that thumbnails are generated asynchronously by ffmpeg:
+  - Supports both single-URL and multi-resolution (`srcset`+`sizes`) modes via the `useThumbnailSrcset` composable
   - Uses `<picture>` with `<source type="image/jxl">`, `<source type="image/avif">`, and `<img>` PNG fallback for browser-side format negotiation.
   - Displays a loading spinner placeholder (gray background + animated spinner) while the image is not yet available.
   - If the image fails to load, auto-retries every 5 seconds up to 12 retries.
@@ -701,7 +725,7 @@ cargo test
 
 1. Add handler in `server/src/api/{module}.rs`
 2. Register route in `server/src/api/mod.rs` (`create_router`)
-3. Add frontend API call in `frontend/src/api/streams.ts` or `recordings.ts`
+3. Add frontend API call in `frontend/src/api/streams.ts`
 4. Add types in `frontend/src/types/index.ts`
 
 ### 11.3 Adding a New Codec
@@ -716,21 +740,34 @@ cargo test
 ```
 vibe-livestream/
 ├── server/src/
-│   ├── main.rs              # Entry point, AppState, axum server
+│   ├── main.rs              # Entry point, AppState, graceful shutdown
 │   ├── config/mod.rs        # Env var configuration
-│   ├── api/                 # REST API handlers
+│   ├── api/                 # REST API handlers (health, streams, recordings)
+│   ├── disk_writer.rs       # Channel-based disk I/O (segments, playlists, recordings)
 │   ├── hls/                 # HLS generation + fMP4 muxer
+│   │   ├── mod.rs           # HlsStreamState, playlist management
+│   │   └── fmp4/            # fMP4 muxer + codec string/HDR helpers
+│   │       ├── mod.rs       # Fmp4Muxer, sample tables, init/fragment generation
+│   │       └── codec.rs     # RFC 6381 codec strings, AV1 OBU, HEVC hvcC SEI HDR
 │   ├── recording/           # MP4 recording + index.json
-│   ├── rtmp/                # RTMP server + session + enhanced parsing
-│   └── thumbnail.rs         # ffmpeg thumbnail generation
+│   ├── rtmp/                # RTMP server + session + parsing
+│   │   ├── server.rs        # TcpListener, connection accept loop
+│   │   ├── session.rs       # Session lifecycle, video/audio dispatch
+│   │   ├── enhanced.rs      # Enhanced RTMP header parsing
+│   │   ├── amf.rs           # AMF0 parser (depth-limited recursion)
+│   │   └── color.rs         # Color config + HDR metadata extraction
+│   ├── thumbnail.rs         # Two-phase ffmpeg thumbnail generation
+│   └── util.rs              # ISOBMFF box utilities (find_box, read/write u32/u64)
 ├── frontend/src/
-│   ├── views/               # Page-level components
+│   ├── views/               # Page-level components (Home, LiveWatch, Recordings, NotFound)
 │   ├── components/
 │   │   ├── player/          # Player sub-components (ProgressBar, VolumeControl, SettingsMenu, TrackSelector, DebugOverlay)
-│   │   └── ...              # Other reusable UI components
-│   ├── api/                 # Typed fetch wrappers
-│   ├── composables/         # Vue composables (usePlayer, usePolling, useStream, useClipboard)
-│   ├── stores/              # Pinia stores
+│   │   ├── ui/              # Base UI components (BaseButton, BaseCard, BaseBadge, BasePill, BaseSkeleton, etc.)
+│   │   └── ...              # Other reusable UI components (StreamCard, RecordingCard, ThumbnailImg)
+│   ├── api/                 # Typed fetch wrappers (client.ts, streams.ts)
+│   ├── composables/         # Vue composables (usePlayer, usePolling, useStream, useStreamList, useClipboard, useRelativeTime, useThumbnailSrcset)
+│   ├── layouts/             # App layouts (DefaultLayout.vue)
+│   ├── stores/              # Pinia stores (stream.ts)
 │   ├── router/              # Vue Router config
 │   ├── utils/               # Utility functions (format, clipboard, deepEqual)
 │   └── types/               # TypeScript interfaces
@@ -739,7 +776,12 @@ vibe-livestream/
 ├── Dockerfile.backend       # Rust backend image (CI + Docker Compose)
 ├── Dockerfile.nginx         # Frontend + nginx image
 ├── docker-compose.yml       # Docker Compose setup (backend + nginx)
-└── test.sh                  # Unified integration test suite
+├── test.sh                  # Unified integration test suite
+└── tests/
+    ├── regen_thumbnails.sh  # Thumbnail regeneration (two-phase, faststart remux, parallel)
+    ├── hdr_boxes.py         # HDR ISOBMFF box validation
+    ├── stts_check.py        # stts box sample_delta validation
+    └── passthrough.py       # Audio passthrough frame comparison
 ```
 
 ### 11.5 Customizing the Site Icon
@@ -768,10 +810,12 @@ Keep the same filename (`icon.svg`) for a seamless swap. The file is served as a
 
 GitHub Actions (`.github/workflows/ci.yml`):
 
-1. **Check & Lint** — `cargo check`, `cargo clippy`, `cargo fmt --check`
-2. **Tests** — `cargo test -- --nocapture`
-3. **Frontend Build** — `npm ci && npm run build`
-4. **Docker Build** — `docker build`
+1. **Check & Lint** — `cargo check --workspace`, `cargo clippy --workspace`, `cargo fmt --check`
+2. **Tests** — `cargo build && cargo test -- --nocapture`
+3. **Frontend Build** — `npm ci && npm run build` (Node 22)
+4. **Docker Build** — `docker build -f Dockerfile.backend`
+
+Actions use `actions/checkout@v6`, `actions-rust-lang/setup-rust-toolchain@v1`, and `actions/setup-node@v6`.
 
 ## 14. References
 
