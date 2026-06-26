@@ -1,9 +1,10 @@
 <template>
   <div v-if="tracks.length > 1" class="relative">
     <button
+      ref="btnRef"
       class="flex items-center gap-1 px-2 py-1.5 rounded-lg text-white/80 hover:text-white hover:bg-white/10 transition text-xs font-medium cursor-pointer"
       title="Quality"
-      @click.stop="showMenu = !showMenu"
+      @click.stop="toggle"
     >
       <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
         <path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
@@ -13,29 +14,32 @@
       <span class="hidden sm:inline">{{ activeTrackLabel }}</span>
     </button>
 
-    <Transition name="quality">
-      <div
-        v-if="showMenu"
-        v-click-outside="() => showMenu = false"
-        class="absolute bottom-full right-0 mb-2 w-44 bg-bg-overlay/95 border border-border-default rounded-xl shadow-2xl overflow-hidden z-30"
-      >
-        <div class="py-1">
-          <div class="px-3 py-1.5 text-[10px] text-text-muted uppercase tracking-wider font-medium">Video Track</div>
-          <button
-            v-for="track in tracks"
-            :key="track.track_id"
-            class="w-full flex items-center justify-between px-3 py-1.5 text-xs transition"
-            :class="activeTrackId === track.track_id
-              ? 'text-accent-primary bg-accent-primary/10'
-              : 'text-text-secondary hover:bg-bg-surface hover:text-text-primary'"
-            @click="select(track.track_id)"
-          >
-            <span>{{ track.track_id === 0 ? 'Default' : `Track ${track.track_id}` }}</span>
-            <span class="font-mono text-[10px] opacity-70">{{ track.video_codec || '—' }}</span>
-          </button>
+    <Teleport to="body">
+      <Transition name="quality">
+        <div
+          v-if="showMenu"
+          v-click-outside="() => showMenu = false"
+          class="fixed w-44 bg-bg-overlay/95 border border-border-default rounded-xl shadow-2xl overflow-hidden z-[200]"
+          :style="panelStyle"
+        >
+          <div class="py-1">
+            <div class="px-3 py-1.5 text-[10px] text-text-muted uppercase tracking-wider font-medium">Video Track</div>
+            <button
+              v-for="track in tracks"
+              :key="track.track_id"
+              class="w-full flex items-center justify-between px-3 py-1.5 text-xs transition"
+              :class="activeTrackId === track.track_id
+                ? 'text-accent-primary bg-accent-primary/10'
+                : 'text-text-secondary hover:bg-bg-surface hover:text-text-primary'"
+              @click="select(track.track_id)"
+            >
+              <span>{{ track.track_id === 0 ? 'Default' : `Track ${track.track_id}` }}</span>
+              <span class="font-mono text-[10px] opacity-70">{{ track.video_codec || '—' }}</span>
+            </button>
+          </div>
         </div>
-      </div>
-    </Transition>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -54,6 +58,25 @@ const emit = defineEmits<{
 }>()
 
 const showMenu = ref(false)
+const btnRef = ref<HTMLElement | null>(null)
+const panelStyle = ref<Record<string, string>>({})
+
+function updatePanelPosition() {
+  const el = btnRef.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  panelStyle.value = {
+    bottom: `${window.innerHeight - rect.top + 8}px`,
+    right: `${window.innerWidth - rect.right}px`,
+  }
+}
+
+function toggle() {
+  showMenu.value = !showMenu.value
+  if (showMenu.value) {
+    updatePanelPosition()
+  }
+}
 
 const activeTrackLabel = computed(() => {
   const track = props.tracks.find(t => t.track_id === props.activeTrackId)
