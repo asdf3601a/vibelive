@@ -32,7 +32,7 @@ export function usePolling<T>(
 
   const data = ref<T | null>(null) as Ref<T | null>
   const error = ref<Error | null>(null)
-  const loading = ref(false)
+  const loading = ref(immediate)
   let timer: ReturnType<typeof setInterval> | null = null
   let aborted = false
 

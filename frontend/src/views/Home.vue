@@ -32,8 +32,6 @@
       </div>
     </div>
 
-  <!-- Stream grid -->
-
     <!-- Error state -->
     <BaseErrorState
       v-else-if="error"
@@ -42,47 +40,50 @@
       :on-retry="refetch"
     />
 
-    <!-- Stream setup info -->
-    <BaseCard padding :hoverable="false" class="mb-6">
-      <div class="flex items-center justify-between cursor-pointer" @click="showSetup = !showSetup">
-        <div class="flex items-center gap-2">
-          <svg class="h-4 w-4 text-accent-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+    <!-- Has data -->
+    <template v-else-if="displayedData?.length">
+      <!-- Stream setup info -->
+      <BaseCard padding :hoverable="false" class="mb-6">
+        <div class="flex items-center justify-between cursor-pointer" @click="showSetup = !showSetup">
+          <div class="flex items-center gap-2">
+            <svg class="h-4 w-4 text-accent-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span class="text-sm font-medium text-text-primary">Stream Setup</span>
+            <BaseTag>Multitrack</BaseTag>
+          </div>
+          <svg class="h-4 w-4 text-text-muted transition" :class="showSetup ? 'rotate-180' : ''" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" />
           </svg>
-          <span class="text-sm font-medium text-text-primary">Stream Setup</span>
-          <BaseTag>Multitrack</BaseTag>
         </div>
-        <svg class="h-4 w-4 text-text-muted transition" :class="showSetup ? 'rotate-180' : ''" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" />
-        </svg>
-      </div>
-      <div v-if="showSetup" class="mt-3 space-y-3 text-sm text-text-secondary">
-        <div>
-          <span class="font-medium">RTMP URL:</span>
-          <BaseCodeBlock :text="rtmpUrl" />
+        <div v-if="showSetup" class="mt-3 space-y-3 text-sm text-text-secondary">
+          <div>
+            <span class="font-medium">RTMP URL:</span>
+            <BaseCodeBlock :text="rtmpUrl" />
+          </div>
+          <div>
+            <span class="font-medium">Supported codecs:</span>
+            <span class="ml-1">Video: {{ supportedVideoCodecs.join(', ') }} / Audio: {{ supportedAudioCodecs.join(', ') }}</span>
+          </div>
+          <div>
+            <span class="font-medium">Single-track ffmpeg example:</span>
+            <BaseCodeBlock :text="exampleFfmpegSingle" :multiline="true" />
+          </div>
+          <div>
+            <span class="font-medium">Multitrack ffmpeg example:</span>
+            <BaseCodeBlock :text="exampleFfmpegMultitrack" :multiline="true" />
+          </div>
         </div>
-        <div>
-          <span class="font-medium">Supported codecs:</span>
-          <span class="ml-1">Video: {{ supportedVideoCodecs.join(', ') }} / Audio: {{ supportedAudioCodecs.join(', ') }}</span>
-        </div>
-        <div>
-          <span class="font-medium">Single-track ffmpeg example:</span>
-          <BaseCodeBlock :text="exampleFfmpegSingle" :multiline="true" />
-        </div>
-        <div>
-          <span class="font-medium">Multitrack ffmpeg example:</span>
-          <BaseCodeBlock :text="exampleFfmpegMultitrack" :multiline="true" />
-        </div>
-      </div>
-    </BaseCard>
-    <TransitionGroup
-      v-if="displayedData?.length"
-      name="stream-list"
-      tag="div"
-      class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
-    >
-      <StreamCard v-for="stream in displayedData" :key="stream.stream_key" :stream="stream" />
-    </TransitionGroup>
+      </BaseCard>
+
+      <TransitionGroup
+        name="stream-list"
+        tag="div"
+        class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
+      >
+        <StreamCard v-for="stream in displayedData" :key="stream.stream_key" :stream="stream" />
+      </TransitionGroup>
+    </template>
 
     <!-- Empty state -->
     <BaseEmptyState v-else title="No active streams" description="Start streaming to see it here.">
