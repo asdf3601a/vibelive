@@ -1,5 +1,6 @@
 mod api;
 mod config;
+pub mod disk_writer;
 mod hls;
 mod recording;
 mod rtmp;
@@ -19,6 +20,7 @@ pub struct AppState {
     pub remux_queue: Arc<recording::RemuxQueue>,
     pub thumbnail_semaphore: Arc<Semaphore>,
     pub recording_thumbnail_semaphore: Arc<Semaphore>,
+    pub disk_writer: disk_writer::DiskWriter,
 }
 
 #[tokio::main]
@@ -40,6 +42,8 @@ async fn main() -> anyhow::Result<()> {
         if avif_ok { "available" } else { "unavailable" },
     );
 
+    let disk_writer = disk_writer::DiskWriter::new();
+
     let app_state = Arc::new(AppState {
         stream_manager: RwLock::new(rtmp::StreamManager::new()),
         config: cfg.clone(),
@@ -51,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
         recording_thumbnail_semaphore: Arc::new(Semaphore::new(
             cfg.thumbnail_ffmpeg_concurrency as usize,
         )),
+        disk_writer,
     });
 
     let rtmp_addr: SocketAddr = format!("{}:{}", cfg.rtmp_host, cfg.rtmp_port).parse()?;

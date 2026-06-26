@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+use crate::disk_writer::{DiskCommand, DiskWriter};
 
 /// Scan an fMP4 segment for tfdt box and rewrite base_media_decode_time.
 /// Returns the new base_media_decode_time if found.
@@ -50,26 +51,28 @@ fn rewrite_segment_tfdt(segment: &mut [u8], offset: u64) -> Option<u64> {
 pub struct Fmp4Recorder {
     dir: PathBuf,
     stream_key: String,
-    file: Option<tokio::fs::File>,
+    disk_writer: DiskWriter,
     closed: bool,
     saved_path: Option<PathBuf>,
     last_init_hash: Option<u64>,
     init_written: bool,
+    recording_open: bool,
     recording_time_offset: u64,
     last_tfdt: Option<u64>,
 }
 
 impl Fmp4Recorder {
-    pub fn new(media_dir: &str, stream_key: &str) -> Self {
+    pub fn new(media_dir: &str, stream_key: &str, disk_writer: DiskWriter) -> Self {
         let dir = PathBuf::from(media_dir).join("recordings");
         Self {
             dir,
             stream_key: stream_key.to_string(),
-            file: None,
+            disk_writer,
             closed: false,
             saved_path: None,
             last_init_hash: None,
             init_written: false,
+            recording_open: false,
             recording_time_offset: 0,
             last_tfdt: None,
         }
@@ -79,29 +82,37 @@ impl Fmp4Recorder {
         let new_hash = crate::util::hash_bytes(init);
         if let Some(last_hash) = self.last_init_hash
             && last_hash != new_hash
-            && self.file.is_some()
+            && self.recording_open
         {
-            // Init changed while file is open: close current and start new recording
+            // Init changed while recording is open: close current and start new recording
             let _ = self.close().await;
             self.closed = false;
         }
 
-        if self.init_written && self.file.is_some() {
-            // Init already written to this file; refuse to write another
+        if self.init_written && self.recording_open {
+            // Init already written to this recording; refuse to write another
             return Ok(());
         }
 
-        if self.file.is_none() {
+        if !self.recording_open {
+            // Ensure the recordings directory exists
+            self.disk_writer.send(DiskCommand::CreateDirAll {
+                path: self.dir.clone(),
+            });
             let path = self.dir.join(format!(
                 "{}_{}.mp4",
                 self.stream_key,
                 chrono::Utc::now().format("%Y%m%d_%H%M%S")
             ));
-            let mut file = tokio::fs::File::create(&path).await?;
-            file.write_all(init).await?;
-            self.saved_path = Some(path);
-            self.file = Some(file);
+            self.saved_path = Some(path.clone());
+            self.recording_open = true;
             self.last_tfdt = None;
+
+            self.disk_writer.send(DiskCommand::CreateRecording {
+                stream_key: self.stream_key.clone(),
+                path,
+                init_data: init.to_vec(),
+            });
         }
         self.init_written = true;
         self.last_init_hash = Some(new_hash);
@@ -109,31 +120,35 @@ impl Fmp4Recorder {
     }
 
     pub async fn write_segment(&mut self, mut segment: Vec<u8>) -> std::io::Result<()> {
-        if let Some(ref mut file) = self.file {
-            if let Some(rewritten_tfdt) =
-                rewrite_segment_tfdt(&mut segment, self.recording_time_offset)
-            {
-                if let Some(last_tfdt) = self.last_tfdt {
-                    if rewritten_tfdt < last_tfdt {
-                        // Gap or backward jump detected: bridge it
-                        let gap = last_tfdt.saturating_sub(rewritten_tfdt) + 1;
-                        self.recording_time_offset += gap;
-                        // Re-rewrite with adjusted offset
-                        if let Some(new_tfdt) =
-                            rewrite_segment_tfdt(&mut segment, self.recording_time_offset)
-                        {
-                            self.last_tfdt = Some(new_tfdt);
-                        }
-                    } else {
-                        self.last_tfdt = Some(rewritten_tfdt);
+        if !self.recording_open {
+            return Ok(());
+        }
+        if let Some(rewritten_tfdt) =
+            rewrite_segment_tfdt(&mut segment, self.recording_time_offset)
+        {
+            if let Some(last_tfdt) = self.last_tfdt {
+                if rewritten_tfdt < last_tfdt {
+                    // Gap or backward jump detected: bridge it
+                    let gap = last_tfdt.saturating_sub(rewritten_tfdt) + 1;
+                    self.recording_time_offset += gap;
+                    // Re-rewrite with adjusted offset
+                    if let Some(new_tfdt) =
+                        rewrite_segment_tfdt(&mut segment, self.recording_time_offset)
+                    {
+                        self.last_tfdt = Some(new_tfdt);
                     }
                 } else {
                     self.last_tfdt = Some(rewritten_tfdt);
                 }
+            } else {
+                self.last_tfdt = Some(rewritten_tfdt);
             }
-
-            file.write_all(&segment).await?;
         }
+
+        self.disk_writer.send(DiskCommand::WriteRecordingData {
+            stream_key: self.stream_key.clone(),
+            data: segment,
+        });
         Ok(())
     }
 
@@ -148,8 +163,11 @@ impl Fmp4Recorder {
         self.last_init_hash = None;
         self.init_written = false;
 
-        if let Some(file) = self.file.take() {
-            file.sync_all().await?;
+        if self.recording_open {
+            self.recording_open = false;
+            self.disk_writer.send(DiskCommand::CloseRecording {
+                stream_key: self.stream_key.clone(),
+            });
         }
 
         self.saved_path
@@ -328,6 +346,15 @@ pub async fn update_index_json(
 mod tests {
     use super::*;
 
+    fn test_disk_writer() -> DiskWriter {
+        DiskWriter::new()
+    }
+
+    async fn flush_and_wait(dw: &DiskWriter) {
+        dw.flush().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
     #[tokio::test]
     async fn test_fmp4_recorder_create_and_close() {
         let test_dir = std::env::temp_dir().join("recording_fmp4_test");
@@ -335,7 +362,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("recordings"))
             .await
             .unwrap();
-        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "teststream");
+        let dw = test_disk_writer();
+        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "teststream", dw.clone());
 
         recorder
             .write_init(&[0x66, 0x74, 0x79, 0x70])
@@ -346,6 +374,9 @@ mod tests {
             .await
             .unwrap();
         let path = recorder.close().await.unwrap();
+
+        flush_and_wait(&dw).await;
+
         assert!(tokio::fs::try_exists(&path).await.unwrap_or(false));
 
         let recordings_dir = test_dir.join("recordings");
@@ -373,13 +404,17 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("recordings"))
             .await
             .unwrap();
-        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "multistream");
+        let dw = test_disk_writer();
+        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "multistream", dw.clone());
 
         recorder.write_init(&[0x01, 0x02]).await.unwrap();
         recorder.write_segment(vec![0x03, 0x04]).await.unwrap();
         recorder.write_segment(vec![0x05, 0x06]).await.unwrap();
         recorder.write_segment(vec![0x07, 0x08]).await.unwrap();
         let path = recorder.close().await.unwrap();
+
+        flush_and_wait(&dw).await;
+
         assert!(tokio::fs::try_exists(&path).await.unwrap_or(false));
 
         let recordings_dir = test_dir.join("recordings");
@@ -409,7 +444,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("recordings"))
             .await
             .unwrap();
-        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "indexstream");
+        let dw = test_disk_writer();
+        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "indexstream", dw.clone());
 
         recorder
             .write_init(&[0x66, 0x74, 0x79, 0x70])
@@ -420,6 +456,9 @@ mod tests {
             .await
             .unwrap();
         let path = recorder.close().await.unwrap();
+
+        flush_and_wait(&dw).await;
+
         let filename = path.file_name().unwrap().to_str().unwrap().to_string();
 
         crate::recording::update_index_json(
@@ -452,7 +491,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("recordings"))
             .await
             .unwrap();
-        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "doublestream");
+        let dw = test_disk_writer();
+        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "doublestream", dw.clone());
 
         recorder.write_init(&[0x01, 0x02]).await.unwrap();
         let path1 = recorder.close().await.unwrap();
@@ -486,7 +526,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("recordings"))
             .await
             .unwrap();
-        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "moovstream");
+        let dw = test_disk_writer();
+        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "moovstream", dw.clone());
 
         // Build a minimal valid init segment (ftyp + moov)
         let mut init_a = Vec::new();
@@ -516,6 +557,8 @@ mod tests {
         // Simulate close + reconnect with changed init
         recorder.close().await.unwrap();
 
+        flush_and_wait(&dw).await;
+
         // Build init B (different size/content to trigger hash change)
         let mut init_b = Vec::new();
         init_b.extend_from_slice(&(12u32).to_be_bytes());
@@ -534,6 +577,8 @@ mod tests {
             .await
             .unwrap();
         let path = recorder.close().await.unwrap();
+
+        flush_and_wait(&dw).await;
 
         // Read the recorded file and count "moov" occurrences
         let contents = tokio::fs::read(&path).await.unwrap();

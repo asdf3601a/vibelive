@@ -1,4 +1,5 @@
 use crate::AppState;
+use crate::disk_writer::{DiskCommand, DiskWriter};
 use crate::hls::HlsStreamState;
 use crate::recording::Fmp4Recorder;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
@@ -30,7 +31,7 @@ pub async fn handle_rtmp_session(
     let mut init_results = Some(init_results);
 
     let mut buf = vec![0u8; 1024 * 64];
-    let mut session_ctx = SessionContext::new();
+    let mut session_ctx = SessionContext::new(app_state.disk_writer.clone());
 
     let session_result: anyhow::Result<()> = async {
         loop {
@@ -142,6 +143,7 @@ struct SessionContext {
     media_dir: Option<String>,
     hls_segment_duration: u32,
     hls_segments_keep: u32,
+    disk_writer: DiskWriter,
     // Per-track codec caches
     track_video_codecs: HashMap<u32, crate::hls::fmp4::VideoCodec>,
     track_audio_codecs: HashMap<u32, crate::hls::fmp4::AudioCodec>,
@@ -155,7 +157,7 @@ struct SessionContext {
 }
 
 impl SessionContext {
-    fn new() -> Self {
+    fn new(disk_writer: DiskWriter) -> Self {
         Self {
             current_stream_key: None,
             current_app: None,
@@ -168,6 +170,7 @@ impl SessionContext {
             media_dir: None,
             hls_segment_duration: 0,
             hls_segments_keep: 0,
+            disk_writer,
             track_video_codecs: HashMap::new(),
             track_audio_codecs: HashMap::new(),
             closed_video_tracks: HashSet::new(),
@@ -189,6 +192,7 @@ impl SessionContext {
         let segments_keep = self.hls_segments_keep;
         let fps_num = self.video_fps_num;
         let fps_den = self.video_fps_den;
+        let disk_writer = self.disk_writer.clone();
         let state = self.track_states.entry(track_id).or_insert_with(|| {
             let mut s = HlsStreamState::new(
                 &media_dir,
@@ -197,6 +201,7 @@ impl SessionContext {
                 is_audio_only,
                 segment_duration,
                 segments_keep,
+                disk_writer,
             );
             s.set_video_framerate(fps_num, fps_den);
             s
@@ -303,43 +308,33 @@ async fn notify_track_discovered(
     }
 }
 
-async fn write_master_playlist(
+fn write_master_playlist(
     media_dir: &str,
     stream_key: &str,
     track_ids: &[u32],
-) -> anyhow::Result<()> {
+    disk_writer: &DiskWriter,
+) {
     let stream_dir = PathBuf::from(media_dir).join("hls").join(stream_key);
     let mut playlist = String::new();
     playlist.push_str("#EXTM3U\n");
     playlist.push_str("#EXT-X-VERSION:6\n");
 
-    // Default playlist (index.m3u8) always included if it exists
-    let default_playlist = stream_dir.join("index.m3u8");
-    if tokio::fs::try_exists(&default_playlist)
-        .await
-        .unwrap_or(false)
-    {
-        playlist.push_str("#EXT-X-STREAM-INF:BANDWIDTH=2500000\n");
-        playlist.push_str("index.m3u8\n");
-    }
+    // Default playlist (index.m3u8) always included
+    playlist.push_str("#EXT-X-STREAM-INF:BANDWIDTH=2500000\n");
+    playlist.push_str("index.m3u8\n");
 
     // Include each track playlist
     for track_id in track_ids {
-        let track_playlist = stream_dir
-            .join(format!("track_{}", track_id))
-            .join("index.m3u8");
-        if tokio::fs::try_exists(&track_playlist)
-            .await
-            .unwrap_or(false)
-        {
-            playlist.push_str("#EXT-X-STREAM-INF:BANDWIDTH=2500000\n");
-            playlist.push_str(&format!("track_{}/index.m3u8\n", track_id));
-        }
+        playlist.push_str("#EXT-X-STREAM-INF:BANDWIDTH=2500000\n");
+        playlist.push_str(&format!("track_{}/index.m3u8\n", track_id));
     }
 
     let master_path = stream_dir.join("master.m3u8");
-    tokio::fs::write(&master_path, playlist).await?;
-    Ok(())
+    disk_writer.send(DiskCommand::WriteAndRename {
+        tmp_path: stream_dir.join("master.m3u8.tmp"),
+        final_path: master_path,
+        data: playlist.into_bytes(),
+    });
 }
 
 async fn drain_hls_to_recorder(hls: &mut HlsStreamState, recorder: &mut Fmp4Recorder) {
@@ -368,9 +363,7 @@ async fn finalize_stream(
 
     // Generate master playlist
     let media_dir = app_state.config.media_dir.clone();
-    if let Err(e) = write_master_playlist(&media_dir, stream_key, &track_ids).await {
-        tracing::warn!("Failed to write master playlist for {}: {}", stream_key, e);
-    }
+    write_master_playlist(&media_dir, stream_key, &track_ids, &app_state.disk_writer);
 
     // Set ended flag and delete live thumbnails BEFORE spawning any tasks
     {
@@ -383,10 +376,9 @@ async fn finalize_stream(
     let sizes = app_state.config.thumbnail_sizes.clone();
     for &w in &sizes {
         for ext in &["jxl", "avif", "png"] {
-            let _ = tokio::fs::remove_file(
-                stream_thumb_dir.join(format!("{}_w{}.{}", stream_key, w, ext)),
-            )
-            .await;
+            app_state.disk_writer.send(DiskCommand::RemoveFile {
+                path: stream_thumb_dir.join(format!("{}_w{}.{}", stream_key, w, ext)),
+            });
         }
     }
 
@@ -409,7 +401,12 @@ async fn finalize_stream(
                 .map(|n| n.to_string())
                 .unwrap_or_default();
             let recording_thumbnail_semaphore = app_state.recording_thumbnail_semaphore.clone();
+            let disk_writer = app_state.disk_writer.clone();
             tokio::spawn(async move {
+                // Wait for all pending disk writes to complete before
+                // generating thumbnails (which read files from disk)
+                disk_writer.flush().await;
+
                 // Remux to faststart BEFORE thumbnail generation so we get
                 // efficient single-pass extraction. If remux fails, proceed
                 // anyway — thumbnails still work, just marginally slower.
@@ -488,7 +485,7 @@ async fn finalize_stream(
                     );
                 } else {
                     let hls_dir = PathBuf::from(&media_dir).join("hls").join(&key);
-                    let _ = tokio::fs::remove_dir_all(&hls_dir).await;
+                    app_state.disk_writer.send(DiskCommand::RemoveDirAll { path: hls_dir });
                 }
             });
         }
@@ -528,13 +525,7 @@ async fn enter_grace_period(app_state: &Arc<AppState>, ctx: &mut SessionContext)
     // Generate master playlist with whatever we have so far
     if let Some(ref key) = ctx.current_stream_key {
         let media_dir = app_state.config.media_dir.clone();
-        if let Err(e) = write_master_playlist(&media_dir, key, &track_ids).await {
-            tracing::warn!(
-                "Failed to write master playlist during grace period for {}: {}",
-                key,
-                e
-            );
-        }
+        write_master_playlist(&media_dir, key, &track_ids, &ctx.disk_writer);
     }
 
     if let Some(ref key) = ctx.current_stream_key.clone() {
@@ -692,10 +683,7 @@ async fn handle_event(
                 drop(sm);
 
                 let media_dir = app_state.config.media_dir.clone();
-                let hls_dir = std::path::PathBuf::from(&media_dir)
-                    .join("hls")
-                    .join(&stream_key);
-                let _ = tokio::fs::create_dir_all(&hls_dir).await;
+                // Directory creation is handled by DiskWriter via HlsStreamState::rotate_segment()
                 ctx.media_dir = Some(media_dir.clone());
                 ctx.hls_segment_duration = app_state.config.hls_segment_duration;
                 ctx.hls_segments_keep = app_state.config.hls_segments_keep;
@@ -706,12 +694,12 @@ async fn handle_event(
                     false,
                     app_state.config.hls_segment_duration,
                     app_state.config.hls_segments_keep,
+                    ctx.disk_writer.clone(),
                 ));
                 ctx.track_states.clear();
                 if app_state.config.recording_enabled {
-                    let recordings_dir = std::path::PathBuf::from(&media_dir).join("recordings");
-                    let _ = tokio::fs::create_dir_all(&recordings_dir).await;
-                    ctx.recorder = Some(Fmp4Recorder::new(&media_dir, &stream_key));
+                    // Recordings directory creation is handled by DiskWriter via Fmp4Recorder
+                    ctx.recorder = Some(Fmp4Recorder::new(&media_dir, &stream_key, ctx.disk_writer.clone()));
                 }
                 ctx.current_stream_key = Some(stream_key.clone());
 

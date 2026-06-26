@@ -1,8 +1,8 @@
 pub mod fmp4;
 
+use crate::disk_writer::{DiskCommand, DiskWriter};
 use std::borrow::Cow;
 use std::path::PathBuf;
-use tokio::io::{AsyncWriteExt, BufWriter};
 
 pub struct HlsStreamState {
     stream_dir: PathBuf,
@@ -11,7 +11,8 @@ pub struct HlsStreamState {
     segment_duration: u32,
     current_segment_start: u64,
     segment_index: u32,
-    current_file: Option<BufWriter<tokio::fs::File>>,
+    segment_open: bool,
+    disk_writer: DiskWriter,
     fmp4_muxer: fmp4::Fmp4Muxer,
     has_video: bool,
     has_audio: bool,
@@ -55,6 +56,7 @@ impl HlsStreamState {
         is_audio_only: bool,
         segment_duration: u32,
         hls_segments_keep: u32,
+        disk_writer: DiskWriter,
     ) -> Self {
         let mut dir = PathBuf::from(media_dir).join("hls").join(stream_key);
         if track_id > 0 {
@@ -67,7 +69,8 @@ impl HlsStreamState {
             segment_duration,
             current_segment_start: 0,
             segment_index: 0,
-            current_file: None,
+            segment_open: false,
+            disk_writer,
             fmp4_muxer: fmp4::Fmp4Muxer::new(),
             has_video: false,
             has_audio: false,
@@ -250,13 +253,13 @@ impl HlsStreamState {
             self.stream_started_at = Some(chrono::Utc::now());
             self.current_segment_start = dts;
             tracing::debug!(
-                "write_video: rotate_segment done, current_file={}",
-                self.current_file.is_some()
+                "write_video: rotate_segment done, segment_open={}",
+                self.segment_open
             );
         }
 
-        // Handle case where current_file was closed externally (e.g., explicit finalize_segment)
-        if self.current_file.is_none() {
+        // Handle case where segment was closed externally (e.g., explicit finalize_segment)
+        if !self.segment_open {
             if !is_keyframe {
                 return Ok(());
             }
@@ -278,7 +281,7 @@ impl HlsStreamState {
         let elapsed_since_start = dts.saturating_sub(self.current_segment_start);
         let threshold = self.segment_duration as u64 * 1000;
 
-        if elapsed_since_start >= threshold && self.current_file.is_some() && !self.pending_rotation
+        if elapsed_since_start >= threshold && self.segment_open && !self.pending_rotation
         {
             self.pending_rotation = true;
             self.pending_rotation_pts = dts;
@@ -337,7 +340,7 @@ impl HlsStreamState {
                 return Ok(());
             }
         }
-        if self.current_file.is_none() {
+        if !self.segment_open {
             if self.is_audio_only {
                 let base_ts = self.first_ts.unwrap_or(0);
                 let pts = (timestamp.saturating_sub(base_ts)) as u64 + self.timestamp_offset;
@@ -367,7 +370,7 @@ impl HlsStreamState {
             let elapsed_since_start = pts.saturating_sub(self.current_segment_start);
             let threshold = self.segment_duration as u64 * 1000;
             if elapsed_since_start >= threshold
-                && self.current_file.is_some()
+                && self.segment_open
                 && !self.pending_rotation
             {
                 self.pending_rotation = true;
@@ -390,7 +393,7 @@ impl HlsStreamState {
         // already open, write the updated init immediately so the current
         // segment is advertised with matching sample-entry metadata instead of
         // waiting for a later rotation.
-        if self.current_file.is_some() {
+        if self.segment_open {
             self.write_init_segment().await?;
             self.update_playlist().await?;
         }
@@ -399,15 +402,7 @@ impl HlsStreamState {
 
     async fn write_init_segment(&mut self) -> anyhow::Result<()> {
         if self.init_written {
-            // Verify the file actually exists on disk.
-            // Stale cleanup from a previous stream instance may have deleted it
-            // while we were between segment rotations.
-            let path = self.current_init_path();
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                return Ok(());
-            }
-            self.init_written = false;
-            self.last_init_hash = None;
+            return Ok(());
         }
         let init = self.fmp4_muxer.init_segment();
         let new_hash = crate::util::hash_bytes(&init);
@@ -428,11 +423,14 @@ impl HlsStreamState {
             self.init_version += 1;
         }
         let path = self.current_init_path();
-
-        // Atomic write: tmp + rename so clients never see a partially-written init
         let tmp_path = path.with_extension("mp4.tmp");
-        tokio::fs::write(&tmp_path, &init).await?;
-        tokio::fs::rename(&tmp_path, &path).await?;
+
+        self.disk_writer.send(DiskCommand::WriteAndRename {
+            tmp_path,
+            final_path: path,
+            data: init.clone(),
+        });
+
         self.init_data = Some(init);
         self.init_written = true;
         self.last_init_hash = Some(new_hash);
@@ -440,13 +438,11 @@ impl HlsStreamState {
     }
 
     async fn rotate_segment(&mut self) -> anyhow::Result<()> {
-        tokio::fs::create_dir_all(&self.stream_dir).await?;
+        self.disk_writer.send(DiskCommand::CreateDirAll {
+            path: self.stream_dir.clone(),
+        });
         self.write_init_segment().await?;
-        let path = self.segment_path(self.segment_index);
-        let tmp_path = path.with_extension("m4s.tmp");
-        tracing::debug!("rotate_segment: creating tmp file at {:?}", tmp_path);
-        let file = tokio::fs::File::create(&tmp_path).await?;
-        self.current_file = Some(BufWriter::with_capacity(64 * 1024, file));
+        self.segment_open = true;
         self.update_playlist().await?;
         tracing::debug!("rotate_segment: done, segment_index={}", self.segment_index);
         Ok(())
@@ -454,54 +450,59 @@ impl HlsStreamState {
 
     pub async fn finalize_segment(&mut self) -> anyhow::Result<()> {
         tracing::debug!(
-            "finalize_segment: current_file={}",
-            self.current_file.is_some()
+            "finalize_segment: segment_open={}",
+            self.segment_open
         );
-        if let Some(mut writer) = self.current_file.take() {
+        if !self.segment_open {
+            return Ok(());
+        }
+        self.segment_open = false;
+
+        let has_fragment = if let Some(fragment) = self.fmp4_muxer.flush_combined_fragment() {
+            tracing::debug!(
+                "finalize_segment: fragment of {} bytes",
+                fragment.len()
+            );
+
             // Capture last sample duration before flush clears samples
             let last_sample_duration = if self.last_video_pts >= self.last_audio_pts {
                 self.fmp4_muxer.last_video_sample_duration()
             } else {
                 self.fmp4_muxer.last_audio_sample_duration()
             };
-            let has_fragment = if let Some(fragment) = self.fmp4_muxer.flush_combined_fragment() {
-                tracing::debug!(
-                    "finalize_segment: writing fragment of {} bytes",
-                    fragment.len()
-                );
-                writer.write_all(&fragment).await?;
-                self.segment_data.push(fragment);
 
-                let last_pts = self.last_video_pts.max(self.last_audio_pts);
-                let duration_ms =
-                    (last_pts + last_sample_duration).saturating_sub(self.current_segment_start);
-                self.max_segment_duration_ms = self.max_segment_duration_ms.max(duration_ms);
-                let duration = duration_ms as f64 / 1000.0;
-                self.segment_durations.push(duration.max(0.001));
-                self.total_duration_secs += duration.max(0.001);
-                self.segment_start_offsets.push(self.current_segment_start);
-                let prev_init = self.segment_init_versions.last().copied();
-                let is_discontinuity = prev_init.is_some() && prev_init != Some(self.init_version);
-                self.discontinuity_before.push(is_discontinuity);
-                self.segment_init_versions.push(self.init_version);
-                true
-            } else {
-                false
-            };
-            writer.flush().await?;
-            writer.get_ref().sync_all().await?;
-            drop(writer);
+            let last_pts = self.last_video_pts.max(self.last_audio_pts);
+            let duration_ms =
+                (last_pts + last_sample_duration).saturating_sub(self.current_segment_start);
+            self.max_segment_duration_ms = self.max_segment_duration_ms.max(duration_ms);
+            let duration = duration_ms as f64 / 1000.0;
+            self.segment_durations.push(duration.max(0.001));
+            self.total_duration_secs += duration.max(0.001);
+            self.segment_start_offsets.push(self.current_segment_start);
+            let prev_init = self.segment_init_versions.last().copied();
+            let is_discontinuity = prev_init.is_some() && prev_init != Some(self.init_version);
+            self.discontinuity_before.push(is_discontinuity);
+            self.segment_init_versions.push(self.init_version);
 
-            // Atomic rename: tmp -> final segment file
+            self.segment_data.push(fragment.clone());
+
+            // Push segment write to DiskWriter (no fsync)
             let path = self.segment_path(self.segment_index);
             let tmp_path = path.with_extension("m4s.tmp");
-            if has_fragment {
-                let _ = tokio::fs::rename(&tmp_path, &path).await;
-            } else {
-                // No data written: remove the empty temp file
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-            }
+            self.disk_writer.send(DiskCommand::WriteSegment {
+                tmp_path,
+                final_path: path,
+                data: fragment,
+            });
+            true
+        } else {
+            false
+        };
+
+        if !has_fragment {
+            // No data written: remove the empty temp file (was never created, no-op)
         }
+
         self.update_playlist().await?;
         Ok(())
     }
@@ -556,7 +557,7 @@ impl HlsStreamState {
             }
             let seg_idx = self.first_segment_index + i as u32;
             let path = self.segment_path(seg_idx);
-            let _ = tokio::fs::remove_file(&path).await;
+            self.disk_writer.send(DiskCommand::RemoveFile { path });
         }
 
         if to_remove > 0 {
@@ -633,21 +634,28 @@ impl HlsStreamState {
 
         let lock_path = self.stream_dir.join("index.m3u8.lock");
         let target_path = self.stream_dir.join("index.m3u8");
-        tokio::fs::write(&lock_path, playlist).await?;
-        tokio::fs::rename(&lock_path, &target_path).await?;
+        self.disk_writer.send(DiskCommand::WritePlaylist {
+            lock_path,
+            target_path,
+            content: playlist,
+        });
         Ok(())
-    }
-}
-
-impl Drop for HlsStreamState {
-    fn drop(&mut self) {
-        let _ = self.current_file.take();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_disk_writer() -> DiskWriter {
+        DiskWriter::new()
+    }
+
+    async fn flush_and_wait(dw: &DiskWriter) {
+        dw.flush().await;
+        // Small sleep to let OS settle file operations
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
 
     #[tokio::test]
     async fn test_hls_stream_state_new() {
@@ -656,16 +664,12 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10);
+        let dw = test_disk_writer();
+        let state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10, dw.clone());
         assert_eq!(state.segment_index, 0);
-        assert!(state.current_file.is_none());
+        assert!(!state.segment_open);
         assert!(!state.has_video);
         assert!(!state.has_audio);
-        assert!(
-            tokio::fs::try_exists(&state.stream_dir)
-                .await
-                .unwrap_or(false)
-        );
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 
@@ -676,7 +680,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10, dw.clone());
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -688,13 +693,17 @@ mod tests {
         state.write_video(&nal, 0, true, 0).await.unwrap();
 
         assert!(state.has_video);
-        assert!(state.current_file.is_some());
-        // Segment file is a temp file until finalize_segment renames it
+        assert!(state.segment_open);
+
+        flush_and_wait(&dw).await;
+
+        // init.mp4 should exist on disk after DiskWriter processes it
         assert!(
-            tokio::fs::try_exists(state.segment_path(0).with_extension("m4s.tmp"))
+            tokio::fs::try_exists(state.stream_dir.join("init.mp4"))
                 .await
                 .unwrap_or(false)
         );
+        // playlist should exist
         assert!(
             tokio::fs::try_exists(state.playlist_path())
                 .await
@@ -711,7 +720,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -722,6 +732,8 @@ mod tests {
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
         state.write_video(&nal, 0, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
+
+        flush_and_wait(&dw).await;
 
         let playlist = tokio::fs::read_to_string(state.playlist_path())
             .await
@@ -744,18 +756,14 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10, dw.clone());
 
         let aac = vec![0x01, 0x02, 0x03];
         state.write_audio(&aac, 0).await.unwrap();
 
         assert!(!state.has_video);
-        assert!(state.current_file.is_none());
-        assert!(
-            !tokio::fs::try_exists(state.segment_path(0))
-                .await
-                .unwrap_or(false)
-        );
+        assert!(!state.segment_open);
 
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
@@ -767,7 +775,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10); // 2s segment duration
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -783,14 +792,11 @@ mod tests {
         // Frame at ts=2500 (> 2s duration) triggers finalize + new segment
         state.write_video(&nal, 2500, true, 0).await.unwrap();
         assert_eq!(state.segment_index, 1);
+
+        flush_and_wait(&dw).await;
+
         assert!(
             tokio::fs::try_exists(state.segment_path(0))
-                .await
-                .unwrap_or(false)
-        );
-        // New segment is still a temp file until it gets finalized
-        assert!(
-            tokio::fs::try_exists(state.segment_path(1).with_extension("m4s.tmp"))
                 .await
                 .unwrap_or(false)
         );
@@ -811,7 +817,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -847,7 +854,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -883,7 +891,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 3); // keep 3
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 3, dw.clone());
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -899,6 +908,8 @@ mod tests {
             state.write_video(&nal, ts, true, 0).await.unwrap();
         }
         state.finalize_segment().await.unwrap();
+
+        flush_and_wait(&dw).await;
 
         let playlist = tokio::fs::read_to_string(state.playlist_path())
             .await
@@ -940,7 +951,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -951,6 +963,8 @@ mod tests {
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
         state.write_video(&nal, 0, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
+
+        flush_and_wait(&dw).await;
 
         // .lock file should not exist after rename
         let lock_path = state.stream_dir.join("index.m3u8.lock");
@@ -971,7 +985,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
 
         let avcc_config1 = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -982,6 +997,8 @@ mod tests {
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
         state.write_video(&nal, 0, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
+
+        flush_and_wait(&dw).await;
 
         // init.mp4 should exist
         assert!(
@@ -998,6 +1015,8 @@ mod tests {
             .unwrap();
         state.write_video(&nal, 2500, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
+
+        flush_and_wait(&dw).await;
 
         // init_v1.mp4 should exist
         assert!(
@@ -1021,7 +1040,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
 
         let avcc_config1 = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -1042,6 +1062,8 @@ mod tests {
         state.write_video(&nal, 2500, true, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
 
+        flush_and_wait(&dw).await;
+
         let playlist = tokio::fs::read_to_string(state.playlist_path())
             .await
             .unwrap();
@@ -1057,7 +1079,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -1073,7 +1096,7 @@ mod tests {
         state.prepare_for_grace_period().await.unwrap();
         assert!(state.timestamp_offset > old_offset);
         assert_eq!(state.segment_index, 1);
-        assert!(state.current_file.is_some());
+        assert!(state.segment_open);
 
         let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
@@ -1085,7 +1108,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -1096,6 +1120,8 @@ mod tests {
         let nal = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x00];
         state.write_video(&nal, 0, true, 0).await.unwrap();
         state.close().await.unwrap();
+
+        flush_and_wait(&dw).await;
 
         let playlist = tokio::fs::read_to_string(state.playlist_path())
             .await
@@ -1112,7 +1138,8 @@ mod tests {
         tokio::fs::create_dir_all(&test_dir.join("hls").join("testkey"))
             .await
             .unwrap();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10);
+        let dw = test_disk_writer();
+        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -1130,6 +1157,8 @@ mod tests {
         let aac = vec![0xAF, 0x01];
         state.write_audio(&aac, 0).await.unwrap();
         state.finalize_segment().await.unwrap();
+
+        flush_and_wait(&dw).await;
 
         assert!(
             tokio::fs::try_exists(state.segment_path(0))

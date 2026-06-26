@@ -1,0 +1,172 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+
+pub enum DiskCommand {
+    CreateDirAll { path: PathBuf },
+    WriteAndRename { tmp_path: PathBuf, final_path: PathBuf, data: Vec<u8> },
+    WriteSegment { tmp_path: PathBuf, final_path: PathBuf, data: Vec<u8> },
+    WritePlaylist { lock_path: PathBuf, target_path: PathBuf, content: String },
+    RemoveFile { path: PathBuf },
+    RemoveDirAll { path: PathBuf },
+    WriteRecordingData { stream_key: String, data: Vec<u8> },
+    CreateRecording { stream_key: String, path: PathBuf, init_data: Vec<u8> },
+    CloseRecording { stream_key: String },
+    Flush { reply: tokio::sync::oneshot::Sender<()> },
+}
+
+pub struct DiskWriter {
+    tx: mpsc::UnboundedSender<DiskCommand>,
+}
+
+impl Clone for DiskWriter {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl Default for DiskWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DiskWriter {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(Self::run(rx));
+        Self { tx }
+    }
+
+    pub fn sender(&self) -> mpsc::UnboundedSender<DiskCommand> {
+        self.tx.clone()
+    }
+
+    pub fn send(&self, cmd: DiskCommand) {
+        if let Err(e) = self.tx.send(cmd) {
+            tracing::error!("DiskWriter: channel closed, command dropped: {}", e);
+        }
+    }
+
+    pub async fn flush(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(DiskCommand::Flush { reply: tx });
+        let _ = rx.await;
+    }
+
+    async fn run(mut rx: mpsc::UnboundedReceiver<DiskCommand>) {
+        let mut open_recordings: HashMap<String, tokio::fs::File> = HashMap::new();
+
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                DiskCommand::CreateDirAll { path } => {
+                    if let Err(e) = tokio::fs::create_dir_all(&path).await {
+                        tracing::error!("DiskWriter: create_dir_all {:?} failed: {}", path, e);
+                    }
+                }
+                DiskCommand::WriteAndRename { tmp_path, final_path, data } => {
+                    if let Err(e) = tokio::fs::write(&tmp_path, &data).await {
+                        tracing::error!("DiskWriter: write {:?} failed: {}", tmp_path, e);
+                        continue;
+                    }
+                    if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+                        tracing::error!(
+                            "DiskWriter: rename {:?} -> {:?} failed: {}",
+                            tmp_path, final_path, e
+                        );
+                    }
+                }
+                DiskCommand::WriteSegment { tmp_path, final_path, data } => {
+                    if let Err(e) = tokio::fs::write(&tmp_path, &data).await {
+                        tracing::error!("DiskWriter: write segment {:?} failed: {}", tmp_path, e);
+                        continue;
+                    }
+                    if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+                        tracing::error!(
+                            "DiskWriter: rename segment {:?} -> {:?} failed: {}",
+                            tmp_path, final_path, e
+                        );
+                    }
+                }
+                DiskCommand::WritePlaylist { lock_path, target_path, content } => {
+                    if let Err(e) = tokio::fs::write(&lock_path, &content).await {
+                        tracing::error!("DiskWriter: write playlist {:?} failed: {}", lock_path, e);
+                        continue;
+                    }
+                    if let Err(e) = tokio::fs::rename(&lock_path, &target_path).await {
+                        tracing::error!(
+                            "DiskWriter: rename playlist {:?} -> {:?} failed: {}",
+                            lock_path, target_path, e
+                        );
+                    }
+                }
+                DiskCommand::RemoveFile { path } => {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
+                DiskCommand::RemoveDirAll { path } => {
+                    let _ = tokio::fs::remove_dir_all(&path).await;
+                }
+                DiskCommand::CreateRecording { stream_key, path, init_data } => {
+                    match tokio::fs::File::create(&path).await {
+                        Ok(mut file) => {
+                            if let Err(e) = file.write_all(&init_data).await {
+                                tracing::error!(
+                                    "DiskWriter: write init for recording {} failed: {}",
+                                    stream_key, e
+                                );
+                            } else {
+                                open_recordings.insert(stream_key, file);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "DiskWriter: create recording {:?} failed: {}",
+                                path, e
+                            );
+                        }
+                    }
+                }
+                DiskCommand::WriteRecordingData { stream_key, data } => {
+                    if let Some(ref mut file) = open_recordings.get_mut(&stream_key) {
+                        if let Err(e) = file.write_all(&data).await {
+                            tracing::error!(
+                                "DiskWriter: write recording data for {} failed: {}",
+                                stream_key, e
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "DiskWriter: WriteRecordingData for {} but no open recording",
+                            stream_key
+                        );
+                    }
+                }
+                DiskCommand::CloseRecording { stream_key } => {
+                    if let Some(file) = open_recordings.remove(&stream_key) {
+                        if let Err(e) = file.sync_all().await {
+                            tracing::error!(
+                                "DiskWriter: sync recording {} failed: {}",
+                                stream_key, e
+                            );
+                        }
+                        drop(file);
+                        tracing::info!("DiskWriter: closed recording for {}", stream_key);
+                    }
+                }
+                DiskCommand::Flush { reply } => {
+                    let _ = reply.send(());
+                }
+            }
+        }
+
+        // Channel closed: flush and close all open recording files
+        for (key, file) in open_recordings {
+            let _ = file.sync_all().await;
+            drop(file);
+            tracing::info!("DiskWriter: closed recording for {} (shutdown)", key);
+        }
+    }
+}
