@@ -101,7 +101,7 @@
           :class="seekIndicator.dir === 'forward' ? 'right-8' : 'left-8'"
         >
           <div
-            class="flex items-center gap-2 bg-black/70 backdrop-blur rounded-xl px-4 py-2.5 shadow-2xl"
+            class="flex items-center gap-2 bg-black/70 rounded-xl px-4 py-2.5 shadow-2xl"
             :class="seekIndicator.dir === 'forward' ? 'flex-row' : 'flex-row-reverse'"
           >
             <svg class="h-5 w-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">

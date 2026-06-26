@@ -17,7 +17,7 @@
       <div
         v-if="showMenu"
         v-click-outside="() => showMenu = false"
-        class="absolute bottom-full right-0 mb-2 w-44 bg-bg-overlay/95 border border-border-default rounded-xl shadow-2xl backdrop-blur overflow-hidden z-30"
+        class="absolute bottom-full right-0 mb-2 w-44 bg-bg-overlay/95 border border-border-default rounded-xl shadow-2xl overflow-hidden z-30"
       >
         <div class="py-1">
           <div class="px-3 py-1.5 text-[10px] text-text-muted uppercase tracking-wider font-medium">Video Track</div>

@@ -1,7 +1,7 @@
 <template>
   <Teleport to="body">
     <div
-      class="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+      class="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-4"
       @click.self="$emit('close')"
     >
       <div class="w-full max-w-5xl bg-bg-surface shadow-2xl" :class="isFullscreen ? '' : 'rounded-xl border border-border-default'">
