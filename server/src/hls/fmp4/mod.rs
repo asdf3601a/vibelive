@@ -92,6 +92,7 @@ pub struct Fmp4Muxer {
     audio_sample_rate: u32,
     video_fps_num: u64,
     video_fps_den: u64,
+    first_cts_offset: Option<i64>,
 }
 
 impl Fmp4Muxer {
@@ -113,6 +114,7 @@ impl Fmp4Muxer {
             audio_sample_rate: 44100,
             video_fps_num: 30,
             video_fps_den: 1,
+            first_cts_offset: None,
         }
     }
 
@@ -194,7 +196,11 @@ impl Fmp4Muxer {
         } else {
             SAMPLE_FLAG_NON_KEYFRAME
         };
-        let diff = pts as i64 - dts as i64;
+        let mut diff = pts as i64 - dts as i64;
+        if self.first_cts_offset.is_none() {
+            self.first_cts_offset = Some(diff);
+        }
+        diff -= self.first_cts_offset.unwrap_or(0);
         let cto_ts = if diff >= 0 {
             (diff * self.video_fps_num as i64 + 500) / 1000
         } else {
@@ -208,6 +214,10 @@ impl Fmp4Muxer {
             flags,
             composition_time_offset: cto_ts,
         });
+    }
+
+    pub fn reset_first_cts_offset(&mut self) {
+        self.first_cts_offset = None;
     }
 
     pub fn add_audio_sample(&mut self, data: Cow<'_, [u8]>, pts: u64) {
@@ -1659,8 +1669,10 @@ mod tests {
         muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
         muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
 
-        // Sample with DTS=0, PTS=100  →  composition_time_offset = 100*30/1000 = 3
+        // First sample: DTS=0, PTS=100 → first_cts_offset=100ms, normalized CTO=0
         muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 0, 100, true);
+        // Second sample: DTS=33, PTS=233 → diff=200ms, adjusted=100ms → CTO=100*30/1000=3
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 33, 233, false);
 
         let frag = muxer.flush_combined_fragment().unwrap();
 
@@ -1681,7 +1693,6 @@ mod tests {
                             version, 1,
                             "trun version should be 1 when composition_time_offset is non-zero"
                         );
-                        // Check CTO flag is set (0x000800)
                         let trun_flags = u32::from_be_bytes([
                             0,
                             frag[idata + 1],
@@ -1692,17 +1703,22 @@ mod tests {
                             trun_flags & 0x000800 != 0,
                             "trun should have sample_composition_time_offset flag"
                         );
-                        // trun data: version(1)+flags(3)+sample_count(4)+data_offset(4)+first_flags(4)+entries
-                        // Each entry: sample_size(4)+composition_time_offset(4)
-                        // CTO is at data_offset+20 for video
-                        // CTO is in media timescale: 100ms X 30 / 1000 = 3
-                        let cto = i32::from_be_bytes([
+                        // First sample CTO = 0 (normalized by muxer)
+                        let cto0 = i32::from_be_bytes([
                             frag[idata + 20],
                             frag[idata + 21],
                             frag[idata + 22],
                             frag[idata + 23],
                         ]);
-                        assert_eq!(cto, 3);
+                        assert_eq!(cto0, 0, "first sample CTO should be 0 after normalization");
+                        // Second sample CTO = 3 (100ms × 30fps / 1000)
+                        let cto1 = i32::from_be_bytes([
+                            frag[idata + 28],
+                            frag[idata + 29],
+                            frag[idata + 30],
+                            frag[idata + 31],
+                        ]);
+                        assert_eq!(cto1, 3, "second sample CTO should be 3");
                         return;
                     }
                     inner += _isize;
@@ -2055,5 +2071,121 @@ mod tests {
             50,
             "minLum"
         );
+    }
+
+    #[test]
+    fn test_first_cts_normalized_to_zero() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
+        muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
+
+        // All samples have PTS > DTS (typical non-B-frame stream).
+        // First sample: PTS-DTS = 100ms  → becomes the offset, CTO=0
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 0, 100, true);
+        // Second: PTS-DTS = 200ms  → adjusted = 100ms  → CTO = 100*30/1000 = 3
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x41].into(), 33, 233, false);
+        // Third: PTS-DTS = 150ms  → adjusted = 50ms  → CTO = (50*30+500)/1000 = 2
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x41].into(), 66, 216, false);
+
+        let frag = muxer.flush_combined_fragment().unwrap();
+        let (_, _, _, trun_data) = find_traf_child(&frag, 0, b"trun");
+
+        assert_eq!(trun_data[0], 1, "trun version should be 1 (has non-zero CTO)");
+        let sample_count = u32::from_be_bytes([trun_data[4], trun_data[5], trun_data[6], trun_data[7]]);
+        assert_eq!(sample_count, 3);
+
+        // Entry offsets: [12..16]=first_flags, then [16..20]=size, [20..24]=CTO, [24..28]=size, ...
+        let cto0 = i32::from_be_bytes([trun_data[20], trun_data[21], trun_data[22], trun_data[23]]);
+        let cto1 = i32::from_be_bytes([trun_data[28], trun_data[29], trun_data[30], trun_data[31]]);
+        let cto2 = i32::from_be_bytes([trun_data[36], trun_data[37], trun_data[38], trun_data[39]]);
+
+        assert_eq!(cto0, 0, "first CTO must be 0 after normalization");
+        assert_eq!(cto1, 3, "second CTO should be 3 (100ms * 30 / 1000)");
+        assert_eq!(cto2, 2, "third CTO should be 2 (50ms * 30 / 1000, rounded)");
+    }
+
+    #[test]
+    fn test_first_cts_negative_initial() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
+        muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
+
+        // First sample has PTS < DTS (negative CTS, e.g. B-frame reorder).
+        // DTS=100, PTS=0 → diff = -100ms  → first_cts_offset = -100
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 100, 0, true);
+        // Second: DTS=200, PTS=200 → diff=0ms → adjusted = 0 - (-100) = 100ms → CTO=3
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x41].into(), 200, 200, false);
+
+        let frag = muxer.flush_combined_fragment().unwrap();
+        let (_, _, _, trun_data) = find_traf_child(&frag, 0, b"trun");
+
+        let cto0 = i32::from_be_bytes([trun_data[20], trun_data[21], trun_data[22], trun_data[23]]);
+        let cto1 = i32::from_be_bytes([trun_data[28], trun_data[29], trun_data[30], trun_data[31]]);
+
+        assert_eq!(cto0, 0, "first CTO must be 0 even with negative initial PTS-DTS");
+        assert_eq!(cto1, 3, "second CTO should be 3 (100ms adjusted)");
+    }
+
+    #[test]
+    fn test_first_cts_reset_on_reconnect() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
+        muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
+
+        // First connection: PTS-DTS=100ms
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 0, 100, true);
+        // Need a second sample with different PTS-DTS to get non-zero CTO in trun
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x41].into(), 33, 233, false);
+        let frag1 = muxer.flush_combined_fragment().unwrap();
+        let (_, _, _, trun1) = find_traf_child(&frag1, 0, b"trun");
+        let cto1_0 = i32::from_be_bytes([trun1[20], trun1[21], trun1[22], trun1[23]]);
+        let cto1_1 = i32::from_be_bytes([trun1[28], trun1[29], trun1[30], trun1[31]]);
+        assert_eq!(cto1_0, 0, "first connection: first CTO=0");
+        assert_eq!(cto1_1, 3, "first connection: second CTO=3");
+
+        // Simulate reconnect: reset CTS offset
+        muxer.reset_first_cts_offset();
+
+        // New connection: different PTS-DTS baseline (200ms instead of 100ms)
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 0, 200, true);
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x41].into(), 33, 333, false);
+        let frag2 = muxer.flush_combined_fragment().unwrap();
+        let (_, _, _, trun2) = find_traf_child(&frag2, 0, b"trun");
+        let cto2_0 = i32::from_be_bytes([trun2[20], trun2[21], trun2[22], trun2[23]]);
+        let cto2_1 = i32::from_be_bytes([trun2[28], trun2[29], trun2[30], trun2[31]]);
+        assert_eq!(cto2_0, 0, "after reconnect: new first CTO=0");
+        assert_eq!(cto2_1, 3, "after reconnect: second CTO=3 (100ms adjusted)");
+    }
+
+    #[test]
+    fn test_first_cts_across_flushes() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
+        muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
+
+        // Fragment 1: first sample sets the offset
+        // DTS=0, PTS=100 → first_cts_offset=100ms, normalized CTO=0
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 0, 100, true);
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x41].into(), 33, 233, false);
+        let frag1 = muxer.flush_combined_fragment().unwrap();
+        let (_, _, _, trun1) = find_traf_child(&frag1, 0, b"trun");
+        assert_eq!(
+            i32::from_be_bytes([trun1[20], trun1[21], trun1[22], trun1[23]]),
+            0, "frag1 sample0 CTO=0"
+        );
+
+        // Fragment 2: offset persists from fragment 1
+        // DTS=66, PTS=266 → diff=200ms → adjusted=100ms → CTO=3
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x65].into(), 66, 266, true);
+        // DTS=100, PTS=300 → diff=200ms → adjusted=100ms → CTO=3
+        muxer.add_video_sample(vec![0x00, 0x00, 0x00, 0x01, 0x41].into(), 100, 300, false);
+        let frag2 = muxer.flush_combined_fragment().unwrap();
+        let (_, _, _, trun2) = find_traf_child(&frag2, 0, b"trun");
+        // Both samples in frag2 have adjusted diff=100ms → CTO=3
+        // Since only one sample has non-zero CTO (both actually do), version=1
+        let cto2_0 = i32::from_be_bytes([trun2[20], trun2[21], trun2[22], trun2[23]]);
+        let cto2_1 = i32::from_be_bytes([trun2[28], trun2[29], trun2[30], trun2[31]]);
+        assert_eq!(cto2_0, 3, "frag2 sample0 CTO=3 (offset from frag1 persists)");
+        assert_eq!(cto2_1, 3, "frag2 sample1 CTO=3 (same adjusted diff)");
     }
 }

@@ -243,6 +243,13 @@ check_mp4() {
     echo "$stts_pass" | grep -q "^OK$" && echo -e "${GREEN}  ✓ stts consistent${NC}" || echo -e "${YELLOW}  ⚠ stts incomplete${NC}"
     echo "$stts_pass" | grep -v "^OK$" | grep -v "^FAIL$" | while IFS= read -r l; do echo "  $l"; done
 
+    # DTS/CTS/PTS timing consistency check
+    local timing_pass
+    timing_pass=$(python3 "$(dirname "$0")/tests/timing_check.py" "$mp4" 2>&1) || true
+
+    echo "$timing_pass" | grep -q "^TIMING_OK$" && echo -e "${GREEN}  ✓ timing consistent${NC}" || echo -e "${YELLOW}  ⚠ timing incomplete${NC}"
+    echo "$timing_pass" | grep -v "^TIMING_OK$" | grep -v "^TIMING_FAIL$" | while IFS= read -r l; do echo "  $l"; done
+
     echo -e "${GREEN}  ✓ MP4 integrity OK (duration=${duration}s, frames=${fcnt})${NC}"
     return 0
 }

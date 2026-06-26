@@ -514,6 +514,7 @@ impl HlsStreamState {
             .max(self.last_audio_pts)
             .saturating_add(33);
         self.first_ts = None;
+        self.fmp4_muxer.reset_first_cts_offset();
         self.segment_index += 1;
         self.rotate_segment().await?;
         self.current_segment_start = self.timestamp_offset;
