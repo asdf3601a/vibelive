@@ -697,11 +697,7 @@ fn ebsp_to_rbsp(nal: &[u8]) -> Vec<u8> {
     out
 }
 
-fn parse_hevc_sei_nal(
-    nal: &[u8],
-    cll: &mut Option<(u16, u16)>,
-    mdcv: &mut Option<MdcvParts>,
-) {
+fn parse_hevc_sei_nal(nal: &[u8], cll: &mut Option<(u16, u16)>, mdcv: &mut Option<MdcvParts>) {
     if nal.len() < 3 {
         return;
     }
@@ -1085,5 +1081,3 @@ mod tests {
         );
     }
 }
-
-

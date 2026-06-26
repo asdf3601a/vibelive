@@ -47,9 +47,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.recording_remux_enabled,
             cfg.recording_remux_concurrency as usize,
         )),
-        thumbnail_semaphore: Arc::new(Semaphore::new(
-            cfg.thumbnail_ffmpeg_concurrency as usize,
-        )),
+        thumbnail_semaphore: Arc::new(Semaphore::new(cfg.thumbnail_ffmpeg_concurrency as usize)),
         recording_thumbnail_semaphore: Arc::new(Semaphore::new(
             cfg.thumbnail_ffmpeg_concurrency as usize,
         )),
@@ -72,7 +70,11 @@ async fn main() -> anyhow::Result<()> {
         loop {
             interval.tick().await;
             let sm = thumb_state.stream_manager.read().await;
-            let tasks: Vec<(String, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicU64>)> = sm
+            let tasks: Vec<(
+                String,
+                Arc<std::sync::atomic::AtomicBool>,
+                Arc<std::sync::atomic::AtomicU64>,
+            )> = sm
                 .publishers()
                 .iter()
                 .map(|(key, info)| {

@@ -28,7 +28,9 @@ fn available_formats() -> Vec<&'static str> {
     let (jxl, avif) = match info {
         Some(c) => (c.jxl_available, c.avif_available),
         None => {
-            tracing::warn!("Codec info not initialized; probing lazily is not supported. Skipping JXL/AVIF.");
+            tracing::warn!(
+                "Codec info not initialized; probing lazily is not supported. Skipping JXL/AVIF."
+            );
             (false, false)
         }
     };
@@ -267,10 +269,7 @@ async fn encode_fmt_from_png(
             let meta = tokio::fs::metadata(&tmp_output).await?;
             if meta.len() == 0 {
                 let _ = tokio::fs::remove_file(&tmp_output).await;
-                return Err(anyhow::anyhow!(
-                    "ffmpeg produced empty output for {}",
-                    fmt
-                ));
+                return Err(anyhow::anyhow!("ffmpeg produced empty output for {}", fmt));
             }
 
             tokio::fs::rename(&tmp_output, output_path).await?;

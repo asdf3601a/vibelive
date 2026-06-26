@@ -298,7 +298,8 @@ impl HlsStreamState {
         };
         if self.fmp4_muxer.video_codec() == Some(fmp4::VideoCodec::AV1) {
             let mut init_changed = false;
-            if let Some(color_cfg) = fmp4::codec::av1_color_config_from_config(sample_data.as_ref()) {
+            if let Some(color_cfg) = fmp4::codec::av1_color_config_from_config(sample_data.as_ref())
+            {
                 self.fmp4_muxer.set_video_color_config(color_cfg);
                 init_changed = true;
             }

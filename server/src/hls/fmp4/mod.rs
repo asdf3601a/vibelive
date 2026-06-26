@@ -1068,7 +1068,10 @@ impl Fmp4Muxer {
         data.extend_from_slice(&data_offset.to_be_bytes());
 
         if is_video {
-            let first_flags = samples.first().map(|s| s.flags).unwrap_or(SAMPLE_FLAG_KEYFRAME);
+            let first_flags = samples
+                .first()
+                .map(|s| s.flags)
+                .unwrap_or(SAMPLE_FLAG_KEYFRAME);
             data.extend_from_slice(&first_flags.to_be_bytes());
         }
 
@@ -1685,7 +1688,10 @@ mod tests {
                             frag[idata + 2],
                             frag[idata + 3],
                         ]);
-                        assert!(trun_flags & 0x000800 != 0, "trun should have sample_composition_time_offset flag");
+                        assert!(
+                            trun_flags & 0x000800 != 0,
+                            "trun should have sample_composition_time_offset flag"
+                        );
                         // trun data: version(1)+flags(3)+sample_count(4)+data_offset(4)+first_flags(4)+entries
                         // Each entry: sample_size(4)+composition_time_offset(4)
                         // CTO is at data_offset+20 for video
@@ -1790,7 +1796,11 @@ mod tests {
 
         // Every audio sample must have exactly 1024 (AAC fixed frame size)
         for s in &muxer.audio_samples {
-            assert_eq!(s.duration, 1024, "AAC sample duration must be 1024, got {}", s.duration);
+            assert_eq!(
+                s.duration, 1024,
+                "AAC sample duration must be 1024, got {}",
+                s.duration
+            );
         }
     }
 
@@ -1798,7 +1808,9 @@ mod tests {
     fn test_audio_duration_opus_from_toc() {
         let mut muxer = Fmp4Muxer::new();
         muxer.set_audio_codec(AudioCodec::Opus);
-        muxer.set_audio_config(vec![0x01, 0x02, 0x38, 0x01, 0x80, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        muxer.set_audio_config(vec![
+            0x01, 0x02, 0x38, 0x01, 0x80, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
 
         // Opus packet with TOC: config=3 (20ms), c=0 (1 frame) → 960 samples
         // TOC = (3<<5) | 0 = 0x60
@@ -1812,7 +1824,11 @@ mod tests {
         muxer.compute_and_set_durations();
 
         for s in &muxer.audio_samples {
-            assert_eq!(s.duration, 960, "Opus sample duration must be 960 (20ms @ 48kHz), got {}", s.duration);
+            assert_eq!(
+                s.duration, 960,
+                "Opus sample duration must be 960 (20ms @ 48kHz), got {}",
+                s.duration
+            );
         }
     }
 
@@ -1829,7 +1845,11 @@ mod tests {
         muxer.compute_and_set_durations();
 
         for s in &muxer.audio_samples {
-            assert_eq!(s.duration, 960, "Opus fallback duration must be 960, got {}", s.duration);
+            assert_eq!(
+                s.duration, 960,
+                "Opus fallback duration must be 960, got {}",
+                s.duration
+            );
         }
     }
 
@@ -1849,8 +1869,10 @@ mod tests {
         muxer.compute_and_set_durations();
 
         assert_eq!(muxer.audio_samples.len(), 1);
-        assert_eq!(muxer.audio_samples[0].duration, 4096,
-            "Single FLAC sample should default to 4096");
+        assert_eq!(
+            muxer.audio_samples[0].duration, 4096,
+            "Single FLAC sample should default to 4096"
+        );
     }
 
     #[test]
@@ -1869,7 +1891,10 @@ mod tests {
         // which set_audio_config set sample_rate to 44100.
         // total=23, cnt=1 → 23*44100/1000 = 1014 (rounded from 1014.3)
         assert_eq!(muxer.audio_samples[0].duration, 1014);
-        assert_eq!(muxer.audio_samples[0].duration, muxer.audio_samples[1].duration);
+        assert_eq!(
+            muxer.audio_samples[0].duration,
+            muxer.audio_samples[1].duration
+        );
     }
 
     #[test]
@@ -1895,9 +1920,8 @@ mod tests {
     fn find_box_bytes<'a>(data: &'a [u8], target: &[u8; 4]) -> Option<(usize, &'a [u8])> {
         let mut off = 0;
         while off + 8 <= data.len() {
-            let size =
-                u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
-                    as usize;
+            let size = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+                as usize;
             if size == 0 || off + size > data.len() {
                 break;
             }
@@ -1944,9 +1968,9 @@ mod tests {
         mux.set_video_codec(VideoCodec::H265, 1920, 1080);
         mux.set_audio_codec(AudioCodec::Aac);
         mux.set_video_config(vec![
-            0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78,
-            0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 0x03, 0x20, 0x00, 0x00,
-            0x03, 0x00, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xAC, 0x09,
+            0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xF0,
+            0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 0x03, 0x20, 0x00, 0x00, 0x03, 0x00,
+            0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xAC, 0x09,
         ]);
         mux.set_audio_config(vec![0x12, 0x10]);
 
@@ -1989,14 +2013,38 @@ mod tests {
             find_box_bytes(&init, b"mdcv").expect("mdcv box missing from init segment");
         assert_eq!(mdcv_size, 32, "mdcv box should be 32 bytes");
 
-        assert_eq!(u16::from_be_bytes([mdcv_data[0], mdcv_data[1]]), 13250, "GX");
-        assert_eq!(u16::from_be_bytes([mdcv_data[2], mdcv_data[3]]), 34500, "GY");
+        assert_eq!(
+            u16::from_be_bytes([mdcv_data[0], mdcv_data[1]]),
+            13250,
+            "GX"
+        );
+        assert_eq!(
+            u16::from_be_bytes([mdcv_data[2], mdcv_data[3]]),
+            34500,
+            "GY"
+        );
         assert_eq!(u16::from_be_bytes([mdcv_data[4], mdcv_data[5]]), 7500, "BX");
         assert_eq!(u16::from_be_bytes([mdcv_data[6], mdcv_data[7]]), 3000, "BY");
-        assert_eq!(u16::from_be_bytes([mdcv_data[8], mdcv_data[9]]), 34000, "RX");
-        assert_eq!(u16::from_be_bytes([mdcv_data[10], mdcv_data[11]]), 16000, "RY");
-        assert_eq!(u16::from_be_bytes([mdcv_data[12], mdcv_data[13]]), 15635, "WX");
-        assert_eq!(u16::from_be_bytes([mdcv_data[14], mdcv_data[15]]), 16450, "WY");
+        assert_eq!(
+            u16::from_be_bytes([mdcv_data[8], mdcv_data[9]]),
+            34000,
+            "RX"
+        );
+        assert_eq!(
+            u16::from_be_bytes([mdcv_data[10], mdcv_data[11]]),
+            16000,
+            "RY"
+        );
+        assert_eq!(
+            u16::from_be_bytes([mdcv_data[12], mdcv_data[13]]),
+            15635,
+            "WX"
+        );
+        assert_eq!(
+            u16::from_be_bytes([mdcv_data[14], mdcv_data[15]]),
+            16450,
+            "WY"
+        );
         assert_eq!(
             u32::from_be_bytes([mdcv_data[16], mdcv_data[17], mdcv_data[18], mdcv_data[19]]),
             10_000_000,

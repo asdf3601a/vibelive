@@ -7,8 +7,8 @@ pub use server::start_rtmp_server;
 use crate::hls::HlsStreamState;
 use crate::recording::Fmp4Recorder;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub struct StreamManager {
     publishers: HashMap<String, PublisherInfo>,
