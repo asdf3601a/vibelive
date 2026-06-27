@@ -65,10 +65,16 @@ pub fn parse_enhanced_hdr_metadata(data: &[u8]) -> Option<HdrMetadata> {
         white_point_x: u16::from_be_bytes([mdcv_data[12], mdcv_data[13]]),
         white_point_y: u16::from_be_bytes([mdcv_data[14], mdcv_data[15]]),
         max_luminance: u32::from_be_bytes([
-            mdcv_data[16], mdcv_data[17], mdcv_data[18], mdcv_data[19],
+            mdcv_data[16],
+            mdcv_data[17],
+            mdcv_data[18],
+            mdcv_data[19],
         ]),
         min_luminance: u32::from_be_bytes([
-            mdcv_data[20], mdcv_data[21], mdcv_data[22], mdcv_data[23],
+            mdcv_data[20],
+            mdcv_data[21],
+            mdcv_data[22],
+            mdcv_data[23],
         ]),
     })
 }

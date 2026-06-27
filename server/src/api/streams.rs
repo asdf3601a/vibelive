@@ -73,15 +73,13 @@ pub async fn list(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 pub async fn get(State(state): State<Arc<AppState>>, Path(key): Path<String>) -> impl IntoResponse {
     let sm = state.stream_manager.read().await;
     match sm.get_publisher(&key) {
-        Some(info) => {
-            (
-                StatusCode::OK,
-                Json(serde_json::json!(build_stream_response(
-                    info,
-                    &state.config.thumbnail_sizes
-                ))),
-            )
-        }
+        Some(info) => (
+            StatusCode::OK,
+            Json(serde_json::json!(build_stream_response(
+                info,
+                &state.config.thumbnail_sizes
+            ))),
+        ),
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Stream not found"})),

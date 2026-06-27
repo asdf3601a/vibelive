@@ -73,8 +73,7 @@ impl Config {
             thumbnail_rate_limit_seconds: env::var("THUMBNAIL_RATE_LIMIT_SECONDS")
                 .unwrap_or_else(|_| "5".into())
                 .parse()?,
-            cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS")
-                .unwrap_or_else(|_| "*".into()),
+            cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS").unwrap_or_else(|_| "*".into()),
         })
     }
 }

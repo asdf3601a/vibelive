@@ -489,7 +489,9 @@ async fn finalize_stream(
                     );
                 } else {
                     let hls_dir = PathBuf::from(&media_dir).join("hls").join(&key);
-                    app_state.disk_writer.send(DiskCommand::RemoveDirAll { path: hls_dir });
+                    app_state
+                        .disk_writer
+                        .send(DiskCommand::RemoveDirAll { path: hls_dir });
                 }
             });
         }
@@ -703,7 +705,11 @@ async fn handle_event(
                 ctx.track_states.clear();
                 if app_state.config.recording_enabled {
                     // Recordings directory creation is handled by DiskWriter via Fmp4Recorder
-                    ctx.recorder = Some(Fmp4Recorder::new(&media_dir, &stream_key, ctx.disk_writer.clone()));
+                    ctx.recorder = Some(Fmp4Recorder::new(
+                        &media_dir,
+                        &stream_key,
+                        ctx.disk_writer.clone(),
+                    ));
                 }
                 ctx.current_stream_key = Some(stream_key.clone());
 
@@ -966,11 +972,15 @@ async fn handle_video_data(
                                         Some(crate::rtmp::enhanced::VideoPacketType::Metadata) => {
                                             let _ = hls
                                                 .set_video_color_config(
-                                                    super::color::parse_enhanced_color_config(track.payload),
+                                                    super::color::parse_enhanced_color_config(
+                                                        track.payload,
+                                                    ),
                                                 )
                                                 .await;
                                             if let Some(hdr) =
-                                                super::color::parse_enhanced_hdr_metadata(track.payload)
+                                                super::color::parse_enhanced_hdr_metadata(
+                                                    track.payload,
+                                                )
                                             {
                                                 let _ = hls.set_hdr_metadata(hdr).await;
                                             }
@@ -1013,11 +1023,15 @@ async fn handle_video_data(
                                         Some(crate::rtmp::enhanced::VideoPacketType::Metadata) => {
                                             let _ = track_state
                                                 .set_video_color_config(
-                                                    super::color::parse_enhanced_color_config(track.payload),
+                                                    super::color::parse_enhanced_color_config(
+                                                        track.payload,
+                                                    ),
                                                 )
                                                 .await;
                                             if let Some(hdr) =
-                                                super::color::parse_enhanced_hdr_metadata(track.payload)
+                                                super::color::parse_enhanced_hdr_metadata(
+                                                    track.payload,
+                                                )
                                             {
                                                 let _ = track_state.set_hdr_metadata(hdr).await;
                                             }
@@ -1074,7 +1088,9 @@ async fn handle_video_data(
                 crate::rtmp::enhanced::VideoPacketType::Metadata => {
                     if let Some(ref mut hls) = ctx.hls_state {
                         let _ = hls
-                            .set_video_color_config(super::color::parse_enhanced_color_config(remainder))
+                            .set_video_color_config(super::color::parse_enhanced_color_config(
+                                remainder,
+                            ))
                             .await;
                         if let Some(hdr) = super::color::parse_enhanced_hdr_metadata(remainder) {
                             let _ = hls.set_hdr_metadata(hdr).await;
@@ -1082,7 +1098,9 @@ async fn handle_video_data(
                     }
                     for track_state in ctx.track_states.values_mut() {
                         let _ = track_state
-                            .set_video_color_config(super::color::parse_enhanced_color_config(remainder))
+                            .set_video_color_config(super::color::parse_enhanced_color_config(
+                                remainder,
+                            ))
                             .await;
                         if let Some(hdr) = super::color::parse_enhanced_hdr_metadata(remainder) {
                             let _ = track_state.set_hdr_metadata(hdr).await;

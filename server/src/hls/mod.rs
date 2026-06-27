@@ -280,8 +280,7 @@ impl HlsStreamState {
         let elapsed_since_start = dts.saturating_sub(self.current_segment_start);
         let threshold = self.segment_duration as u64 * 1000;
 
-        if elapsed_since_start >= threshold && self.segment_open && !self.pending_rotation
-        {
+        if elapsed_since_start >= threshold && self.segment_open && !self.pending_rotation {
             self.pending_rotation = true;
             self.pending_rotation_pts = dts;
         }
@@ -368,10 +367,7 @@ impl HlsStreamState {
         if self.is_audio_only {
             let elapsed_since_start = pts.saturating_sub(self.current_segment_start);
             let threshold = self.segment_duration as u64 * 1000;
-            if elapsed_since_start >= threshold
-                && self.segment_open
-                && !self.pending_rotation
-            {
+            if elapsed_since_start >= threshold && self.segment_open && !self.pending_rotation {
                 self.pending_rotation = true;
                 self.pending_rotation_pts = pts;
             }
@@ -443,25 +439,23 @@ impl HlsStreamState {
         self.write_init_segment().await?;
         self.segment_open = true;
         self.update_playlist().await?;
-        tracing::debug!("rotate_segment: done, segment_index={}, track={}", self.segment_index, self.track_id);
+        tracing::debug!(
+            "rotate_segment: done, segment_index={}, track={}",
+            self.segment_index,
+            self.track_id
+        );
         Ok(())
     }
 
     pub async fn finalize_segment(&mut self) -> anyhow::Result<()> {
-        tracing::debug!(
-            "finalize_segment: segment_open={}",
-            self.segment_open
-        );
+        tracing::debug!("finalize_segment: segment_open={}", self.segment_open);
         if !self.segment_open {
             return Ok(());
         }
         self.segment_open = false;
 
         let has_fragment = if let Some(fragment) = self.fmp4_muxer.flush_combined_fragment() {
-            tracing::debug!(
-                "finalize_segment: fragment of {} bytes",
-                fragment.len()
-            );
+            tracing::debug!("finalize_segment: fragment of {} bytes", fragment.len());
 
             // Capture last sample duration before flush clears samples
             let last_sample_duration = if self.last_video_pts >= self.last_audio_pts {
@@ -665,7 +659,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10, dw.clone());
+        let state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            4,
+            10,
+            dw.clone(),
+        );
         assert_eq!(state.segment_index, 0);
         assert!(!state.segment_open);
         assert!(!state.has_video);
@@ -681,7 +683,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            4,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -721,7 +731,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -757,7 +775,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 4, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            4,
+            10,
+            dw.clone(),
+        );
 
         let aac = vec![0x01, 0x02, 0x03];
         state.write_audio(&aac, 0).await.unwrap();
@@ -776,7 +802,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -818,7 +852,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -855,7 +897,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -892,7 +942,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 3, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            3,
+            dw.clone(),
+        );
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -952,7 +1010,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -986,7 +1052,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config1 = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -1041,7 +1115,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config1 = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -1080,7 +1162,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -1109,7 +1199,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state
@@ -1139,7 +1237,15 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut state = HlsStreamState::new(test_dir.to_str().unwrap(), "testkey", 0, false, 2, 10, dw.clone());
+        let mut state = HlsStreamState::new(
+            test_dir.to_str().unwrap(),
+            "testkey",
+            0,
+            false,
+            2,
+            10,
+            dw.clone(),
+        );
 
         let avcc_config = vec![0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x00];
         state

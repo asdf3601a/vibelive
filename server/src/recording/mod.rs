@@ -123,8 +123,7 @@ impl Fmp4Recorder {
         if !self.recording_open {
             return Ok(());
         }
-        if let Some(rewritten_tfdt) =
-            rewrite_segment_tfdt(&mut segment, self.recording_time_offset)
+        if let Some(rewritten_tfdt) = rewrite_segment_tfdt(&mut segment, self.recording_time_offset)
         {
             if let Some(last_tfdt) = self.last_tfdt {
                 if rewritten_tfdt < last_tfdt {
@@ -227,6 +226,10 @@ async fn remux_fmp4_to_mp4(path: &std::path::Path) -> anyhow::Result<()> {
             "copy",
             "-movflags",
             "+faststart",
+            "-use_editlist",
+            "0",
+            "-negative_cts_offsets",
+            "1",
             "-f",
             "mp4",
             tmp_path.to_str().unwrap(),
@@ -492,7 +495,8 @@ mod tests {
             .await
             .unwrap();
         let dw = test_disk_writer();
-        let mut recorder = Fmp4Recorder::new(test_dir.to_str().unwrap(), "doublestream", dw.clone());
+        let mut recorder =
+            Fmp4Recorder::new(test_dir.to_str().unwrap(), "doublestream", dw.clone());
 
         recorder.write_init(&[0x01, 0x02]).await.unwrap();
         let path1 = recorder.close().await.unwrap();

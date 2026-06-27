@@ -438,7 +438,6 @@ impl Fmp4Muxer {
             (self.video_width as u32) << 16,
             (self.video_height as u32) << 16,
         );
-        self.write_edts(&mut trak_data, true);
         self.write_mdia_video(&mut trak_data);
         write_box(w, b"trak", &trak_data);
     }
@@ -446,33 +445,8 @@ impl Fmp4Muxer {
     fn write_audio_trak(&self, w: &mut Vec<u8>) {
         let mut trak_data = Vec::new();
         self.write_tkhd(&mut trak_data, 2, 0x0100, 0, 0);
-        self.write_edts(&mut trak_data, false);
         self.write_mdia_audio(&mut trak_data);
         write_box(w, b"trak", &trak_data);
-    }
-
-    fn write_edts(&self, w: &mut Vec<u8>, is_video: bool) {
-        let mut elst_data = Vec::new();
-        if is_video {
-            elst_data.extend_from_slice(&2u32.to_be_bytes());
-            elst_data.extend_from_slice(&0u32.to_be_bytes());
-            elst_data.extend_from_slice(&0xFFFFFFFFu32.to_be_bytes());
-            elst_data.extend_from_slice(&1u16.to_be_bytes());
-            elst_data.extend_from_slice(&0u16.to_be_bytes());
-            elst_data.extend_from_slice(&0u32.to_be_bytes());
-            elst_data.extend_from_slice(&0u32.to_be_bytes());
-            elst_data.extend_from_slice(&1u16.to_be_bytes());
-            elst_data.extend_from_slice(&0u16.to_be_bytes());
-        } else {
-            elst_data.extend_from_slice(&1u32.to_be_bytes());
-            elst_data.extend_from_slice(&0u32.to_be_bytes());
-            elst_data.extend_from_slice(&0u32.to_be_bytes());
-            elst_data.extend_from_slice(&1u16.to_be_bytes());
-            elst_data.extend_from_slice(&0u16.to_be_bytes());
-        }
-        let mut edts_data = Vec::new();
-        write_fullbox(&mut edts_data, b"elst", 0, 0, &elst_data);
-        write_box(w, b"edts", &edts_data);
     }
 
     fn write_tkhd(&self, w: &mut Vec<u8>, track_id: u32, volume: u16, width: u32, height: u32) {
@@ -2090,8 +2064,12 @@ mod tests {
         let frag = muxer.flush_combined_fragment().unwrap();
         let (_, _, _, trun_data) = find_traf_child(&frag, 0, b"trun");
 
-        assert_eq!(trun_data[0], 1, "trun version should be 1 (has non-zero CTO)");
-        let sample_count = u32::from_be_bytes([trun_data[4], trun_data[5], trun_data[6], trun_data[7]]);
+        assert_eq!(
+            trun_data[0], 1,
+            "trun version should be 1 (has non-zero CTO)"
+        );
+        let sample_count =
+            u32::from_be_bytes([trun_data[4], trun_data[5], trun_data[6], trun_data[7]]);
         assert_eq!(sample_count, 3);
 
         // Entry offsets: [12..16]=first_flags, then [16..20]=size, [20..24]=CTO, [24..28]=size, ...
@@ -2122,7 +2100,10 @@ mod tests {
         let cto0 = i32::from_be_bytes([trun_data[20], trun_data[21], trun_data[22], trun_data[23]]);
         let cto1 = i32::from_be_bytes([trun_data[28], trun_data[29], trun_data[30], trun_data[31]]);
 
-        assert_eq!(cto0, 0, "first CTO must be 0 even with negative initial PTS-DTS");
+        assert_eq!(
+            cto0, 0,
+            "first CTO must be 0 even with negative initial PTS-DTS"
+        );
         assert_eq!(cto1, 3, "second CTO should be 3 (100ms adjusted)");
     }
 
@@ -2171,7 +2152,8 @@ mod tests {
         let (_, _, _, trun1) = find_traf_child(&frag1, 0, b"trun");
         assert_eq!(
             i32::from_be_bytes([trun1[20], trun1[21], trun1[22], trun1[23]]),
-            0, "frag1 sample0 CTO=0"
+            0,
+            "frag1 sample0 CTO=0"
         );
 
         // Fragment 2: offset persists from fragment 1
@@ -2185,7 +2167,10 @@ mod tests {
         // Since only one sample has non-zero CTO (both actually do), version=1
         let cto2_0 = i32::from_be_bytes([trun2[20], trun2[21], trun2[22], trun2[23]]);
         let cto2_1 = i32::from_be_bytes([trun2[28], trun2[29], trun2[30], trun2[31]]);
-        assert_eq!(cto2_0, 3, "frag2 sample0 CTO=3 (offset from frag1 persists)");
+        assert_eq!(
+            cto2_0, 3,
+            "frag2 sample0 CTO=3 (offset from frag1 persists)"
+        );
         assert_eq!(cto2_1, 3, "frag2 sample1 CTO=3 (same adjusted diff)");
     }
 }
