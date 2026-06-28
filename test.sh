@@ -250,6 +250,13 @@ check_mp4() {
     echo "$timing_pass" | grep -q "^TIMING_OK$" && echo -e "${GREEN}  ✓ timing consistent${NC}" || echo -e "${YELLOW}  ⚠ timing incomplete${NC}"
     echo "$timing_pass" | grep -v "^TIMING_OK$" | grep -v "^TIMING_FAIL$" | while IFS= read -r l; do echo "  $l"; done
 
+    # Edit list (edts/elst) policy check: AAC pre-roll only, no video edts
+    local edts_pass
+    edts_pass=$(python3 "$(dirname "$0")/tests/edts_check.py" "$mp4" 2>&1) || true
+
+    echo "$edts_pass" | grep -q "^EDTS_OK$" && echo -e "${GREEN}  ✓ edit list consistent${NC}" || echo -e "${YELLOW}  ⚠ edit list incomplete${NC}"
+    echo "$edts_pass" | grep -v "^EDTS_OK$" | grep -v "^EDTS_FAIL$" | while IFS= read -r l; do echo "  $l"; done
+
     echo -e "${GREEN}  ✓ MP4 integrity OK (duration=${duration}s, frames=${fcnt})${NC}"
     return 0
 }

@@ -226,8 +226,6 @@ async fn remux_fmp4_to_mp4(path: &std::path::Path) -> anyhow::Result<()> {
             "copy",
             "-movflags",
             "+faststart+negative_cts_offsets",
-            "-use_editlist",
-            "0",
             "-f",
             "mp4",
             tmp_path.to_str().unwrap(),

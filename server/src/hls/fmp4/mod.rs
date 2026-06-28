@@ -75,6 +75,15 @@ pub struct HdrMetadata {
 const SAMPLE_FLAG_KEYFRAME: u32 = 0x02000000;
 const SAMPLE_FLAG_NON_KEYFRAME: u32 = 0x01010000;
 
+/// AAC-LC encoder pre-roll skipped via the audio edit list.
+///
+/// RTMP/FLV carries AAC frames with their priming included but does not signal
+/// encoder delay, so the priming must be assumed. One AAC-LC frame (1024
+/// samples) is the single-frame MDCT pre-roll. When both video and audio are
+/// rebased to start at 0, this edit shifts the audio presentation earlier by
+/// this many samples so real audio aligns with video at t=0.
+const AAC_PRIMING_SAMPLES: u32 = 1024;
+
 pub struct Fmp4Muxer {
     video_codec: Option<VideoCodec>,
     audio_codec: Option<AudioCodec>,
@@ -445,8 +454,31 @@ impl Fmp4Muxer {
     fn write_audio_trak(&self, w: &mut Vec<u8>) {
         let mut trak_data = Vec::new();
         self.write_tkhd(&mut trak_data, 2, 0x0100, 0, 0);
+        if self.audio_codec == Some(AudioCodec::Aac) {
+            self.write_edts_aac(&mut trak_data);
+        }
         self.write_mdia_audio(&mut trak_data);
         write_box(w, b"trak", &trak_data);
+    }
+
+    /// Audio edit list to skip AAC encoder pre-roll.
+    ///
+    /// Multi-encoder note: only AAC needs an `elst` here. Opus signals pre-roll
+    /// via the `roll` sample group (`sgpd`/`sbgp`) plus `pre_skip` in `dOps`;
+    /// FLAC has no encoder delay; video relies on CTS normalization (first trun
+    /// composition_time_offset is always 0). `segment_duration = 0` extends the
+    /// edit to the end of the fragmented track (standard CMAF/HLS convention).
+    fn write_edts_aac(&self, w: &mut Vec<u8>) {
+        let mut elst = Vec::new();
+        elst.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        elst.extend_from_slice(&0u32.to_be_bytes()); // segment_duration (movie timescale)
+        // media_time is in the track's media timescale (audio_sample_rate).
+        elst.extend_from_slice(&(AAC_PRIMING_SAMPLES as i32).to_be_bytes());
+        elst.extend_from_slice(&1u16.to_be_bytes()); // media_rate_integer
+        elst.extend_from_slice(&0u16.to_be_bytes()); // media_rate_fraction
+        let mut edts = Vec::new();
+        write_fullbox(&mut edts, b"elst", 0, 0, &elst);
+        write_box(w, b"edts", &edts);
     }
 
     fn write_tkhd(&self, w: &mut Vec<u8>, track_id: u32, volume: u16, width: u32, height: u32) {
@@ -2172,5 +2204,143 @@ mod tests {
             "frag2 sample0 CTO=3 (offset from frag1 persists)"
         );
         assert_eq!(cto2_1, 3, "frag2 sample1 CTO=3 (same adjusted diff)");
+    }
+
+    // ── Edit list (edts/elst) per-codec validation ──────────────────
+    //
+    // Only AAC gets an edts/elst (to skip encoder pre-roll). Opus signals
+    // pre-roll via sgpd/sbgp + dOps pre_skip; FLAC has no encoder delay; video
+    // relies on CTS normalization (first trun CTO = 0).
+
+    /// Locate the `elst` payload (bytes after the elst fullbox header) inside an
+    /// `edts` box, or None if no edts is present. Returns the entry bytes
+    /// starting at entry_count.
+    fn find_elst_entries(init: &[u8]) -> Option<&[u8]> {
+        let (_edts_size, edts_content) = find_box_bytes(init, b"edts")?;
+        // edts_content is the elst fullbox: size(4) + "elst"(4) + version(1) +
+        // flags(3) + entry_count(4) + entries...
+        if edts_content.len() < 12 || &edts_content[4..8] != b"elst" {
+            return None;
+        }
+        Some(&edts_content[12..])
+    }
+
+    #[test]
+    fn test_aac_audio_trak_has_edts() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Aac);
+        muxer.set_audio_config(vec![0x12, 0x10]); // 44100Hz stereo
+
+        let init = muxer.init_segment();
+        let entries = find_elst_entries(&init).expect("AAC audio trak must have edts/elst");
+
+        // elst version 0, single entry:
+        //   entry_count(4) + segment_duration(4) + media_time(4) + media_rate(4)
+        assert_eq!(
+            u32::from_be_bytes(entries[0..4].try_into().unwrap()),
+            1,
+            "one elst entry"
+        );
+        let segment_duration = u32::from_be_bytes(entries[4..8].try_into().unwrap());
+        assert_eq!(
+            segment_duration, 0,
+            "segment_duration=0 extends to end of fragmented track"
+        );
+        let media_time = i32::from_be_bytes(entries[8..12].try_into().unwrap());
+        assert_eq!(
+            media_time, AAC_PRIMING_SAMPLES as i32,
+            "media_time skips AAC pre-roll"
+        );
+        let media_rate_int = u16::from_be_bytes(entries[12..14].try_into().unwrap());
+        let media_rate_frac = u16::from_be_bytes(entries[14..16].try_into().unwrap());
+        assert_eq!(media_rate_int, 1, "media_rate integer = 1");
+        assert_eq!(media_rate_frac, 0, "media_rate fraction = 0");
+    }
+
+    #[test]
+    fn test_aac_edts_present_in_combined_av_init() {
+        // With both video and AAC audio, the edts must still appear (on the
+        // audio trak). Video never gets an edts.
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_video_codec(VideoCodec::H264, 1920, 1080);
+        muxer.set_video_config(vec![0x01, 0x42, 0xC0, 0x1E]);
+        muxer.set_audio_codec(AudioCodec::Aac);
+        muxer.set_audio_config(vec![0x12, 0x10]);
+
+        let init = muxer.init_segment();
+        let entries = find_elst_entries(&init).expect("combined AV init must keep AAC edts");
+        let media_time = i32::from_be_bytes(entries[8..12].try_into().unwrap());
+        assert_eq!(media_time, AAC_PRIMING_SAMPLES as i32);
+    }
+
+    #[test]
+    fn test_opus_audio_trak_no_edts() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Opus);
+        // OpusHead v1: magic(8) + version(1)=1 + channels(1)=2 + pre_skip(2)
+        // + sample_rate(4)=48000 + gain(2)=0 + family(1)=0
+        let mut head = b"OpusHead".to_vec();
+        head.extend_from_slice(&[
+            0x01, 0x02, 0x00, 0x00, 0x80, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        muxer.set_audio_config(head);
+
+        let init = muxer.init_segment();
+        assert!(
+            find_box_bytes(&init, b"edts").is_none(),
+            "Opus trak must not have edts (pre-roll via sgpd/sbgp + dOps pre_skip)"
+        );
+        // Sanity: Opus pre-roll mechanism is present instead.
+        assert!(
+            find_box_bytes(&init, b"sgpd").is_some(),
+            "Opus trak should have sgpd roll group"
+        );
+    }
+
+    #[test]
+    fn test_flac_audio_trak_no_edts() {
+        let mut muxer = Fmp4Muxer::new();
+        muxer.set_audio_codec(AudioCodec::Flac);
+        // Minimal fLaC + 34-byte STREAMINFO (rate parsed via parse_flac_streaminfo).
+        let mut config = b"fLaC".to_vec();
+        config.extend_from_slice(&[0u8; 34]);
+        muxer.set_audio_config(config);
+
+        let init = muxer.init_segment();
+        assert!(
+            find_box_bytes(&init, b"edts").is_none(),
+            "FLAC trak must not have edts (no encoder delay)"
+        );
+    }
+
+    #[test]
+    fn test_video_trak_no_edts() {
+        // Video-only inits for each codec must not carry an edts; video timing
+        // is handled by CTS normalization (first trun CTO = 0).
+        for (codec, config) in [
+            (VideoCodec::H264, vec![0x01, 0x42, 0xC0, 0x1E]),
+            (
+                VideoCodec::H265,
+                vec![
+                    0x01, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78,
+                    0xF0, 0x00, 0xFC, 0xFD, 0xF8, 0xF8, 0x00, 0x00, 0x0F, 0x03, 0x20, 0x00, 0x00,
+                    0x03, 0x00, 0x80, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xAC, 0x09,
+                ],
+            ),
+            (
+                VideoCodec::AV1,
+                vec![0x81, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4B, 0x97],
+            ),
+        ] {
+            let mut muxer = Fmp4Muxer::new();
+            muxer.set_video_codec(codec, 1920, 1080);
+            muxer.set_video_config(config);
+            let init = muxer.init_segment();
+            assert!(
+                find_box_bytes(&init, b"edts").is_none(),
+                "{:?} video trak must not have edts",
+                codec
+            );
+        }
     }
 }

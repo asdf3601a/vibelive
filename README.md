@@ -79,6 +79,7 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - Supports H.264, H.265 (HEVC), AV1 video + AAC, Opus, FLAC audio
   - Generates `init_segment()` (ftyp + moov), `flush_combined_fragment()` (moof + mdat)
   - Uses Sample tables with duration computation, composition time offsets, and proper `trex` defaults. Audio decode time is tracked in the codec media timescale for known fixed-frame codecs (AAC 1024-sample frames, Opus 960, FLAC 4096) so audio `tfdt.baseMediaDecodeTime` stays on the same sample grid as `tfhd.default_sample_duration` instead of being derived from rounded RTMP millisecond timestamps.
+  - **A/V sync (edit-list policy)**: Each codec handles pre-roll differently so the muxer never writes a one-size-fits-all `edts/elst`. Video relies on **CTS normalization** — the first sample's PTS−DTS diff is stored as `first_cts_offset` and subtracted from every sample, so the first `composition_time_offset` in every `trun` is always 0 (no video `edts`). **AAC** carries its MDCT encoder pre-roll inside the RTMP frames (FLV does not signal encoder delay), so an `edts/elst` with `media_time = 1024` (one AAC-LC frame, `AAC_PRIMING_SAMPLES`) is written on the AAC trak to skip the priming and align real audio with video at t=0; `segment_duration = 0` extends the edit to the end of the fragmented track (standard CMAF/HLS convention). **Opus** signals pre-roll via the `roll` sample group (`sgpd`/`sbgp`) plus `pre_skip` in `dOps` (no `edts`). **FLAC** has no encoder delay (no `edts`). The policy is enforced by `tests/edts_check.py` in `check_mp4()`.
   - **HDR metadata passthrough**: Writes `colr` (nclx with color_primaries / transfer_characteristics / matrix_coefficients / full_range), `clli` (maxCLL / maxFALL), and `mdcv` (display primaries, white point, luminance) boxes into the video sample entry. HDR metadata is sourced from three paths: (1) Enhanced RTMP AMF0 `colorInfo` (OBS/veovera), (2) Enhanced RTMP binary format (FFmpeg), (3) HEVC hvcC SEI NAL units and AV1 metadata OBUs (`hls/fmp4/codec.rs`). AV1 color config is also extracted from codec configuration OBU.
 - **`hls/fmp4/codec.rs`** — RFC 6381 codec string builders (avc1, hvc1, av01, mp4a, opus, fLaC), AV1 OBU parsing and normalization (`ensure_av1_obu_size_fields`, `av1c_box_from_config`), HEVC hvcC SEI HDR extraction (`hevc_hdr_metadata_from_hvcc`), AV1 metadata OBU HDR extraction (`av1_hdr_metadata_from_obus`), and audio config builders (`build_esds`, `build_dops`, `build_dfla`).
 
@@ -92,7 +93,7 @@ In local dev, `vite dev server` runs on port 3000 and proxies `/api`, `/hls`, `/
   - `update_index_json()` atomically updates `recordings/index.json` with metadata and thumbnail URLs
 - **`RemuxQueue`** — Optional background FFmpeg remux after recording finalization:
   - Runs asynchronously after `recorder.close()` so stream shutdown is never blocked
-  - Uses `-movflags +faststart` to relocate moov to the front for maximum player compatibility
+  - Uses `-movflags +faststart+negative_cts_offsets`: `+faststart` relocates `moov` to the front for maximum player compatibility; `+negative_cts_offsets` keeps B-frame video on negative `ctts` (no video `edts`), consistent with the fMP4 muxer's CTS-normalization design. `-use_editlist` is left at ffmpeg's default (`auto`) so the **AAC audio `elst`** (pre-roll skip) is preserved/propagated through the remux rather than stripped — the mov demuxer otherwise applies it during demux, dropping the priming either way, so recording A/V sync is correct.
    - Adds `-strict -2` for FLAC-in-MP4 compatibility (required by older FFmpeg versions).
   - Concurrency controlled via `tokio::sync::Semaphore` (`RECORDING_REMUX_CONCURRENCY`, default 4)
   - Configurable via `RECORDING_REMUX_ENABLED` (default true) — no remux performed when disabled (file is already a valid fragmented MP4 with moov at front)
@@ -781,6 +782,8 @@ vibe-livestream/
     ├── regen_thumbnails.sh  # Thumbnail regeneration (two-phase, faststart remux, parallel)
     ├── hdr_boxes.py         # HDR ISOBMFF box validation
     ├── stts_check.py        # stts box sample_delta validation
+    ├── timing_check.py      # DTS/CTS/PTS timing consistency (moof/traf/tfdt/trun)
+    ├── edts_check.py        # Edit-list (edts/elst) per-codec policy validation
     └── passthrough.py       # Audio passthrough frame comparison
 ```
 
