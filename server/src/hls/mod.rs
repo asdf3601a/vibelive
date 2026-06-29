@@ -420,11 +420,13 @@ impl HlsStreamState {
         let path = self.current_init_path();
         let tmp_path = path.with_extension("mp4.tmp");
 
-        self.disk_writer.send(DiskCommand::WriteAndRename {
+        self.disk_writer.send_cmd(DiskCommand::WriteAndRename {
             tmp_path,
             final_path: path,
             data: init.clone(),
-        });
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("disk write init: {}", e))?;
 
         self.init_data = Some(init);
         self.init_written = true;
@@ -433,9 +435,11 @@ impl HlsStreamState {
     }
 
     async fn rotate_segment(&mut self) -> anyhow::Result<()> {
-        self.disk_writer.send(DiskCommand::CreateDirAll {
+        self.disk_writer.send_cmd(DiskCommand::CreateDirAll {
             path: self.stream_dir.clone(),
-        });
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("disk create dir: {}", e))?;
         self.write_init_segment().await?;
         self.segment_open = true;
         self.update_playlist().await?;
@@ -482,11 +486,13 @@ impl HlsStreamState {
             // Push segment write to DiskWriter
             let path = self.segment_path(self.segment_index);
             let tmp_path = path.with_extension("m4s.tmp");
-            self.disk_writer.send(DiskCommand::WriteSegment {
+            self.disk_writer.send_cmd(DiskCommand::WriteSegment {
                 tmp_path,
                 final_path: path,
                 data: fragment,
-            });
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("disk write segment: {}", e))?;
             true
         } else {
             false
@@ -551,7 +557,7 @@ impl HlsStreamState {
             }
             let seg_idx = self.first_segment_index + i as u32;
             let path = self.segment_path(seg_idx);
-            self.disk_writer.send(DiskCommand::RemoveFile { path });
+            self.disk_writer.try_send_cmd(DiskCommand::RemoveFile { path });
         }
 
         if to_remove > 0 {
@@ -628,11 +634,13 @@ impl HlsStreamState {
 
         let lock_path = self.stream_dir.join("index.m3u8.lock");
         let target_path = self.stream_dir.join("index.m3u8");
-        self.disk_writer.send(DiskCommand::WritePlaylist {
+        self.disk_writer.send_cmd(DiskCommand::WritePlaylist {
             lock_path,
             target_path,
             content: playlist,
-        });
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("disk write playlist: {}", e))?;
         Ok(())
     }
 }

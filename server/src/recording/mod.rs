@@ -85,7 +85,9 @@ impl Fmp4Recorder {
             && self.recording_open
         {
             // Init changed while recording is open: close current and start new recording
-            let _ = self.close().await;
+            if let Err(e) = self.close().await {
+                tracing::warn!("Recording: close on init change failed for {}: {}", self.stream_key, e);
+            }
             self.closed = false;
         }
 
@@ -96,9 +98,9 @@ impl Fmp4Recorder {
 
         if !self.recording_open {
             // Ensure the recordings directory exists
-            self.disk_writer.send(DiskCommand::CreateDirAll {
+            self.disk_writer.send_cmd(DiskCommand::CreateDirAll {
                 path: self.dir.clone(),
-            });
+            }).await.map_err(|e| std::io::Error::other(format!("disk create dir: {}", e)))?;
             let path = self.dir.join(format!(
                 "{}_{}.mp4",
                 self.stream_key,
@@ -108,11 +110,11 @@ impl Fmp4Recorder {
             self.recording_open = true;
             self.last_tfdt = None;
 
-            self.disk_writer.send(DiskCommand::CreateRecording {
+            self.disk_writer.send_cmd(DiskCommand::CreateRecording {
                 stream_key: self.stream_key.clone(),
                 path,
                 init_data: init.to_vec(),
-            });
+            }).await.map_err(|e| std::io::Error::other(format!("disk create recording: {}", e)))?;
         }
         self.init_written = true;
         self.last_init_hash = Some(new_hash);
@@ -144,10 +146,10 @@ impl Fmp4Recorder {
             }
         }
 
-        self.disk_writer.send(DiskCommand::WriteRecordingData {
+        self.disk_writer.send_cmd(DiskCommand::WriteRecordingData {
             stream_key: self.stream_key.clone(),
             data: segment,
-        });
+        }).await.map_err(|e| std::io::Error::other(format!("disk write recording: {}", e)))?;
         Ok(())
     }
 
@@ -164,9 +166,9 @@ impl Fmp4Recorder {
 
         if self.recording_open {
             self.recording_open = false;
-            self.disk_writer.send(DiskCommand::CloseRecording {
+            self.disk_writer.send_cmd(DiskCommand::CloseRecording {
                 stream_key: self.stream_key.clone(),
-            });
+            }).await.map_err(|e| std::io::Error::other(format!("disk close recording: {}", e)))?;
         }
 
         self.saved_path

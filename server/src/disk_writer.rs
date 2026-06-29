@@ -5,6 +5,20 @@ use tokio::sync::mpsc;
 
 const DISK_WRITER_CHANNEL_BOUND: usize = 10_000;
 
+/// Error returned when the DiskWriter channel is closed (worker task exited).
+#[derive(Debug, Clone)]
+pub struct DiskWriterError {
+    reason: String,
+}
+
+impl std::fmt::Display for DiskWriterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DiskWriter channel closed: {}", self.reason)
+    }
+}
+
+impl std::error::Error for DiskWriterError {}
+
 pub enum DiskCommand {
     CreateDirAll {
         path: PathBuf,
@@ -72,17 +86,33 @@ impl DiskWriter {
         Self { tx }
     }
 
-    pub fn sender(&self) -> mpsc::Sender<DiskCommand> {
-        self.tx.clone()
+    /// Send a command to the DiskWriter, awaiting channel capacity.
+    ///
+    /// Returns an error only if the DiskWriter worker task has exited
+    /// (channel closed). Under normal operation this provides backpressure
+    /// rather than silently dropping writes.
+    pub async fn send_cmd(&self, cmd: DiskCommand) -> Result<(), DiskWriterError> {
+        self.tx.send(cmd).await.map_err(|e| DiskWriterError {
+            reason: e.to_string(),
+        })
     }
 
-    pub fn send(&self, cmd: DiskCommand) {
+    /// Non-blocking send for non-critical cleanup commands.
+    ///
+    /// Drops the command if the channel is full or closed. Use only for
+    /// best-effort operations like removing stale files where failure is
+    /// acceptable.
+    pub fn try_send_cmd(&self, cmd: DiskCommand) {
         if let Err(e) = self.tx.try_send(cmd) {
-            tracing::error!(
-                "DiskWriter: channel send failed (backpressure or closed): {}",
+            tracing::debug!(
+                "DiskWriter: try_send_cmd skipped (channel full or closed): {}",
                 e
             );
         }
+    }
+
+    pub fn sender(&self) -> mpsc::Sender<DiskCommand> {
+        self.tx.clone()
     }
 
     pub async fn flush(&self) {

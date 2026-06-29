@@ -76,4 +76,52 @@ impl Config {
             cors_allowed_origins: env::var("CORS_ALLOWED_ORIGINS").unwrap_or_else(|_| "*".into()),
         })
     }
+
+    /// Validate that all configuration values are within acceptable ranges.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.thumbnail_sizes.is_empty() {
+            return Err(anyhow::anyhow!(
+                "THUMBNAIL_SIZES must contain at least one width (e.g. \"320\")"
+            ));
+        }
+        for &size in &self.thumbnail_sizes {
+            if size == 0 {
+                return Err(anyhow::anyhow!(
+                    "THUMBNAIL_SIZES contains zero-width entry — all sizes must be > 0"
+                ));
+            }
+            if size > 7680 {
+                return Err(anyhow::anyhow!(
+                    "THUMBNAIL_SIZES contains width {} which exceeds maximum 7680",
+                    size
+                ));
+            }
+        }
+        if self.hls_segment_duration == 0 {
+            return Err(anyhow::anyhow!(
+                "HLS_SEGMENT_DURATION must be > 0 (seconds)"
+            ));
+        }
+        if self.hls_segments_keep < 3 {
+            return Err(anyhow::anyhow!(
+                "HLS_SEGMENTS_KEEP must be >= 3 to maintain a valid sliding window"
+            ));
+        }
+        if self.thumbnail_interval_seconds == 0 {
+            return Err(anyhow::anyhow!(
+                "THUMBNAIL_INTERVAL_SECONDS must be > 0"
+            ));
+        }
+        if self.thumbnail_ffmpeg_concurrency == 0 {
+            return Err(anyhow::anyhow!(
+                "THUMBNAIL_FFMPEG_CONCURRENCY must be > 0"
+            ));
+        }
+        if self.recording_remux_concurrency == 0 {
+            return Err(anyhow::anyhow!(
+                "RECORDING_REMUX_CONCURRENCY must be > 0"
+            ));
+        }
+        Ok(())
+    }
 }

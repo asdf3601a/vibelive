@@ -208,7 +208,11 @@ export function usePlayer(opts: UsePlayerOptions = {}) {
   }
 
   function destroyHls() {
-    if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null }
+    if (hlsInstance) {
+      hlsInstance.detachMedia()
+      hlsInstance.destroy()
+      hlsInstance = null
+    }
     hlsLevels.value = []
     currentHlsLevel.value = -1
     hlsBandwidthEstimate.value = 0

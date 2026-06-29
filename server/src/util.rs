@@ -7,6 +7,20 @@ pub fn hash_bytes(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Read a big-endian u32 from data at the given offset.
+/// Returns 0 if insufficient bytes remain at that offset.
+fn read_u32_at(data: &[u8], offset: usize) -> u32 {
+    if offset + 4 > data.len() {
+        return 0;
+    }
+    u32::from_be_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ])
+}
+
 pub fn find_box(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
     find_box_in_range(data, box_type)
 }
@@ -14,13 +28,17 @@ pub fn find_box(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
 pub fn find_box_in_range(data: &[u8], box_type: &[u8; 4]) -> Option<usize> {
     let mut offset = 0;
     while offset + 8 <= data.len() {
-        let size = read_u32(&data[offset..offset + 4]) as usize;
+        let size = read_u32_at(data, offset) as usize;
         if size == 0 {
             break;
         }
         if size == 1 {
             offset += 16;
             continue;
+        }
+        // Guard against malformed boxes: size too small or extends past buffer
+        if size < 8 || offset + size > data.len() {
+            break;
         }
         if &data[offset + 4..offset + 8] == box_type {
             return Some(offset);

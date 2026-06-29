@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Maximum number of tracks per RTMP session to prevent unbounded memory growth
+/// from malicious or misbehaving encoders.
+const MAX_TRACKS_PER_SESSION: usize = 16;
+
 pub async fn handle_rtmp_session(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -48,8 +52,6 @@ pub async fn handle_rtmp_session(
             };
             tracing::debug!("Read {} bytes from socket", n);
             let data = &buf[..n];
-            tracing::trace!("HEXDUMP: {:?}", &data[..n.min(64)]);
-
             if !handshake_done {
                 tracing::debug!("Handshake: processing {} bytes", data.len());
                 match handshake.process_bytes(data) {
@@ -189,8 +191,45 @@ impl SessionContext {
         track_id: u32,
         is_audio_only: bool,
     ) -> &mut HlsStreamState {
-        let media_dir = self.media_dir.as_ref().unwrap().clone();
-        let stream_key = self.current_stream_key.as_ref().unwrap().clone();
+        // Reject new tracks beyond the limit to prevent unbounded memory growth
+        if self.track_states.len() >= MAX_TRACKS_PER_SESSION
+            && !self.track_states.contains_key(&track_id)
+        {
+            tracing::warn!(
+                "get_or_create_track_state: refusing new track_id={} ({} tracks at limit)",
+                track_id,
+                self.track_states.len()
+            );
+            // Return the first available track state to avoid creating unbounded entries
+            return self
+                .track_states
+                .values_mut()
+                .next()
+                .expect("track_states non-empty at limit");
+        }
+
+        let media_dir = match self.media_dir.as_ref() {
+            Some(d) => d.clone(),
+            None => {
+                tracing::error!(
+                    "get_or_create_track_state: media_dir not set; RTMP packet arrived before publish?"
+                );
+                // Return a dummy entry that will be overwritten on the next call after publish.
+                // The caller should handle this gracefully, but we must not panic.
+                self.media_dir = Some(".".to_string());
+                ".".to_string()
+            }
+        };
+        let stream_key = match self.current_stream_key.as_ref() {
+            Some(k) => k.clone(),
+            None => {
+                tracing::error!(
+                    "get_or_create_track_state: stream_key not set; RTMP packet arrived before publish?"
+                );
+                self.current_stream_key = Some("unknown".to_string());
+                "unknown".to_string()
+            }
+        };
         let segment_duration = self.hls_segment_duration;
         let segments_keep = self.hls_segments_keep;
         let fps_num = self.video_fps_num;
@@ -311,7 +350,7 @@ async fn notify_track_discovered(
     }
 }
 
-fn write_master_playlist(
+async fn write_master_playlist(
     media_dir: &str,
     stream_key: &str,
     track_ids: &[u32],
@@ -334,11 +373,16 @@ fn write_master_playlist(
     }
 
     let master_path = stream_dir.join("master.m3u8");
-    disk_writer.send(DiskCommand::WriteAndRename {
-        tmp_path: stream_dir.join("master.m3u8.tmp"),
-        final_path: master_path,
-        data: playlist.into_bytes(),
-    });
+    disk_writer
+        .send_cmd(DiskCommand::WriteAndRename {
+            tmp_path: stream_dir.join("master.m3u8.tmp"),
+            final_path: master_path,
+            data: playlist.into_bytes(),
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("DiskWriter: write master playlist failed: {}", e);
+        });
 }
 
 async fn drain_hls_to_recorder(hls: &mut HlsStreamState, recorder: &mut Fmp4Recorder) {
@@ -367,7 +411,7 @@ async fn finalize_stream(
 
     // Generate master playlist
     let media_dir = app_state.config.media_dir.clone();
-    write_master_playlist(&media_dir, stream_key, &track_ids, &app_state.disk_writer);
+    write_master_playlist(&media_dir, stream_key, &track_ids, &app_state.disk_writer).await;
 
     // Set ended flag and delete live thumbnails BEFORE spawning any tasks
     {
@@ -380,7 +424,7 @@ async fn finalize_stream(
     let sizes = app_state.config.thumbnail_sizes.clone();
     for &w in &sizes {
         for ext in &["jxl", "avif", "png"] {
-            app_state.disk_writer.send(DiskCommand::RemoveFile {
+            app_state.disk_writer.try_send_cmd(DiskCommand::RemoveFile {
                 path: stream_thumb_dir.join(format!("{}_w{}.{}", stream_key, w, ext)),
             });
         }
@@ -491,7 +535,7 @@ async fn finalize_stream(
                     let hls_dir = PathBuf::from(&media_dir).join("hls").join(&key);
                     app_state
                         .disk_writer
-                        .send(DiskCommand::RemoveDirAll { path: hls_dir });
+                        .try_send_cmd(DiskCommand::RemoveDirAll { path: hls_dir });
                 }
             });
         }
@@ -531,7 +575,7 @@ async fn enter_grace_period(app_state: &Arc<AppState>, ctx: &mut SessionContext)
     // Generate master playlist with whatever we have so far
     if let Some(ref key) = ctx.current_stream_key {
         let media_dir = app_state.config.media_dir.clone();
-        write_master_playlist(&media_dir, key, &track_ids, &ctx.disk_writer);
+        write_master_playlist(&media_dir, key, &track_ids, &ctx.disk_writer).await;
     }
 
     if let Some(ref key) = ctx.current_stream_key.clone() {

@@ -38,9 +38,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/streams", get(streams::list))
         .route("/api/streams/{key}", get(streams::get))
         .route("/api/recordings", get(recordings::list));
+    // Note: Rate limiting for production deployments should be configured
+    // at the nginx layer (limit_req / limit_conn directives). Consider
+    // adding tower_http::limit::RateLimitLayer when upgrading tower-http.
 
     let hls_service = tower_http::services::ServeDir::new(hls_dir);
 
+    // Middleware is applied globally for now; the URI check is a cheap
+    // string-suffix match that short-circuits for non-HLS paths.
     Router::new()
         .nest_service("/hls", hls_service)
         .nest_service(
