@@ -2,9 +2,15 @@
 """Edit list (edts/elst) consistency check for MP4/fMP4 files.
 
 Validates the multi-encoder edit-list policy:
-  * video trak (avc1/hvc1/av01): NO edts  (timing via CTS normalization)
+  * video trak (avc1/hvc1/av01): no composition-time edit. A media_time == 0
+    identity edit list is accepted (ffmpeg emits one to align the video
+    timeline with audio pre-roll edit lists during remux); a non-zero
+    media_time (a real composition offset) fails for our fragmented init
+    segments and is advisory for ffmpeg progressive remuxes.
   * AAC audio trak (mp4a):       edts with elst media_time == 1024  (pre-roll skip)
-  * Opus audio trak (Opus):      NO edts  (pre-roll via sgpd/sbgp + dOps pre_skip)
+  * Opus audio trak (Opus):      NO edts  (pre-roll via sgpd/sbgp + dOps pre_skip);
+    in ffmpeg progressive remuxes Opus priming is expressed as a gap edit
+    (media_time == -1) + identity edit, which is advisory rather than a failure.
   * FLAC audio trak (fLaC):      NO edts  (no encoder delay)
 
 For fragmented movies (moov with mvex, i.e. our muxer's init segment / fMP4)
@@ -168,10 +174,27 @@ def main(path):
         label = f"trak {trak_count} ({handler.decode('latin1') if handler else '?'}/{fourcc.decode('latin1') if fourcc else '?'})"
 
         if handler == b'vide':
-            # Video must never carry an edts (CTS normalization handles timing).
-            if edts_off is not None:
-                print(f'  {label}: ✗ unexpected edts on video trak')
+            # Video timing is handled by CTS normalization, so an edit list is
+            # never needed to shift composition time in our fragmented init
+            # segments. ffmpeg's progressive remux may emit a benign identity
+            # edit (media_time == 0) to align the video timeline with audio
+            # pre-roll edit lists; that is acceptable in either case. A non-zero
+            # media_time is a real composition offset: it fails for our own
+            # fragmented init segments and is advisory for ffmpeg remuxes.
+            if elst_entries:
+                first_media_time = elst_entries[0][1]
+                if first_media_time == 0:
+                    print(f'  {label}: edts media_time=0 (identity alignment edit, ok)')
+                elif fragmented:
+                    print(f'  {label}: ✗ video edts media_time={first_media_time} (expected 0)')
+                    ok = False
+                else:
+                    print(f'  {label}: video edts media_time={first_media_time} (progressive; advisory)')
+            elif edts_off is not None and fragmented:
+                print(f'  {label}: ✗ video edts present without elst')
                 ok = False
+            elif edts_off is not None:
+                print(f'  {label}: video edts present without elst (progressive; advisory)')
             else:
                 print(f'  {label}: no edts (ok)')
         elif handler == b'soun' and fourcc == b'mp4a':
@@ -196,10 +219,17 @@ def main(path):
                 else:
                     print(f'  {label}: edts/elst ok ({detail})')
         elif handler == b'soun':
-            # Opus / FLAC: pre-roll is handled elsewhere (or absent); no edts.
+            # Opus / FLAC: in our fragmented init segments pre-roll is handled
+            # via sgpd/sbgp (+dOps) or is absent, so an edts is unexpected and
+            # fails. A ffmpeg progressive remux legitimately expresses Opus
+            # priming as a gap edit (media_time == -1) + identity edit, so the
+            # edit list there is advisory rather than a failure.
             if edts_off is not None:
-                print(f'  {label}: ✗ unexpected edts on {fourcc} audio trak')
-                ok = False
+                if fragmented:
+                    print(f'  {label}: ✗ unexpected edts on {fourcc} audio trak')
+                    ok = False
+                else:
+                    print(f'  {label}: edts present on {fourcc} audio (progressive; advisory)')
             else:
                 print(f'  {label}: no edts (ok)')
         else:

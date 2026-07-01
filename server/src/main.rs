@@ -104,11 +104,7 @@ async fn thumbnail_loop(app_state: Arc<AppState>, shutdown_token: CancellationTo
                 {
                     Ok(_paths) => {}
                     Err(e) => {
-                        tracing::warn!(
-                            "Thumbnail generation failed for stream '{}': {}",
-                            key,
-                            e
-                        );
+                        tracing::warn!("Thumbnail generation failed for stream '{}': {}", key, e);
                     }
                 }
             });

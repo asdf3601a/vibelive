@@ -126,7 +126,7 @@ Axum router with these endpoints:
 | `GET /api/streams` | List active streams with metadata and `tracks` array |
 | `GET /api/streams/{key}` | Get single stream details (includes `tracks` with per-track HLS URLs and codecs) |
 | `GET /api/recordings` | List recordings (from index.json or fallback scan) |
-**HLS content-type middleware**: Sets correct MIME types for HLS segments (`video/mp4` for `.m4s`) and playlists (`application/vnd.apple.mpegurl` for `.m3u8`) to ensure browser compatibility.
+**HLS content-type middleware**: Sets correct MIME types for HLS segments (`video/mp4` for `.m4s`) and playlists (`application/vnd.apple.mpegurl; charset=utf-8` for `.m3u8`) to ensure browser compatibility.
 
 Static file serving:
 - `/hls/*` → `MEDIA_DIR/hls/*`
@@ -221,7 +221,7 @@ List all currently active (live) streams.
 | `tracks[].video_codec` | `string \| null` | Video codec for this track (null if not yet detected) |
 | `tracks[].audio_codec` | `string \| null` | Audio codec for this track (null if not yet detected) |
 
-**Side effect:** Calling this endpoint triggers asynchronous thumbnail generation for each active stream so that nginx can serve fresh thumbnails.
+**Thumbnails:** This endpoint only *reads* stream state — it does **not** trigger thumbnail generation. Live-stream thumbnails are produced by a background interval loop (`thumbnail_loop` in `main.rs`) that ticks every `THUMBNAIL_INTERVAL_SECONDS` and applies per-stream rate limiting via `THUMBNAIL_RATE_LIMIT_SECONDS`. nginx therefore always serves whatever thumbnails the loop has already written.
 
 ---
 
@@ -404,7 +404,7 @@ Environment variables (all in `.env`). Below are the code defaults and the `.env
 ### 7.1 Prerequisites
 
 - Rust 1.95+ (for 2024 edition with `let` chains)
-- Node.js 22+ + npm
+- Node.js 24+ + npm
 - ffmpeg (for thumbnails and test scripts)
 - nginx (for reverse proxy in production-like setups)
 
@@ -463,8 +463,8 @@ Host:1935 ───RTMP──────▶│  │              │  │  HLS/
                         └──────────────────────────────────────┘
 ```
 
-- **`livestream-backend`** — Rust server (RTMP 1935 + API/HLS 8080). Built from `Dockerfile.backend` (multi-stage: `rust:1.95-slim` builder → `debian:bookworm-slim` runtime with ffmpeg).
-- **`livestream-nginx`** — nginx:alpine serving the Vue SPA from `/srv/frontend` and proxying `/api/`, `/hls/` to `http://backend:8080`. Built from `Dockerfile.nginx` (Node 22 build stage + `nginx:alpine`).
+- **`livestream-backend`** — Rust server (RTMP 1935 + API/HLS 8080). Built from `Dockerfile.backend` (multi-stage: `rust:1-slim-trixie` builder → `debian:trixie-slim` runtime with ffmpeg).
+- **`livestream-nginx`** — nginx:alpine serving the Vue SPA from `/srv/frontend` and proxying `/api/`, `/hls/` to `http://backend:8080`. Built from `Dockerfile.nginx` (Node 24 build stage (`node:24-slim`) + `nginx:alpine`).
 
 **Container networking:**
 - No `expose` or `ports` are needed in Compose for inter-container communication — Docker Compose's default bridge network resolves service names (`backend`, `nginx`) automatically.
@@ -578,7 +578,7 @@ Change thumbnail sizes via `THUMBNAIL_SIZES`:
 THUMBNAIL_SIZES=320,480,640,1280
 ```
 
-Control how often live stream thumbnails are regenerated via `THUMBNAIL_INTERVAL_SECONDS` (default 10s). Lower values increase thumbnail freshness but use more CPU.
+Live-stream thumbnails are produced by a background loop (`thumbnail_loop` in `main.rs`) that ticks every `THUMBNAIL_INTERVAL_SECONDS` (default 300s). Lower values increase thumbnail freshness but use more CPU. Per-stream rate limiting is applied separately via `THUMBNAIL_RATE_LIMIT_SECONDS` (default 5s).
 
 Thumbnails are generated in three formats: **JPEG XL** (`.jxl`), **AVIF** (`.avif`), and **PNG** (`.png`). The frontend uses `<picture>` elements to let the browser pick the first supported format: JXL → AVIF → PNG. PNG is always generated (built-in ffmpeg encoder, no external libs needed). If ffmpeg lacks `libjxl` or `libaom-av1`, the corresponding format is silently skipped and the browser falls through to the next.
 
@@ -624,8 +624,8 @@ Covers:
 The project includes a unified test script `./test.sh` that covers codec compatibility, resolution/aspect-ratio coverage, color-space validation, graceful-stop, reconnect, and HLS streaming tests.
 
 ```bash
-# Quick mode (recommended for CI): codec matrix at 480p/720p + all resolutions +
-# color space + graceful stop + reconnect + HLS + multitrack
+# Default mode (recommended for CI): codec, res, color, graceful, reconnect,
+# hls, multitrack, thumbnail, and passthrough suites
 ./test.sh
 
 # Full Cartesian product: every video × audio × resolution combination
@@ -645,19 +645,21 @@ The project includes a unified test script `./test.sh` that covers codec compati
 ./test.sh --video hevc --res 720p --tests codec --duration 3
 ```
 
-**Test suites (`--tests`):**
+**Test suites (`--tests`):** The default set is `codec res color graceful reconnect hls multitrack thumbnail passthrough` (i.e. everything except `fps`).
+
 | Suite | Description |
 |-------|-------------|
-| `codec` | Video + audio codec matrix (quick: 480p & 720p; full: all resolutions) |
+| `codec` | Video + audio codec matrix (quick: 480p only; `--full`: all resolutions) |
 | `res` | Resolution matrix across all specified aspect ratios |
-| `color` | Color-space / HDR compatibility (HEVC & AV1, SDR & HDR). HEVC HDR test streams include x265 `master-display`/`max-cll` metadata so FFmpeg's Enhanced RTMP muxer can emit `hdrCll`/`hdrMdcv` for `clli`/`mdcv` validation. |
+| `color` | Color-space / HDR compatibility + `colr`/`clli`/`mdcv` box validation (HEVC & AV1, SDR & HDR). Aliases: `hdr`, `hdr-validate`. HEVC HDR test streams include x265 `master-display`/`max-cll` metadata so FFmpeg's Enhanced RTMP muxer can emit `hdrCll`/`hdrMdcv` for `clli`/`mdcv` validation. |
 | `graceful` | Graceful stop & HLS cleanup verification |
 | `reconnect` | Abnormal disconnect + reconnect grace period |
 | `hls` | Live HLS segment verification |
 | `multitrack` | Enhanced RTMP multitrack (2 video + 2 audio, mixed codecs) |
-| `hdr-validate` | HDR box validation (HEVC & AV1, 15s streams, ISOBMFF box structure) |
+| `thumbnail` | Live + recording thumbnail generation (JXL, AVIF, PNG) |
+| `passthrough` | Audio byte-exact + video similarity after RTMP `-c copy` passthrough |
 | `fps` | NTSC/PAL frame rate consistency test (NOT included in `all`) |
-| `all` | Every suite except `fps` and `passthrough` |
+| `all` | Expands to every suite except `fps` (includes `passthrough`) |
 
 **Passthrough test** (`--tests passthrough`): Encodes one test pattern and pushes through RTMP with `-c copy`, then verifies raw audio frame data is byte-identical between input FLV and output recording. Currently passes for AAC (173/173 frames, 100%) and FLAC (39/39 frames, 100%); Opus is pending (Ogg page parser needs multi-segment packet reassembly refinement — see Known Issues). Also validates stts box sample_deltas are correct for each codec.
 
@@ -763,10 +765,10 @@ vibe-livestream/
 │   ├── views/               # Page-level components (Home, LiveWatch, Recordings, NotFound)
 │   ├── components/
 │   │   ├── player/          # Player sub-components (ProgressBar, VolumeControl, SettingsMenu, TrackSelector, DebugOverlay)
-│   │   ├── ui/              # Base UI components (BaseButton, BaseCard, BaseBadge, BasePill, BaseSkeleton, etc.)
-│   │   └── ...              # Other reusable UI components (StreamCard, RecordingCard, ThumbnailImg)
+│   │   ├── ui/              # Base UI components (BaseButton, BaseCard, BaseBadge, BasePill, BaseSkeleton, BaseTag, BaseCodeBlock, BaseEmptyState, BaseErrorState)
+│   │   └── ...              # Other reusable UI components (StreamCard, RecordingCard, RecordingGridCard, RecordingsList, RecordingPlayer, ThumbnailImg, StreamInfo, NavStatus)
 │   ├── api/                 # Typed fetch wrappers (client.ts, streams.ts)
-│   ├── composables/         # Vue composables (usePlayer, usePolling, useStream, useStreamList, useClipboard, useRelativeTime, useThumbnailSrcset)
+│   ├── composables/         # Vue composables (usePlayer, usePolling, useStream, useStreamList, useClipboard, useRelativeTime, useThumbnailSrcset, playerGestures, playerKeyboard, playerVolume)
 │   ├── layouts/             # App layouts (DefaultLayout.vue)
 │   ├── stores/              # Pinia stores (stream.ts)
 │   ├── router/              # Vue Router config
@@ -811,14 +813,14 @@ Keep the same filename (`icon.svg`) for a seamless swap. The file is served as a
 
 ## 13. CI/CD
 
-GitHub Actions (`.github/workflows/ci.yml`):
+GitHub Actions (`.github/workflows/ci.yml`) runs four parallel jobs:
 
-1. **Check & Lint** — `cargo check --workspace`, `cargo clippy --workspace`, `cargo fmt --check`
-2. **Tests** — `cargo build && cargo test -- --nocapture`
-3. **Frontend Build** — `npm ci && npm run build` (Node 22)
-4. **Docker Build** — `docker build -f Dockerfile.backend`
+1. **Check & Lint** — `cargo check --workspace`, then `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`. All three are hard gates (any warning or formatting diff fails the job).
+2. **Tests** — `cargo build && cargo test -- --nocapture`.
+3. **Frontend Build** — `npm ci && npm run build` (Node 24). Both steps are enforced gates.
+4. **Docker Build** — `docker build -f Dockerfile.backend`.
 
-Actions use `actions/checkout@v6`, `actions-rust-lang/setup-rust-toolchain@v1`, and `actions/setup-node@v6`.
+Actions use `actions/checkout@v6`, `actions-rust-lang/setup-rust-toolchain@v1`, and `actions/setup-node@v6`. The CI frontend job and the `Dockerfile.nginx` build stage both use Node 24.
 
 ## 14. References
 

@@ -108,19 +108,13 @@ impl Config {
             ));
         }
         if self.thumbnail_interval_seconds == 0 {
-            return Err(anyhow::anyhow!(
-                "THUMBNAIL_INTERVAL_SECONDS must be > 0"
-            ));
+            return Err(anyhow::anyhow!("THUMBNAIL_INTERVAL_SECONDS must be > 0"));
         }
         if self.thumbnail_ffmpeg_concurrency == 0 {
-            return Err(anyhow::anyhow!(
-                "THUMBNAIL_FFMPEG_CONCURRENCY must be > 0"
-            ));
+            return Err(anyhow::anyhow!("THUMBNAIL_FFMPEG_CONCURRENCY must be > 0"));
         }
         if self.recording_remux_concurrency == 0 {
-            return Err(anyhow::anyhow!(
-                "RECORDING_REMUX_CONCURRENCY must be > 0"
-            ));
+            return Err(anyhow::anyhow!("RECORDING_REMUX_CONCURRENCY must be > 0"));
         }
         Ok(())
     }

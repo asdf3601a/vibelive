@@ -217,7 +217,7 @@ PYEOF
 
 # ── MP4 integrity + stts check ────────────────────────────────────
 check_mp4() {
-    local mp4="$1" key="$2" max_exp="${3:-30}" corrupt=0
+    local mp4="$1" key="$2" max_exp="${3:-30}" corrupt=0 validate_fail=0
     local duration
     duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$mp4" 2>&1) || corrupt=1
     if [ "$corrupt" -eq 0 ]; then
@@ -239,23 +239,43 @@ check_mp4() {
     # stts consistency check (audio AAC frames must be uniform 1024)
     local stts_pass
     stts_pass=$(python3 "$(dirname "$0")/tests/stts_check.py" "$mp4" 2>&1) || true
-
-    echo "$stts_pass" | grep -q "^OK$" && echo -e "${GREEN}  ✓ stts consistent${NC}" || echo -e "${YELLOW}  ⚠ stts incomplete${NC}"
+    if echo "$stts_pass" | grep -q "^FAIL$"; then
+        echo -e "${RED}  ✗ stts inconsistent${NC}"; validate_fail=1
+    elif echo "$stts_pass" | grep -q "^OK$"; then
+        echo -e "${GREEN}  ✓ stts consistent${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ stts incomplete${NC}"
+    fi
     echo "$stts_pass" | grep -v "^OK$" | grep -v "^FAIL$" | while IFS= read -r l; do echo "  $l"; done
 
     # DTS/CTS/PTS timing consistency check
     local timing_pass
     timing_pass=$(python3 "$(dirname "$0")/tests/timing_check.py" "$mp4" 2>&1) || true
-
-    echo "$timing_pass" | grep -q "^TIMING_OK$" && echo -e "${GREEN}  ✓ timing consistent${NC}" || echo -e "${YELLOW}  ⚠ timing incomplete${NC}"
+    if echo "$timing_pass" | grep -q "^TIMING_FAIL$"; then
+        echo -e "${RED}  ✗ timing inconsistent${NC}"; validate_fail=1
+    elif echo "$timing_pass" | grep -q "^TIMING_OK$"; then
+        echo -e "${GREEN}  ✓ timing consistent${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ timing incomplete${NC}"
+    fi
     echo "$timing_pass" | grep -v "^TIMING_OK$" | grep -v "^TIMING_FAIL$" | while IFS= read -r l; do echo "  $l"; done
 
     # Edit list (edts/elst) policy check: AAC pre-roll only, no video edts
     local edts_pass
     edts_pass=$(python3 "$(dirname "$0")/tests/edts_check.py" "$mp4" 2>&1) || true
-
-    echo "$edts_pass" | grep -q "^EDTS_OK$" && echo -e "${GREEN}  ✓ edit list consistent${NC}" || echo -e "${YELLOW}  ⚠ edit list incomplete${NC}"
+    if echo "$edts_pass" | grep -q "^EDTS_FAIL$"; then
+        echo -e "${RED}  ✗ edit list inconsistent${NC}"; validate_fail=1
+    elif echo "$edts_pass" | grep -q "^EDTS_OK$"; then
+        echo -e "${GREEN}  ✓ edit list consistent${NC}"
+    else
+        echo -e "${YELLOW}  ⚠ edit list incomplete${NC}"
+    fi
     echo "$edts_pass" | grep -v "^EDTS_OK$" | grep -v "^EDTS_FAIL$" | while IFS= read -r l; do echo "  $l"; done
+
+    if [ "$validate_fail" -eq 1 ]; then
+        echo -e "${RED}  ✗ MP4 integrity FAILED (validator reported FAIL)${NC}"
+        return 1
+    fi
 
     echo -e "${GREEN}  ✓ MP4 integrity OK (duration=${duration}s, frames=${fcnt})${NC}"
     return 0

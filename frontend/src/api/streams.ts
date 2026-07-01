@@ -21,7 +21,3 @@ export function getPlayerUrl(key: string): string {
 export function listRecordings(): Promise<Recording[]> {
   return apiFetch<Recording[]>('/api/recordings')
 }
-
-export function getRecordingUrl(filename: string): string {
-  return `/api/recordings/${encodeURIComponent(filename)}`
-}
